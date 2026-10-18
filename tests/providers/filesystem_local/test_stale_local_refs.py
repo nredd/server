@@ -232,3 +232,26 @@ async def test_storage_check_treats_a_raised_outage_as_unreachable(tmp_path: Pat
     )
 
     assert not await provider._storage_reachable()
+
+
+async def test_prune_keeps_everything_when_a_probe_times_out(tmp_path: Path) -> None:
+    """A remote storage that raises while being probed keeps every reference."""
+    provider = _make_provider(str(tmp_path))
+    library_item = MagicMock(
+        provider_mappings=[
+            _mapping("Artist/Album", "Artist/Album"),
+            _mapping("Artist/Old", "Artist/Old"),
+        ],
+        metadata=MagicMock(images=[]),
+    )
+    controller = MagicMock()
+    controller.get_library_item = AsyncMock(return_value=library_item)
+    controller.remove_provider_mapping = AsyncMock()
+    controller.remove_provider_images = AsyncMock()
+    provider.exists = AsyncMock(side_effect=ProviderUnavailableError("timeout"))  # type: ignore[method-assign]
+    provider._storage_reachable = AsyncMock()  # type: ignore[method-assign]
+
+    assert not await provider._prune_missing_local_refs(controller, [6])
+
+    controller.remove_provider_mapping.assert_not_called()
+    provider._storage_reachable.assert_not_awaited()

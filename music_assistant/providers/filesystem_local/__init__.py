@@ -2842,6 +2842,40 @@ class LocalFileSystemProvider(MusicProvider):
             artist_ids.update(artist.item_id for artist in db_album.artists)
         return album_ids, artist_ids
 
+    async def _missing_local_refs(
+        self, controller: AlbumsController | ArtistsController, item_ids: Iterable[str | int]
+    ) -> tuple[list[tuple[str | int, str]], dict[str | int, set[str]]] | None:
+        """Return the (item, mapping) pairs and images per item with missing files, None if unprobed."""
+        stale_mappings: list[tuple[str | int, str]] = []
+        stale_images: dict[str | int, set[str]] = {}
+        for item_id in item_ids:
+            library_item = await controller.get_library_item(item_id)
+            try:
+                missing = [
+                    mapping.item_id
+                    for mapping in library_item.provider_mappings
+                    if mapping.provider_instance == self.instance_id
+                    and mapping.url
+                    and not await self._has_path(mapping.url)
+                ]
+                missing_images = {
+                    image.path
+                    for image in library_item.metadata.images or []
+                    if image.provider == self.instance_id
+                    and not await self._has_path(image.path.split("?cs=", 1)[0])
+                }
+            except ProviderUnavailableError:
+                # a remote storage that times out while being probed
+                return None
+            # the item still has library tracks, so never drop its last mapping
+            stale_mappings.extend(
+                (item_id, prov_item_id)
+                for prov_item_id in missing[: len(library_item.provider_mappings) - 1]
+            )
+            if missing_images:
+                stale_images[item_id] = missing_images
+        return stale_mappings, stale_images
+
     async def _prune_missing_local_refs(
         self, controller: AlbumsController | ArtistsController, item_ids: Iterable[str | int]
     ) -> bool:
@@ -2852,37 +2886,14 @@ class LocalFileSystemProvider(MusicProvider):
         :param item_ids: The library ids of the items to check.
         :return: False when nothing was dropped because the storage can not be read right now.
         """
-        stale_mappings: list[tuple[str | int, str]] = []
-        stale_images: dict[str | int, set[str]] = {}
-        for item_id in item_ids:
-            library_item = await controller.get_library_item(item_id)
-            missing = [
-                mapping.item_id
-                for mapping in library_item.provider_mappings
-                if mapping.provider_instance == self.instance_id
-                and mapping.url
-                and not await self._has_path(mapping.url)
-            ]
-            # the item still has library tracks, so never drop its last mapping
-            stale_mappings.extend(
-                (item_id, prov_item_id)
-                for prov_item_id in missing[: len(library_item.provider_mappings) - 1]
-            )
-            if missing_images := {
-                image.path
-                for image in library_item.metadata.images or []
-                if image.provider == self.instance_id
-                and not await self._has_path(image.path.split("?cs=", 1)[0])
-            }:
-                stale_images[item_id] = missing_images
-        if not (stale_mappings or stale_images):
-            return True
+        refs = await self._missing_local_refs(controller, item_ids)
         # storage that dropped during the checks reads as missing files, its files are still there
-        if not await self._storage_reachable():
+        if refs is None or (any(refs) and not await self._storage_reachable()):
             self.logger.warning(
                 "Keeping the references of %s to files that can not be read right now", self.name
             )
             return False
+        stale_mappings, stale_images = refs
         for item_id, prov_item_id in stale_mappings:
             await controller.remove_provider_mapping(item_id, self.instance_id, prov_item_id)
         for item_id, paths in stale_images.items():
