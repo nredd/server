@@ -327,3 +327,21 @@ async def test_the_stale_refs_prune_runs_once(mass: MusicAssistant, tmp_path: Pa
 
     prune.assert_awaited_once()
     assert mass.config.get_raw_provider_config_value(INSTANCE_ID, CONF_STALE_REFS_PRUNE_DONE)
+
+
+async def test_a_skipped_deletion_prune_reruns_the_stale_refs_prune(
+    mass: MusicAssistant, tmp_path: Path
+) -> None:
+    """A deletion pass that could not check its references on the storage reruns the full prune."""
+    _write_files(tmp_path / "Author", "Single.m4b")
+    provider = await _load_provider(mass, tmp_path)
+
+    with patch.object(
+        provider, "_prune_all_missing_local_refs", new=AsyncMock(return_value=True)
+    ) as prune:
+        await _sync(provider)
+        with patch.object(provider, "_process_deletions", new=AsyncMock(return_value=False)):
+            await _sync(provider)
+
+    assert prune.await_count == 2
+    assert mass.config.get_raw_provider_config_value(INSTANCE_ID, CONF_STALE_REFS_PRUNE_DONE)

@@ -780,8 +780,11 @@ class LocalFileSystemProvider(MusicProvider):
             report_current_task_failure(f"Deletions skipped: {summary}")
         else:
             deleted_files = await self._without_unreachable_files(prev_filenames - cur_filenames)
-            await self._process_deletions(deleted_files)
+            pruned = await self._process_deletions(deleted_files)
             await self._process_orphaned_albums_and_artists()
+            if not pruned:
+                # the full check catches up on what the deletion pass could not reach
+                self._update_config_value(CONF_STALE_REFS_PRUNE_DONE, False, immediate=True)
             if (
                 not self.mass.config.get_raw_provider_config_value(
                     self.instance_id, CONF_STALE_REFS_PRUNE_DONE, False
@@ -2743,8 +2746,8 @@ class LocalFileSystemProvider(MusicProvider):
             if path not in unreachable and not path.startswith(prefixes)
         }
 
-    async def _process_deletions(self, deleted_files: set[str]) -> None:
-        """Process all deletions."""
+    async def _process_deletions(self, deleted_files: set[str]) -> bool:
+        """Process all deletions, return False when their references could not be checked."""
         # process deleted tracks/playlists
         album_ids: set[str] = set()
         artist_ids: set[str] = set()
@@ -2803,6 +2806,7 @@ class LocalFileSystemProvider(MusicProvider):
                 await controller.remove_provider_mapping(
                     library_item.item_id, self.instance_id, file_path
                 )
+        pruned = True
         # check if any albums need to be cleaned up
         for album_id in album_ids:
             # the album's live tracks, not its cached listing
@@ -2814,7 +2818,7 @@ class LocalFileSystemProvider(MusicProvider):
             else:
                 kept_album_ids.add(album_id)
         if kept_album_ids:
-            await self._prune_missing_local_refs(self.mass.music.albums, kept_album_ids)
+            pruned &= await self._prune_missing_local_refs(self.mass.music.albums, kept_album_ids)
         # check if any artists need to be cleaned up
         for artist_id in artist_ids:
             artist_albums = await self.mass.music.artists.albums(artist_id, "library", limit=1)
@@ -2825,7 +2829,8 @@ class LocalFileSystemProvider(MusicProvider):
             else:
                 kept_artist_ids.add(artist_id)
         if kept_artist_ids:
-            await self._prune_missing_local_refs(self.mass.music.artists, kept_artist_ids)
+            pruned &= await self._prune_missing_local_refs(self.mass.music.artists, kept_artist_ids)
+        return pruned
 
     async def _album_and_artist_ids(self, track: Track) -> tuple[set[str], set[str]]:
         """Return the library ids of a track's album and of its album and track artists."""
@@ -2857,7 +2862,7 @@ class LocalFileSystemProvider(MusicProvider):
                 for mapping in library_item.provider_mappings
                 if mapping.provider_instance == self.instance_id
                 and mapping.url
-                and not await self.exists(mapping.url)
+                and not await self._has_path(mapping.url)
             ]
             # the item still has library tracks, so never drop its last mapping
             stale_mappings.extend(
@@ -2868,7 +2873,7 @@ class LocalFileSystemProvider(MusicProvider):
                 image.path
                 for image in library_item.metadata.images or []
                 if image.provider == self.instance_id
-                and not await self.exists(image.path.split("?cs=", 1)[0])
+                and not await self._has_path(image.path.split("?cs=", 1)[0])
             }:
                 stale_images[item_id] = missing_images
         if not (stale_mappings or stale_images):

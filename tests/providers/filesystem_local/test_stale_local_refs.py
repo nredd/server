@@ -7,6 +7,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from music_assistant_models.enums import ImageType
+from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import MediaItemImage, ProviderMapping
 
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
@@ -137,6 +138,34 @@ async def test_prune_keeps_everything_when_the_storage_dropped(tmp_path: Path) -
 
     controller.remove_provider_mapping.assert_not_called()
     controller.remove_provider_images.assert_not_called()
+
+
+async def test_prune_treats_a_refused_path_as_missing(tmp_path: Path) -> None:
+    """A mapping whose path the source refuses to read counts as missing."""
+    provider = _make_provider(str(tmp_path))
+
+    async def _exists(file_path: str) -> bool:
+        if file_path == "Artist/Outside":
+            raise MediaNotFoundError("outside")
+        return True
+
+    provider.exists = AsyncMock(side_effect=_exists)  # type: ignore[method-assign]
+    provider._storage_reachable = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    library_item = MagicMock(
+        provider_mappings=[
+            _mapping("Artist/Album", "Artist/Album"),
+            _mapping("Artist/Outside", "Artist/Outside"),
+        ],
+        metadata=MagicMock(images=[]),
+    )
+    controller = MagicMock()
+    controller.get_library_item = AsyncMock(return_value=library_item)
+    controller.remove_provider_mapping = AsyncMock()
+    controller.remove_provider_images = AsyncMock()
+
+    assert await provider._prune_missing_local_refs(controller, [6])
+
+    controller.remove_provider_mapping.assert_awaited_once_with(6, INSTANCE_ID, "Artist/Outside")
 
 
 async def test_prune_without_missing_files_skips_the_storage_check(tmp_path: Path) -> None:
