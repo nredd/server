@@ -7,7 +7,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from music_assistant_models.enums import ImageType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
 from music_assistant_models.media_items import MediaItemImage, ProviderMapping
 
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
@@ -222,3 +222,13 @@ async def test_prune_all_stops_when_the_album_check_could_not_run(tmp_path: Path
     assert not await provider._prune_all_missing_local_refs()
 
     prune.assert_awaited_once_with(mass.music.albums, [1])
+
+
+async def test_storage_check_treats_a_raised_outage_as_unreachable(tmp_path: Path) -> None:
+    """A reachability check that raises, as a cloud drive does on an outage, counts as unreachable."""
+    provider = _make_provider(str(tmp_path))
+    provider._is_reachable = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ProviderUnavailableError("offline")
+    )
+
+    assert not await provider._storage_reachable()

@@ -2454,11 +2454,10 @@ class LocalFileSystemProvider(MusicProvider):
 
     async def _storage_reachable(self) -> bool:
         """Return whether the root of this source and every location mounted below it can be read."""
-        if not await self._is_reachable():
-            return False
         try:
-            return not await self._unreachable_folders()
-        except ActionUnavailable:
+            return await self._is_reachable() and not await self._unreachable_folders()
+        except MusicAssistantError:
+            # a cloud drive raises on an outage, and the mount table may be unavailable
             return False
 
     async def _unreachable_folders(self) -> list[str]:
