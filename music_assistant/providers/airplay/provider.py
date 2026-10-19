@@ -49,6 +49,7 @@ from .constants import (
     CONF_COMPAT_PINS_REVIEWED,
     CONF_PASSWORD_INVALID,
     CONF_PASSWORD_MARKERS_REVIEWED,
+    CONF_RADIO_STATION_FIRST,
     CONF_STORED_VOLUME,
     CONF_STREAMING_MODE,
     CONF_VERBOSE_PTP_LOGGING,
@@ -221,6 +222,13 @@ class AirPlayProvider(PlayerProvider):
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
         return (
+            ConfigEntry(
+                key=CONF_RADIO_STATION_FIRST,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                advanced=True,
+            ),
             ConfigEntry(
                 key=CONF_VERBOSE_PTP_LOGGING,
                 type=ConfigEntryType.BOOLEAN,

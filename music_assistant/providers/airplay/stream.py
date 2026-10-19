@@ -18,13 +18,15 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import uuid4
 
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState
 from music_assistant_models.errors import PlayerCommandFailed
+from music_assistant_models.media_items import Radio
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.util import sanitize_http_header_value
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_ARTWORK_RENDER_TIMEOUT,
     AIRPLAY_ARTWORK_SIZE,
@@ -38,6 +40,7 @@ from music_assistant.providers.airplay.constants import (
     CONF_BUFFER_DEPTH,
     CONF_ENCRYPTION,
     CONF_PASSWORD,
+    CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
     RAOP_DEFAULT_PORT,
     STREAMING_MODE_AP2_COMPAT,
@@ -219,6 +222,8 @@ class AirPlayStream:
         self._clock_ready = asyncio.Event()
         self._clock_ready_at_unix_ms: int = 0
         self._clock_readiness: ClockReadiness = ClockReadiness.UNREPORTED
+        self.supports_live_metadata = False
+        self._metadata_is_live = False
         self._metadata_text_checksum = ""
         # Artwork identity (the source image url) whose rendered bytes were
         # last delivered to the binary. Settles on the first successful
@@ -792,17 +797,33 @@ class AirPlayStream:
         artist = ""
         album = ""
         item_id = ""
+        is_live = False
         if metadata:
-            duration = self._full_media_duration(metadata)
             title = metadata.title or ""
             artist = metadata.artist or ""
             album = metadata.album or ""
+            is_live = (
+                metadata.media_type == MediaType.RADIO
+                and self.player.provider.config.get_value(CONF_RADIO_STATION_FIRST, False) is True
+            )
+            station = self._radio_station_title(metadata) if is_live else None
+            if station:
+                title = sanitize_http_header_value(title)
+                artist = sanitize_http_header_value(artist)
+                artist = " - ".join(
+                    part for part in (artist, title if title != station else "") if part
+                )
+                title = station
+                album = sanitize_http_header_value(album)
+            duration = 0 if is_live else self._full_media_duration(metadata)
             item_id = metadata.queue_item_id or ""
             # The identity deliberately excludes duration and image url: a
             # value that shifts per seek or per media-update would re-send the
             # full metadata each time — which makes an Apple TV re-render its
             # Now Playing popup.
             text_checksum = f"{item_id}|{title}|{artist}|{album}"
+            if self.supports_live_metadata:
+                text_checksum += f"|live={int(is_live)}"
             # the artwork identity must survive URL-form changes: the session
             # media and the player state carry the same image behind different
             # base URLs, and re-sending on such a flip would re-render and
@@ -856,6 +877,8 @@ class AirPlayStream:
                     cmd += f"DURATION={duration}\nITEMID={item_id}\n"
                     if artwork_file:
                         cmd += f"ARTWORKFILE={artwork_file}\n"
+                    if self.supports_live_metadata and (is_live or self._metadata_is_live):
+                        cmd += f"IS_LIVE={int(is_live)}\n"
                     cmd += "ACTION=SENDMETA\n"
                     if not await self.send_cli_command(cmd):
                         if artwork_render is not None:
@@ -865,6 +888,7 @@ class AirPlayStream:
                             self._artwork_render_generations.discard(metadata_generation)
                         return
                     self._metadata_text_checksum = text_checksum
+                    self._metadata_is_live = is_live if self.supports_live_metadata else False
                     # every identity push is followed by one explicit progress
                     # anchor, even at position zero: some receivers (WiiM Amp)
                     # mute a flushed-and-restarted session mid-track when no
@@ -913,6 +937,42 @@ class AirPlayStream:
                 await self._render_and_send_artwork(
                     artwork_url, metadata_generation, artwork_render
                 )
+
+    def _radio_station_title(self, metadata: PlayerMedia) -> str | None:
+        """Return the active radio station name only for this queue item and session."""
+        if (
+            metadata.media_type != MediaType.RADIO
+            or not metadata.source_id
+            or not metadata.queue_item_id
+            or self.session is None
+        ):
+            return None
+        session_media = self.session.media
+        if (
+            session_media.source_id != metadata.source_id
+            or session_media.queue_item_id != metadata.queue_item_id
+            or not session_media.queue_session_id
+            or (
+                metadata.queue_session_id is not None
+                and metadata.queue_session_id != session_media.queue_session_id
+            )
+        ):
+            return None
+        queue = self.mass.players.get_active_queue(self.player)
+        if (
+            queue is None
+            or not queue.active
+            or queue.queue_id != metadata.source_id
+            or (item := queue.current_item) is None
+            or item.queue_id != metadata.source_id
+            or item.queue_item_id != metadata.queue_item_id
+            or item.media_type != MediaType.RADIO
+            or item.streamdetails is None
+            or item.streamdetails.queue_session_id != session_media.queue_session_id
+            or not isinstance(item.media_item, Radio)
+        ):
+            return None
+        return sanitize_http_header_value(item.media_item.name) or None
 
     def _full_media_duration(self, metadata: PlayerMedia) -> int:
         """
@@ -1342,6 +1402,7 @@ class AirPlayStream:
         # Only the native AirPlay 2 flow reads them; the other routes report
         # zeroes with the known flags unset. A change applies to the next stream.
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        self.supports_live_metadata = fields.get("live_metadata") == "1"
         formats = 0
         for mask_field, known_field in (
             ("realtime_formats", "realtime_known"),

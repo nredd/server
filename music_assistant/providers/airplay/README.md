@@ -15,6 +15,24 @@ The AirPlay provider enables Music Assistant to stream audio to AirPlay-enabled 
 - **Late Join Support**: Allows adding players to an existing playback session without interrupting other players
 - **Flow Mode Streaming**: Provides gapless playback and crossfade support by streaming the queue as one continuous audio stream
 
+## Radio metadata display
+
+The advanced provider option **Show radio station as main title** (`radio_station_first`)
+is disabled by default. Enable it to show the Music Assistant radio station name as the
+main title and programme/song information (artist and title) on the secondary artist line.
+Station-first labels only apply when the active queue's current radio item matches the
+stream's queue, item and playback session; otherwise the existing labels are unchanged.
+Station names come from the radio item, never from the display album. Existing artwork
+and queue/item identity are preserved across programme changes. With this option enabled,
+explicit radio media sends duration zero to the CLI even if the station cannot be identified.
+Non-radio media and the default (disabled) policy are unchanged. This does not change
+seek capabilities or remote controls.
+When the CLI advertises `live_metadata=1`, metadata pushes also stage `IS_LIVE=1`
+for this configured radio path and reset it to `IS_LIVE=0` when leaving it. Older
+binaries receive neither field. This is preparatory source support, not a claim
+that any deployed binary or native iPhone/HomePod UI has been fixed; hardware
+acceptance is still pending.
+
 ## Architecture
 
 ### Component Overview

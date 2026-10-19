@@ -13,6 +13,7 @@ from music_assistant.constants import CONF_ENTRY_SYNC_ADJUST
 from music_assistant.controllers.streams.constants import SEEK_WAIT_THRESHOLD
 
 DOMAIN = "airplay"
+CONF_RADIO_STATION_FIRST: Final[str] = "radio_station_first"
 
 
 class StreamingProtocol(IntEnum):
