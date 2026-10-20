@@ -1,5 +1,9 @@
 {
   "config_entries": {
+    "experimental_homepod_remote": {
+      "label": "Experimental HomePod mini OS 27 native remote session admission",
+      "description": "Request the experimental native remote session admission profile for eligible HomePod mini OS 27 connections. Disabled by default for compatibility. Applies to new connections only and requires a verified trial CLI. Independent of radio station-first metadata. Does not provide native volume, seek or full group relay support."
+    },
     "radio_station_first": {
       "label": "Show radio station as main title",
       "description": "Show the radio station name as the main Now Playing title, with programme or song information on the secondary artist line. Disabled by default to keep the usual metadata display. Only applies when the current Music Assistant radio station can be identified."

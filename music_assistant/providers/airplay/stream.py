@@ -39,6 +39,7 @@ from music_assistant.providers.airplay.constants import (
     CONF_AIRPLAY_CREDENTIALS,
     CONF_BUFFER_DEPTH,
     CONF_ENCRYPTION,
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_PASSWORD,
     CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
@@ -223,6 +224,11 @@ class AirPlayStream:
         self._clock_ready_at_unix_ms: int = 0
         self._clock_readiness: ClockReadiness = ClockReadiness.UNREPORTED
         self.supports_live_metadata = False
+        # PRE-SETUP policy selection, not connection or native UI success.
+        # None means unsupported/unreported by this process.
+        self.homepod_remote_admission: bool | None = None
+        self._homepod_remote_admission_reported = False
+        self._homepod_remote_admission_requested = False
         self._metadata_is_live = False
         self._metadata_text_checksum = ""
         # Artwork identity (the source image url) whose rendered bytes were
@@ -323,13 +329,29 @@ class AirPlayStream:
             passes the same value to every member so a group never mixes PTP and
             NTP timing. None lets the stream decide from the daemon's readiness.
         """
+        self.homepod_remote_admission = None
+        self._homepod_remote_admission_reported = False
+        self._homepod_remote_admission_requested = (
+            self.prov.config.get_value(CONF_EXPERIMENTAL_HOMEPOD_REMOTE, False) is True
+        )
         self._check_password_preflight()
         # A fresh cliairplay process re-anchors from scratch, so drop any shift
         # carried on this stream object.
         self.reset_reanchor_shift()
         args = await self._build_cli_args(use_shared_ptp)
         self.player.logger.debug("Starting cliairplay for player %s", self.player.player_id)
-        self._cli_proc = AsyncProcess(args, stdin=True, stdout=True, stderr=True, name="cliairplay")
+        self._cli_proc = AsyncProcess(
+            args,
+            stdin=True,
+            stdout=True,
+            stderr=True,
+            name="cliairplay",
+            env={
+                "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": (
+                    "1" if self._homepod_remote_admission_requested else "0"
+                )
+            },
+        )
         try:
             await self.commands_pipe.create()
             await self._cli_proc.start()
@@ -1266,6 +1288,7 @@ class AirPlayStream:
         plus receiver-reported buffering window after connect, the audio formats
         the receiver advertises, and the result of MediaRemote now-playing
         pushes (Apple devices):
+          [STATUS] homepod_remote_admission enabled=<0|1> (PRE-SETUP policy only)
           [STATUS] route protocol=<raop|airplay2> flow=<...> timing=<ntp|ptp> buffered=<0|1>
           [STATUS] latency lead_ms=<int> device_min_frames=<int> device_max_frames=<int>
           [STATUS] capabilities requested=<hex> realtime_formats=<hex> realtime_known=<0|1>
@@ -1283,7 +1306,9 @@ class AirPlayStream:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
-                if "[STATUS] route" in line:
+                if line.startswith("[STATUS] homepod_remote_admission"):
+                    self._parse_homepod_remote_admission_status(line)
+                elif "[STATUS] route" in line:
                     self._parse_route_status(line)
                 elif "[STATUS] mrp" in line:
                     self._parse_mrp_status(line)
@@ -1296,6 +1321,43 @@ class AirPlayStream:
                 self.player.logger.log(
                     VERBOSE_LOG_LEVEL, "cliairplay for %s: %s", self.player.display_name, line
                 )
+
+        # Older binaries may not emit capabilities either. EOF is the only
+        # ordering-safe fallback; stderr's connected/exit can beat queued stdout.
+        self._report_unreported_homepod_remote_admission()
+
+    def _parse_homepod_remote_admission_status(self, line: str) -> None:
+        """Record the CLI's PRE-SETUP policy selection, never native UI readiness."""
+        if self._homepod_remote_admission_reported:
+            self.player.logger.debug("Ignoring duplicate or late HomePod remote admission policy")
+            return
+        parts = line.split()
+        if parts not in (
+            ["[STATUS]", "homepod_remote_admission", "enabled=0"],
+            ["[STATUS]", "homepod_remote_admission", "enabled=1"],
+        ):
+            self.player.logger.debug("Ignoring malformed HomePod remote admission policy")
+            return
+        self.homepod_remote_admission = parts[2] == "enabled=1"
+        self._homepod_remote_admission_reported = True
+        self.player.logger.debug(
+            "HomePod remote admission policy selected for %s: %s "
+            "(PRE-SETUP selection only, not connection or native UI success)",
+            self.player.display_name,
+            "enabled" if self.homepod_remote_admission else "disabled",
+        )
+
+    def _report_unreported_homepod_remote_admission(self) -> None:
+        """Report an older or unrecognized CLI without changing ordinary playback."""
+        if self._homepod_remote_admission_reported:
+            return
+        self._homepod_remote_admission_reported = True
+        self.player.logger.log(
+            logging.WARNING if self._homepod_remote_admission_requested else logging.DEBUG,
+            "HomePod remote admission policy for %s: unsupported/unreported by CLI; "
+            "ordinary playback remains available",
+            self.player.display_name,
+        )
 
     def _parse_remote_event(self, line: str) -> None:
         """Dispatch a normalized remote command reported by the current live stream."""
@@ -1403,6 +1465,9 @@ class AirPlayStream:
         # which corrects a device that was unreachable when it was discovered.
         # Only the native AirPlay 2 flow reads them; the other routes report
         # zeroes with the known flags unset. A change applies to the next stream.
+        # Both reports use stdout: a supported PRE-SETUP marker must already
+        # have arrived here. stderr's connected report has no such ordering.
+        self._report_unreported_homepod_remote_admission()
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
         self.supports_live_metadata = fields.get("live_metadata") == "1"
         formats = 0

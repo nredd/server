@@ -14,6 +14,7 @@ from music_assistant.controllers.streams.constants import SEEK_WAIT_THRESHOLD
 
 DOMAIN = "airplay"
 CONF_RADIO_STATION_FIRST: Final[str] = "radio_station_first"
+CONF_EXPERIMENTAL_HOMEPOD_REMOTE: Final[str] = "experimental_homepod_remote"
 
 
 class StreamingProtocol(IntEnum):

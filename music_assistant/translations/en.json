@@ -1048,6 +1048,8 @@
   "provider.airplay.config_entries.enable_hires.label": "24-bit audio (hi-res)",
   "provider.airplay.config_entries.encryption.description": "Enable encrypted communication with the player, some (3rd party) players require this to be disabled.",
   "provider.airplay.config_entries.encryption.label": "Enable encryption",
+  "provider.airplay.config_entries.experimental_homepod_remote.description": "Request the experimental native remote session admission profile for eligible HomePod mini OS 27 connections. Disabled by default for compatibility. Applies to new connections only and requires a verified trial CLI. Independent of radio station-first metadata. Does not provide native volume, seek or full group relay support.",
+  "provider.airplay.config_entries.experimental_homepod_remote.label": "Experimental HomePod mini OS 27 native remote session admission",
   "provider.airplay.config_entries.ignore_volume.description": "The AirPlay protocol allows devices to report their own volume level. \nFor some devices this is not reliable and can cause unexpected volume changes. \nEnable this option to ignore these reports.",
   "provider.airplay.config_entries.ignore_volume.label": "Ignore volume reports sent by the device itself",
   "provider.airplay.config_entries.mrp_pairing_pin.label": "Enter the 4-digit pairing code shown on the device",

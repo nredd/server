@@ -29,9 +29,44 @@ Non-radio media and the default (disabled) policy are unchanged. This does not c
 seek capabilities or remote controls.
 When the CLI advertises `live_metadata=1`, metadata pushes also stage `IS_LIVE=1`
 for this configured radio path and reset it to `IS_LIVE=0` when leaving it. Older
-binaries receive neither field. This is preparatory source support, not a claim
-that any deployed binary or native iPhone/HomePod UI has been fixed; hardware
-acceptance is still pending.
+binaries receive neither field. This capability only describes metadata staging,
+not native session admission or full iPhone/HomePod UI support. The limited
+admission trial below is independent of this metadata capability.
+
+## Experimental HomePod native remote admission
+
+The advanced provider option **Experimental HomePod mini OS 27 native remote session
+admission** (`experimental_homepod_remote`) is optional and disabled by default for
+compatibility. Changes apply to new connections only. Each streaming child receives
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` only when the option is exactly true;
+otherwise it receives `0`, overriding any ambient environment value without changing
+the server environment. No new CLI arguments are used.
+
+This pinned trial requires a verified CLI with the admission profile from `1c95c1a`.
+The CLI alone enforces exact HomePod mini OS 27, PTP realtime, encrypted and callback
+eligibility and selects the paired SETUP declarations. MA does not duplicate those
+checks or change pairing or shared PTP behavior. Standalone, muted 120-second hardware
+acceptance covered native iPhone session visibility and pause/play only. This is not
+full native MA group relay, native volume or seek support.
+
+`[STATUS] homepod_remote_admission enabled=0|1` reports PRE-SETUP **policy selection**,
+not a connected session or native UI success. A positive marker followed by connection
+failure is not activation. The stream exposes that selection as
+`homepod_remote_admission` (`None` = unsupported/unreported, `False` = disabled,
+`True` = enabled). Missing or malformed markers never count as successful activation;
+older binaries retain ordinary playback. The first valid marker or unsupported/unreported
+fallback settles this process's report; duplicate, conflicting or late markers cannot
+change it. Missing-marker diagnostics wait for the post-connect stdout capabilities
+report (or stdout EOF for older binaries), never stderr connection ordering. A requested
+profile with no reported selection logs one WARNING; default-off connections keep this
+diagnostic at DEBUG. `enabled=0` is a legitimate CLI ineligible/disabled policy selection,
+not a warning or a success claim. Malformed noise does not freeze the report: the first
+valid marker before the capability milestone is still accepted; valid markers after that
+milestone's unreported fallback are ignored. The request and report reset before password
+preflight or argument building, so failed startup on a reused stream cannot expose its
+previous selection. The post-connect `live_metadata=1` capability cannot authorize earlier
+SETUP declarations. Radio station-first/live metadata remains an independent option;
+non-radio metadata and all existing transport routes are unchanged.
 
 ## Architecture
 
