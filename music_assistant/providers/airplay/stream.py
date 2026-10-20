@@ -1298,7 +1298,9 @@ class AirPlayStream:
                 )
 
     def _parse_remote_event(self, line: str) -> None:
-        """Dispatch a normalized remote command reported by cliairplay."""
+        """Dispatch a normalized remote command reported by the current live stream."""
+        if self.player.stream is not self or self.superseded or self._stopping or self._stopped:
+            return
         command_value = line.removeprefix("[EVENT] remote command=").strip()
         try:
             command = AirPlayRemoteCommand(command_value)

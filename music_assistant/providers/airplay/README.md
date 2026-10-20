@@ -347,6 +347,15 @@ When adding a player to an already-playing session (`add_client()` in [stream_se
 
 **Note**: The projection can only push a joiner's anchor later, never earlier — `AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS` is the floor, and the one the anchor rests on whenever no projection arrives or the projection does not clear it. The binary also runs a post-commit clock verification that can pull an anchor forward, but it only arms when the receiver has still not probed by the time it reads the START, and only for an anchor that clears the receiver queue depth plus 500 ms. The deeper defaults in `AIRPLAY_BUFFER_DEPTH_DEFAULTS` ([constants.py](constants.py)) reach past ~2 s of effective depth, where a joiner's anchor no longer clears that — by design: the queue starts releasing frames one depth *before* the anchor, and a line with audio on the wire cannot move.
 
+## Native transport events
+
+Native `cliairplay` transport events (play, pause, play/pause, next, previous)
+are accepted only from the player's current stream. Events from replaced,
+superseded, stopping or stopped processes are ignored, so a delayed old event
+cannot control the player's new session. Current paused streams still accept
+controls, and normal group and Sendspin bridge routing is unchanged. This does
+not change DACP or volume handling and does not establish full native UI support.
+
 ## DACP (Digital Audio Control Protocol)
 
 ### Purpose
