@@ -16,6 +16,7 @@ from music_assistant_models.streamdetails import MultiPartPath, StreamDetails
 
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_buffer import _probe_source_format
+from music_assistant.helpers.process import descriptor_path
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
 from music_assistant.providers.filesystem_local.cue import CueSheetHandler
 from music_assistant.providers.filesystem_local.helpers import open_real_path
@@ -250,9 +251,10 @@ async def test_opening_parts_stops_at_a_refused_one_without_leaking(tree: Path) 
     (tree / "elsewhere.flac").symlink_to(tree.parent / "outside" / "track.flac")
     audio = _make_audio(_make_provider(tree))
     paths = [str(tree / "part1.flac"), str(tree / "elsewhere.flac")]
-    open_before = len(list(Path("/proc/self/fd").iterdir()))
+    fd_directory = Path(descriptor_path(0)).parent
+    open_before = len(list(fd_directory.iterdir()))
 
     with pytest.raises(AudioError):
         await audio.open_local_files(_local_stream(paths[0]), paths)
 
-    assert len(list(Path("/proc/self/fd").iterdir())) == open_before
+    assert len(list(fd_directory.iterdir())) == open_before
