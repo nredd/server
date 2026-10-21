@@ -47,8 +47,11 @@ from .constants import (
     CLI_PROBLEM_MARKERS,
     COMPANION_DISCOVERY_TYPE,
     CONF_COMPAT_PINS_REVIEWED,
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD_INVALID,
     CONF_PASSWORD_MARKERS_REVIEWED,
+    CONF_RADIO_STATION_FIRST,
     CONF_STORED_VOLUME,
     CONF_STREAMING_MODE,
     CONF_VERBOSE_PTP_LOGGING,
@@ -221,6 +224,27 @@ class AirPlayProvider(PlayerProvider):
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
         return (
+            ConfigEntry(
+                key=CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_EXPERIMENTAL_SESSION_VOLUME,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_RADIO_STATION_FIRST,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                advanced=True,
+            ),
             ConfigEntry(
                 key=CONF_VERBOSE_PTP_LOGGING,
                 type=ConfigEntryType.BOOLEAN,
@@ -1109,7 +1133,11 @@ class AirPlayProvider(PlayerProvider):
                         player_id,
                         task_id=f"debounced_pause_{player_id}",
                     )
-            elif "dmcp.device-volume=" in path and not player.ignore_volume_reports:
+            elif (
+                "dmcp.device-volume=" in path
+                and not player.ignore_volume_reports
+                and not player.checked_volume_enabled
+            ):
                 # This is a bit annoying as this can be either the device confirming a new volume
                 # we've sent or the device requesting a new volume itself.
                 # In case of a small rounding difference, we ignore this,

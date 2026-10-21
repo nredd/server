@@ -666,8 +666,30 @@ class AirPlayPlayer(Player):
         # clip waits run outside it (see announce.py).
         await announce.play_announcement(self, announcement, volume_level)
 
+    @property
+    def checked_volume_enabled(self) -> bool:
+        """Return checked-actuator policy/support, not ownership or native UI readiness."""
+        return bool(
+            self.stream
+            and self.stream.session_volume_requested
+            and self.stream.session_volume.supported is True
+        )
+
     async def volume_set(self, volume_level: int) -> None:
         """Send VOLUME_SET command to given player."""
+        if self.checked_volume_enabled:
+            assert self.stream is not None
+            if self.volume_muted:
+                volume_level = 0
+            committed = await self.stream.session_volume.apply(volume_level)
+            if not self.volume_muted:
+                self._attr_volume_level = committed
+                self.mass.config.set_raw_player_config_value(
+                    self.player_id, CONF_STORED_VOLUME, committed
+                )
+            self.update_state()
+            await self.stream.session_volume.publish_state()
+            return
         # Record before sending: the connect-time volume push reads this attribute,
         # so a send that suspends first would let that push send the stale level.
         self._attr_volume_level = volume_level
@@ -681,6 +703,20 @@ class AirPlayPlayer(Player):
 
     async def volume_mute(self, muted: bool) -> None:
         """Handle VOLUME_MUTE command on the player."""
+        if self.checked_volume_enabled:
+            assert self.stream is not None
+            committed = await self.stream.session_volume.apply(
+                0 if muted else (self.volume_level or 0), update_player=False
+            )
+            if not muted:
+                self._attr_volume_level = committed
+                self.mass.config.set_raw_player_config_value(
+                    self.player_id, CONF_STORED_VOLUME, committed
+                )
+            self._attr_volume_muted = muted
+            self.update_state()
+            await self.stream.session_volume.publish_state()
+            return
         self._attr_volume_muted = muted
         if self.stream and self.stream.running:
             volume = 0 if muted else (self.volume_level or 0)
@@ -832,7 +868,7 @@ class AirPlayPlayer(Player):
 
     def update_volume_from_device(self, volume: int) -> None:
         """Update volume from device feedback."""
-        if self.ignore_volume_reports:
+        if self.ignore_volume_reports or self.checked_volume_enabled:
             return
 
         cur_volume = self.volume_level or 0
@@ -1039,6 +1075,8 @@ class AirPlayPlayer(Player):
 
         :param volume: The level the device reported.
         """
+        if self.checked_volume_enabled:
+            return
         ignored_until = self._volume_reports_ignored_until
         await self.volume_set(volume)
         # Writing the level back is a volume command like any other and opens the echo

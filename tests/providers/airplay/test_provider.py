@@ -11,6 +11,7 @@ import pytest
 from music_assistant_models.enums import PlaybackState
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.controllers.players import PlayerController
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_COLD_GROUP_START_LEAD_MS,
     AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS,
@@ -31,6 +32,7 @@ from music_assistant.providers.airplay.sendspin_bridge import (
 from music_assistant.providers.airplay.stream import AirPlayStream
 from music_assistant.providers.airplay.stream_session import AirPlayStreamSession
 from music_assistant.providers.airplay_receiver import airplay_receiver_ports
+from tests.providers.airplay.test_stream import _make_player
 
 INSTANCE_ID = "airplay"
 START_UNIX_MS = 1_750_000_000_000
@@ -54,20 +56,21 @@ def _make_provider() -> AirPlayProvider:
     return prov
 
 
-def test_remote_pause_routes_to_sendspin_session() -> None:
-    """A bridged device pause targets the owning Sendspin session."""
+async def test_remote_pause_routes_to_sendspin_session() -> None:
+    """A current native stdout event targets the owning Sendspin session."""
     prov = _make_provider()
     players = cast("MagicMock", prov.mass.players)
     manager = SendspinBridgeManager(prov)
     prov._bridge_manager = manager
 
-    airplay_player = MagicMock()
-    airplay_player.player_id = "apc43875e9e53a"
+    airplay_player = _make_player()
+    airplay_player.provider = prov
     airplay_player.playback_state = PlaybackState.PLAYING
+    stream = AirPlayStream(airplay_player)
 
     bridge = SendspinAirPlayBridge(prov, airplay_player, MagicMock())
     bridge._bridge_client_id = "sendspin-bridge"
-    bridge._airplay_stream = airplay_player.stream = MagicMock()
+    bridge._airplay_stream = airplay_player.stream = stream
     manager._bridges[airplay_player.player_id] = bridge
 
     bridge_player = MagicMock()
@@ -83,9 +86,47 @@ def test_remote_pause_routes_to_sendspin_session() -> None:
         "sendspin-leader": sync_leader,
     }.get
 
-    prov.handle_remote_command(airplay_player, AirPlayRemoteCommand.PAUSE)
+    stream._cli_proc = MagicMock(
+        read=AsyncMock(side_effect=[b"[EVENT] remote command=pause\n", b""])
+    )
+    await stream._stdout_reader()
 
     players.cmd_pause.assert_called_once_with("sendspin-session")
+
+
+async def test_native_remote_pause_routes_to_current_group() -> None:
+    """A current stream's event follows real player-controller group redirection."""
+    prov = _make_provider()
+    mass = cast("MagicMock", prov.mass)
+    mass.config.get_raw_core_config_value.return_value = "GLOBAL"
+    controller = PlayerController(prov.mass)
+    mass.players = controller
+    prov._bridge_manager = SendspinBridgeManager(prov)
+    player = _make_player()
+    player.provider = prov
+    player.playback_state = PlaybackState.PLAYING
+    player.state.synced_to = None
+    player.state.active_group = "current-group"
+    group = MagicMock()
+    group.player_id = "current-group"
+    group.state.synced_to = None
+    group.state.active_group = None
+    group.state.active_source = "current-group"
+    controller._players = {player.player_id: player, group.player_id: group}
+    queue = MagicMock(queue_id="current-group")
+    mass.player_queues.get.side_effect = {"current-group": queue}.get
+    mass.player_queues.pause = AsyncMock()
+    stream = AirPlayStream(player)
+    player.stream = stream
+    stream._cli_proc = MagicMock(
+        read=AsyncMock(side_effect=[b"[EVENT] remote command=pause\n", b""])
+    )
+
+    await stream._stdout_reader()
+    mass.create_task.assert_called_once()
+    await mass.create_task.call_args.args[0]
+
+    mass.player_queues.pause.assert_awaited_once_with("current-group")
 
 
 def test_remote_pause_keeps_normal_airplay_routing() -> None:

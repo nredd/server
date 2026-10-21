@@ -6,7 +6,7 @@ import logging
 import os
 import select
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, cast
@@ -52,7 +52,7 @@ def _make_cli_proc(*, quiesced: bool = True, calls: list[str] | None = None) -> 
     """
 
     @asynccontextmanager
-    async def _stdin_quiesced(*_args: object) -> AsyncIterator[bool]:
+    async def _stdin_quiesced(*_args: object) -> AsyncGenerator[bool]:
         if calls is not None:
             calls.append("quiesce")
         yield quiesced
@@ -696,6 +696,7 @@ def test_parse_remote_event(value: str, command: AirPlayRemoteCommand) -> None:
     """A normalized CLI remote event is dispatched against its own player."""
     player = _make_player()
     stream = AirPlayStream(player)
+    player.stream = stream
 
     stream._parse_remote_event(f"[EVENT] remote command={value}")
 
@@ -706,6 +707,7 @@ def test_parse_remote_event_rejects_unknown_command(caplog: pytest.LogCaptureFix
     """An unknown CLI remote event is reported and ignored."""
     player = _make_player()
     stream = AirPlayStream(player)
+    player.stream = stream
 
     with caplog.at_level(logging.WARNING):
         stream._parse_remote_event("[EVENT] remote command=unsupported")
@@ -715,10 +717,19 @@ def test_parse_remote_event_rejects_unknown_command(caplog: pytest.LogCaptureFix
 
 
 @pytest.mark.asyncio
-async def test_stdout_reader_dispatches_remote_events_once() -> None:
-    """The CLI stdout reader dispatches each normalized remote event exactly once."""
+@pytest.mark.parametrize("state", [PlaybackState.PLAYING, PlaybackState.PAUSED])
+@pytest.mark.parametrize("connected", [False, True])
+async def test_stdout_reader_dispatches_remote_events_once(
+    state: PlaybackState, connected: bool
+) -> None:
+    """Current playing/paused streams accept events even before stderr connects."""
     player = _make_player()
+    player.playback_state = state
     stream = AirPlayStream(player)
+    player.stream = stream
+    if connected:
+        stream._handle_status_line("[STATUS] connected")
+    assert stream.connected is connected
     process = MagicMock()
     output = "".join(f"[EVENT] remote command={command}\n" for command in AirPlayRemoteCommand)
     process.read = AsyncMock(side_effect=[output.encode(), b""])
@@ -729,6 +740,84 @@ async def test_stdout_reader_dispatches_remote_events_once() -> None:
     assert player.provider.handle_remote_command.call_args_list == [
         call(player, command) for command in AirPlayRemoteCommand
     ]
+
+
+@pytest.mark.parametrize(
+    "transition", ["replaced", "detached", "stopping", "stopped", "superseded"]
+)
+@pytest.mark.parametrize("command", list(AirPlayRemoteCommand))
+async def test_stdout_reader_ignores_stale_remote_events(
+    transition: str, command: AirPlayRemoteCommand
+) -> None:
+    """Output arriving after ownership loss or teardown cannot control the player."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    player.stream = stream
+    output = asyncio.StreamReader()
+    reading = asyncio.Event()
+
+    async def read(size: int) -> bytes:
+        reading.set()
+        return await output.read(size)
+
+    stream._cli_proc = MagicMock(read=read)
+    reader_task = asyncio.create_task(stream._stdout_reader())
+    try:
+        await reading.wait()
+        if transition == "replaced":
+            player.stream = AirPlayStream(player)
+        elif transition == "detached":
+            player.stream = None
+        elif transition == "stopping":
+            stream._stopping = True
+        elif transition == "stopped":
+            stream._stopped = True
+        else:
+            stream.superseded = True
+        output.feed_data(f"[EVENT] remote command={command.value}\n".encode())
+        output.feed_eof()
+        await reader_task
+    finally:
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+
+    player.provider.handle_remote_command.assert_not_called()
+
+
+async def test_stdout_reader_ignores_remote_event_during_stop() -> None:
+    """A pending read cannot dispatch while stop awaits its command pipe write."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    player.stream = stream
+    output = asyncio.StreamReader()
+    stopping = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def stop_command(_command: str) -> bool:
+        stopping.set()
+        await release_stop.wait()
+        return True
+
+    stream._cli_proc = MagicMock(read=output.read)
+    stream._cli_proc.write_eof = AsyncMock()
+    stream._stdout_reader_task = asyncio.create_task(stream._stdout_reader())
+    with (
+        patch.object(stream, "_write_cli_command", side_effect=stop_command),
+        patch.object(stream.commands_pipe, "remove", new_callable=AsyncMock),
+    ):
+        stop_task = asyncio.create_task(stream.stop())
+        try:
+            await stopping.wait()
+            assert stream._stopping
+            assert not stream._stopped
+            assert player.stream is stream
+            output.feed_data(b"[EVENT] remote command=next\n")
+            output.feed_eof()
+            await stream._stdout_reader_task
+            player.provider.handle_remote_command.assert_not_called()
+        finally:
+            release_stop.set()
+            await stop_task
 
 
 def test_command_pipe_paths_are_unique_per_stream() -> None:

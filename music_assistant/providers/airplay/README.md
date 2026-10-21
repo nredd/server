@@ -15,6 +15,124 @@ The AirPlay provider enables Music Assistant to stream audio to AirPlay-enabled 
 - **Late Join Support**: Allows adding players to an existing playback session without interrupting other players
 - **Flow Mode Streaming**: Provides gapless playback and crossfade support by streaming the queue as one continuous audio stream
 
+## Experimental logical session-volume backend
+
+`experimental_session_volume` is a separate advanced provider option, disabled by
+default. New AirPlay children receive `CLIAIRPLAY_SESSION_VOLUME=mrp130` only when
+both this option and `experimental_homepod_remote` are explicitly true; otherwise
+they receive `off`. The parent environment is never modified. The CLI independently
+enforces native admission eligibility. This does not select or package a trial binary.
+
+The v1 `[STATUS] session_volume version=1` stdout handshake is mandatory before any
+new IPC. Missing/older binaries keep legacy `VOLUME=` playback behavior and cannot
+claim checked success. In enabled, handshaken mode all AirPlay volume setters use
+`STREAM_VOLUME_APPLY`, awaiting the actual accepted actuator result. A successful
+FIFO write is not a receipt. Transactions use one atomic write and reject payloads
+larger than the platform's `PIPE_BUF`; UIDs are never truncated to fit. Cancellation
+stops full-pipe retries before releasing the writer lock. Initial volume becomes known only after an explicit
+checked same-level startup commit, never by reading persisted or optimistic fields.
+Muting retains the restore level; unmuting adopts and persists the actual accepted
+raw level rather than the requested restore target.
+Receiver MRP/DACP/dvlc telemetry cannot initialize or command logical session volume.
+DACP device-volume mute/unmute telemetry is ignored before mutating mute state in
+checked mode; legacy telemetry behavior is unchanged. Stdout records and EOF cleanup
+belong to the exact process/backend that started the reader, never a replacement.
+
+`session_volume.py` exposes an explicit offline binding seam. It resolves the exact
+current native stream/session or bridge-owned Sendspin source, visible protocol parent, active group, sync leader
+and complete membership, then rechecks that snapshot around core group/member
+locks and actuator waits. It uses the core interpolation, scaling and mute path,
+not equal-level fanout. All final actuators must be confirmed-capable before any
+send. `get_volume_command_context()` is separate from transport routing: it pins the
+exact bridge, SDK client/role/group, active PushStream and membership. An unresolved
+bridge owner never falls back to native output. All required outputs must resolve to
+checked AirPlay actuators in that source; mixed/unconfirmed outputs remain unavailable,
+not a best-effort subset. `apply_volume_confirmed()` preserves Core's already-scaled
+raw target and awaits the CLI's accepted RTSP receipt. Ordinary opted-in MA Sendspin
+volume/mute commands also await this path, bypassing SDK optimistic setters. External
+Sendspin UI commands retain the legacy SDK behavior and are NOT acceptance receipts.
+Role feedback uses `update_player_state()`, which emits `VolumeChangedEvent` to SDK
+listeners; MA's listener only updates player state, never redispatches a command.
+Warm source replacement retires receipts even if the CLI survives. Logical state is the maximum of actual
+confirmed member levels only when every required member is known. Partial failure
+or timeout clears authoritative state, without pretending a rollback occurred.
+Ordinary UI setter failures also enqueue explicit unknown state for every affected
+binding, including bindings owned by another group member. Confirmed checked commits
+reconcile obsolete ordinary nudge targets to actual logical levels, without replacing
+newer queued UI intent. State/completion feedback never sends actuator commands. One executing request and
+one replaceable trailing request bound native bursts; revisions and process/binding
+generations reject stale completions. Stops, reconnects and observed topology or
+ownership changes invalidate bindings. Binding delivery is transactional: cancellation
+or failure retires the provisional generation, and ownership is revalidated after the
+write before dependencies are installed. A retry cannot inherit an uncertain binding.
+
+Native UI publication remains CLOSED. No production caller binds an output UID.
+`bind(..., verified_identity=True)` is an offline integration seam, not discovery or
+proof that an iPhone addresses that identity. Operational backend readiness is NOT
+native UI volume success: the measured native slider was grey, with no valid gesture.
+No native availability, relative-volume capability, production deployment or native
+UI success is claimed. `python -m scripts.check_native_airplay_volume --harness
+/absolute/path/to/airplay-cli/build/tests/test_live_metadata` exercises the real encrypted
+C peer, MA controller, fake confirmed actuators and atomic FIFO. The offline case verifies
+that a 63% request clamped to 61% returns committed state `610`, with unequal group levels
+preserved. Run from the MA source checkout; both the production module and fixture
+must import from that checkout. Shared worktree environments and CI container interpreters
+are supported, without treating interpreter location as source provenance. This does not
+verify native output identity, UI routing or real hardware.
+
+## Radio metadata display
+
+The advanced provider option **Show radio station as main title** (`radio_station_first`)
+is disabled by default. Enable it to show the Music Assistant radio station name as the
+main title and programme/song information (artist and title) on the secondary artist line.
+Station-first labels only apply when the active queue's current radio item matches the
+stream's queue, item and playback session; otherwise the existing labels are unchanged.
+Station names come from the radio item, never from the display album. Existing artwork
+and queue/item identity are preserved across programme changes. With this option enabled,
+explicit radio media sends duration zero to the CLI even if the station cannot be identified.
+Non-radio media and the default (disabled) policy are unchanged. This does not change
+seek capabilities or remote controls.
+When the CLI advertises `live_metadata=1`, metadata pushes also stage `IS_LIVE=1`
+for this configured radio path and reset it to `IS_LIVE=0` when leaving it. Older
+binaries receive neither field. This capability only describes metadata staging,
+not native session admission or full iPhone/HomePod UI support. The limited
+admission trial below is independent of this metadata capability.
+
+## Experimental HomePod native remote admission
+
+The advanced provider option **Experimental HomePod mini OS 27 native remote session
+admission** (`experimental_homepod_remote`) is optional and disabled by default for
+compatibility. Changes apply to new connections only. Each streaming child receives
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` only when the option is exactly true;
+otherwise it receives `0`, overriding any ambient environment value without changing
+the server environment. No new CLI arguments are used.
+
+This pinned trial requires a verified CLI with the admission profile from `1c95c1a`.
+The CLI alone enforces exact HomePod mini OS 27, PTP realtime, encrypted and callback
+eligibility and selects the paired SETUP declarations. MA does not duplicate those
+checks or change pairing or shared PTP behavior. Standalone, muted 120-second hardware
+acceptance covered native iPhone session visibility and pause/play only. This is not
+full native MA group relay, native volume or seek support.
+
+`[STATUS] homepod_remote_admission enabled=0|1` reports PRE-SETUP **policy selection**,
+not a connected session or native UI success. A positive marker followed by connection
+failure is not activation. The stream exposes that selection as
+`homepod_remote_admission` (`None` = unsupported/unreported, `False` = disabled,
+`True` = enabled). Missing or malformed markers never count as successful activation;
+older binaries retain ordinary playback. The first valid marker or unsupported/unreported
+fallback settles this process's report; duplicate, conflicting or late markers cannot
+change it. Missing-marker diagnostics wait for the post-connect stdout capabilities
+report (or stdout EOF for older binaries), never stderr connection ordering. A requested
+profile with no reported selection logs one WARNING; default-off connections keep this
+diagnostic at DEBUG. `enabled=0` is a legitimate CLI ineligible/disabled policy selection,
+not a warning or a success claim. Malformed noise does not freeze the report: the first
+valid marker before the capability milestone is still accepted; valid markers after that
+milestone's unreported fallback are ignored. The request and report reset before password
+preflight or argument building, so failed startup on a reused stream cannot expose its
+previous selection. The post-connect `live_metadata=1` capability cannot authorize earlier
+SETUP declarations. Radio station-first/live metadata remains an independent option;
+non-radio metadata and all existing transport routes are unchanged.
+
 ## Architecture
 
 ### Component Overview
@@ -328,6 +446,15 @@ When adding a player to an already-playing session (`add_client()` in [stream_se
 4. **Content mapped onto the acked instant**: The stream position due at that instant is primed from the ring tail (when it is at or behind the write head) or skipped off the head of the live feed (when it is ahead). There is no catch-up: the binary makes the first post-START stdin byte audible exactly at the acked instant and freezes the anchor there
 
 **Note**: The projection can only push a joiner's anchor later, never earlier — `AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS` is the floor, and the one the anchor rests on whenever no projection arrives or the projection does not clear it. The binary also runs a post-commit clock verification that can pull an anchor forward, but it only arms when the receiver has still not probed by the time it reads the START, and only for an anchor that clears the receiver queue depth plus 500 ms. The deeper defaults in `AIRPLAY_BUFFER_DEPTH_DEFAULTS` ([constants.py](constants.py)) reach past ~2 s of effective depth, where a joiner's anchor no longer clears that — by design: the queue starts releasing frames one depth *before* the anchor, and a line with audio on the wire cannot move.
+
+## Native transport events
+
+Native `cliairplay` transport events (play, pause, play/pause, next, previous)
+are accepted only from the player's current stream. Events from replaced,
+superseded, stopping or stopped processes are ignored, so a delayed old event
+cannot control the player's new session. Current paused streams still accept
+controls, and normal group and Sendspin bridge routing is unchanged. This does
+not change DACP or volume handling and does not establish full native UI support.
 
 ## DACP (Digital Audio Control Protocol)
 

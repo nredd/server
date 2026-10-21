@@ -20,7 +20,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from aiosendspin.models.core import ClientHelloPayload
@@ -28,6 +30,7 @@ from aiosendspin.models.core import DeviceInfo as SendspinDeviceInfo
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec, PlayerCommand
 from music_assistant_models.enums import IdentifierType, PlaybackState
+from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.constants import CONF_SYNC_ADJUST
 from music_assistant.helpers.util import is_valid_mac_address
@@ -237,6 +240,20 @@ def device_buffer_ahead_seconds(
     return cursor_play_time_s - unix_now
 
 
+@dataclass(frozen=True)
+class BridgeVolumeContext:
+    """Exact bridge source identities, independent of transport-command routing."""
+
+    bridge: SendspinAirPlayBridge
+    stream: AirPlayStream
+    client: SendspinClient
+    role: BridgePlayerRole
+    player: Player
+    group: SendspinGroup
+    source: object
+    members: tuple[SendspinClient, ...]
+
+
 class SendspinAirPlayBridge:
     """
     Manages the Sendspin to AirPlay bridge for a single player.
@@ -437,6 +454,8 @@ class SendspinAirPlayBridge:
                 initial_volume=self.airplay_player.volume_level or 25,
                 initial_muted=bool(self.airplay_player.volume_muted),
             )
+            self._bridge_role.volume_command = self._volume_command
+            self._bridge_role.mute_command = self._mute_command
             self._bridge_role.setup_audio_requirements()
             self._refresh_bridge_timing()
 
@@ -459,6 +478,31 @@ class SendspinAirPlayBridge:
 
         self.logger.debug("Sendspin bridge stopped for %s", self.airplay_player.display_name)
 
+    async def apply_volume_confirmed(
+        self, volume: int, validate: Callable[[], None] | None = None
+    ) -> int:
+        """Await an accepted raw actuator receipt, never an SDK command acknowledgement."""
+        context = self.provider.bridge_manager.get_volume_command_context(
+            self.airplay_player.player_id
+        )
+        if context is None or context.bridge is not self:
+            raise PlayerCommandFailed("Bridge volume source is no longer current")
+
+        def check() -> None:
+            """Guard the exact source on both sides of the actuator await."""
+            if context != self.provider.bridge_manager.get_volume_command_context(
+                self.airplay_player.player_id
+            ):
+                raise PlayerCommandFailed("Bridge volume source changed")
+            if validate is not None:
+                validate()
+
+        check()
+        accepted = await context.stream.session_volume.apply(volume, check, update_player=True)
+        check()
+        self.sync_role_volume_state()
+        return accepted
+
     def sync_role_volume_state(self) -> None:
         """
         Adopt the AirPlay player's volume and mute into the bridge role.
@@ -470,10 +514,22 @@ class SendspinAirPlayBridge:
         """
         if not self._bridge_role:
             return
+        volume = self.airplay_player.volume_level
+        if self.airplay_player.checked_volume_enabled is True:
+            stream = self._airplay_stream
+            if stream is None or stream.session_volume.confirmed_level is None:
+                return
+            backend = stream.session_volume
+            try:
+                if backend._receipt_snapshot != backend.snapshot():
+                    return
+            except PlayerCommandFailed:
+                return
+            volume = backend.confirmed_level
         # Both sides hold the device-scale level, so a value read back here compares
         # equal to the one the role just sent instead of bouncing between the two.
         self._bridge_role.update_player_state(
-            volume=self.airplay_player.volume_level,
+            volume=volume,
             muted=bool(self.airplay_player.volume_muted),
         )
 
@@ -573,6 +629,7 @@ class SendspinAirPlayBridge:
         # previous one says nothing about the device's health on this one. This
         # is settled before anything can return early, so no stream ever
         # inherits the previous one's verdict.
+        self._invalidate_volume_owner()
         self._last_transport_recovery = None
         # Joining a session by any means supersedes a pending re-join.
         self._cancel_rejoin()
@@ -635,7 +692,13 @@ class SendspinAirPlayBridge:
         Called via the BridgePlayerRole.on_stream_start callback when the
         PushStream begins delivering audio chunks.
         """
+        self._invalidate_volume_owner()
         self._restart_transport()
+
+    def _invalidate_volume_owner(self) -> None:
+        """Retire receipts immediately, including when a warm CLI survives source changes."""
+        if self.airplay_player.checked_volume_enabled is True and self._airplay_stream is not None:
+            self._airplay_stream.session_volume.owner_changed()
 
     def _restart_transport(self) -> None:
         """
@@ -1026,6 +1089,21 @@ class SendspinAirPlayBridge:
                 acked_timeline_ms - now_ms,
             )
         return True
+
+    async def _volume_command(self, volume: int) -> None:
+        """Keep ordinary MA commands awaitable in checked mode; external SDK UI stays legacy."""
+        if self.airplay_player.checked_volume_enabled:
+            await self.apply_volume_confirmed(volume)
+        elif self._bridge_role is not None:
+            self._bridge_role.set_player_volume(volume)
+
+    async def _mute_command(self, muted: bool) -> None:
+        """Let accepted actuator feedback, not optimistic SDK mute, update MA."""
+        if self.airplay_player.checked_volume_enabled:
+            await self.airplay_player.volume_mute(muted)
+            self.sync_role_volume_state()
+        elif self._bridge_role is not None:
+            self._bridge_role.set_player_mute(muted)
 
     def _on_volume_change(self, volume: int) -> None:
         """Forward volume changes to the AirPlay player."""
@@ -1661,6 +1739,7 @@ class SendspinAirPlayBridge:
 
         :return: The detached stream, writer task and stream start task.
         """
+        self._invalidate_volume_owner()
         stream = self._airplay_stream
         writer_task = self._writer_task
         start_task = self._airplay_stream_start_task
@@ -1743,6 +1822,44 @@ class SendspinBridgeManager(SendspinBridgeManagerBase[SendspinAirPlayBridge]):
             if (decision := sibling.active_shared_ptp) is not None:
                 return decision
         return None
+
+    def get_volume_command_context(self, airplay_player_id: str) -> BridgeVolumeContext | None:
+        """Resolve only an exact current bridge source; an unresolved owner must not fall back."""
+        bridge = self._bridges.get(airplay_player_id)
+        if bridge is None or not bridge.owns_airplay_stream:
+            return None
+        stream = bridge._airplay_stream
+        client = bridge._sendspin_client
+        role = bridge._bridge_role
+        player = self.mass.players.get_player(bridge.bridge_client_id or "")
+        if (
+            stream is None
+            or stream.session is not None
+            or stream.superseded
+            or not stream.session_volume.enabled
+            or client is None
+            or role is None
+            or player is None
+            or bridge.sendspin_server.get_client(client.client_id) is not client
+            or role not in client.roles_by_family("player")
+        ):
+            raise PlayerCommandFailed("Missing confirmed bridge volume owner")
+        group = client.group
+        # SDK has no public source handle. Pin the actual PushStream, not its optimistic
+        # playback state; a warm transport may survive source replacement.
+        source = group._push_stream
+        if source is None or source.is_stopped or client not in group.clients:
+            raise PlayerCommandFailed("Missing active bridge volume source")
+        return BridgeVolumeContext(
+            bridge,
+            stream,
+            client,
+            role,
+            player,
+            group,
+            source,
+            tuple(group.clients),
+        )
 
     def get_transport_command_target(self, airplay_player_id: str) -> str | None:
         """
