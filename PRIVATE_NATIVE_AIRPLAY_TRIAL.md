@@ -101,24 +101,34 @@ Git from the fixed public `https://github.com/nredd/server` repository and a ful
 40-hex commit, and compares the loaded package origin with the distribution package root.
 Editable, shadowed, missing, malformed or unverifiable metadata returns only `unverified`.
 Success returns only `verified-installer-provenance` and the validated commit; no raw URL,
-metadata, paths, arguments, environment or credentials are returned. This is INSTALLER
-provenance, NOT immutable loaded-byte or image proof. Compare the commit with the
-EXTERNAL private receipt, never a tracked self-referential overlay SHA.
+metadata, paths, arguments, environment or credentials are returned. Every validated public
+SHA1/SHA256 identity value (`commit`, `expected_sha256`, `validated_sha256` and matching
+child `actual_sha256`) uses `{"encoding":"u32be-v1","words":[...]}` with exactly five or
+eight unsigned big-endian 32-bit words. This survives normal diagnostics sanitization without
+loosening it. This is INSTALLER provenance, NOT immutable loaded-byte or image proof. Compare
+the commit with the EXTERNAL private receipt, never a tracked self-referential overlay SHA.
 
 Startup validation is a historical claim, NOT current child attestation. Each available
 owned stream/PTP/pairing process is separately checked through `/proc/<knownpid>/exe`
 using bounded reads and pre/post process-liveness checks. No arbitrary PID/path API,
 process arguments, environment, IDs, raw output or secrets are exposed. Absent pairing
-processes require no attestation; exit, races and unavailable procfs are `unverified`,
-never `match`. A live readable different executable is `mismatch`. Selection uses a
-mutable pathname, not an immutable execution sandbox: an adversarial concurrent media
-replacement after validation remains possible, so live child attestation is a separate
-required gate. None of these fields prove native UI controls or playback success.
+processes require no attestation; failures are `unverified` with only one finite reason:
+`not-live`, `procfs-unavailable-or-child-exited`, `procfs-access-denied`,
+`executable-unstable-or-ineligible`, `procfs-read-failed` or
+`child-changed-during-attestation`; `OSError` failures additionally retain only numeric
+`errno`. A live readable different executable is `mismatch` with no unexpected digest.
+Only a matching child includes encoded `actual_sha256`. Selection uses a mutable pathname,
+not an immutable execution sandbox: an adversarial concurrent media replacement after
+validation remains possible, so live child attestation is a separate required gate. None of
+these fields prove native UI controls or playback success.
 
 ## Gates before any launch
 
 - Preserve a verified backup and restore route for protected official MA 2.10.7, including
-  its original integration, credentials, data and speaker-group state. No seed from it
+  its original integration, credentials, data and speaker-group state. Supervisor partial
+  backup `dc640e9f` contains stock MA `2.10.7`; older `8544fca8` contains `2.10.6` and is
+  retained separately, not mislabeled as the current rollback pin. Neither includes HA Core.
+  No seed from it
   goes into DEV. Use fresh private DEV data and only fresh public SomaFM radio.
 - Resolve the startup budget before launch: pinned source install happens at startup,
   so a two-minute listening window is NOT a build-time estimate. Establish a hard
@@ -143,9 +153,15 @@ required gate. None of these fields prove native UI controls or playback success
   discovery isolation and owner approval. Supplied read-only official DEV info was
   installed=false/available=true/build=true/latest=2.11.0.dev2026102003, with HAOS 18.2 and
   HA core 2026.9.2; this is NOT a freshness or launch receipt. Native UI, real station/group
-  controls, source/image identity, actual Linux startup and startup duration remain
-  unverified. Parent owns final full suite, review, external receipt, commit/push and live
-  gates. No deployment, live setting change or installer execution is part of this work.
+  controls and exact source/child identity remain unverified. The bounded `0af8b62`
+  trial reached Linux private API readiness in 48.1 seconds with a distinct ID; a second
+  no-playback trial completed normal fresh onboarding and verified old ports unbound.
+  Its identity gate failed closed: full hashes were redacted by diagnostics and the
+  PTP child was `unverified`. Both trials restored stock through the independent
+  recovery route. These observations do not establish native feature acceptance or an
+  immutable installed image digest. Parent owns the full suite, review, external receipt,
+  commit/push and live gates for each new source pin. Earlier observations do not authorize
+  another source revision or playback.
 
 ## Private recovery controller
 

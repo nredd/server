@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -253,8 +254,55 @@ async def test_real_owned_child_proc_unavailable(host_executable: Path, tmp_path
     async with child:
         with patch.object(trial, "PROC_ROOT", tmp_path / "absent"):
             result = await trial.attest_owned_child(child, "stream")
-        assert result == {"role": "stream", "outcome": "unverified"}
-    assert await trial.attest_owned_child(child, "stream") == result
+        assert result == {
+            "role": "stream",
+            "outcome": "unverified",
+            "reason": "procfs-unavailable-or-child-exited",
+            "errno": errno.ENOENT,
+        }
+    assert await trial.attest_owned_child(child, "stream") == {
+        "role": "stream",
+        "outcome": "unverified",
+        "reason": "not-live",
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            OSError(errno.EACCES, "private detail"),
+            {"reason": "procfs-access-denied", "errno": errno.EACCES},
+        ),
+        (
+            OSError(errno.EPERM, "private detail"),
+            {"reason": "procfs-access-denied", "errno": errno.EPERM},
+        ),
+        (OSError("private detail"), {"reason": "procfs-read-failed"}),
+        (
+            OSError(errno.EIO, "private detail"),
+            {"reason": "procfs-read-failed", "errno": errno.EIO},
+        ),
+        (ValueError("private detail"), {"reason": "executable-unstable-or-ineligible"}),
+        (
+            trial.ChildAttestationChangedError("private detail"),
+            {"reason": "child-changed-during-attestation"},
+        ),
+    ],
+)
+async def test_owned_child_attestation_safe_failures(
+    host_executable: Path,
+    failure: OSError | ValueError,
+    expected: dict[str, int | str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Procfs failure diagnostics stay finite and exclude private exception detail."""
+    child = AsyncProcess([str(host_executable), "10"])
+    async with child:
+        monkeypatch.setattr(trial, "_read_child_digest", MagicMock(side_effect=failure))
+        result = await trial.attest_owned_child(child, "stream")
+    assert result == {"role": "stream", "outcome": "unverified"} | expected
+    assert "private detail" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("outcome", ["match", "mismatch", "exit", "race", "exec"])
@@ -303,9 +351,13 @@ async def test_owned_child_attestation(
         assert result["outcome"] == (
             "unverified" if outcome in ("exit", "race", "exec") else outcome
         )
+        if outcome == "exit":
+            assert result["reason"] == "not-live"
+        elif outcome in ("race", "exec"):
+            assert result["reason"] == "child-changed-during-attestation"
         assert "sleep" not in json.dumps(result)
         assert str(child.proc.pid) not in json.dumps(result)
-        if outcome in ("exit", "race", "exec"):
+        if outcome in ("mismatch", "exit", "race", "exec"):
             assert "actual_sha256" not in result
 
 
@@ -326,7 +378,9 @@ async def test_diagnostics_only_owned_roles_no_secrets(asset: Path) -> None:
     assert str(asset) not in encoded
     identity = result["trial_binary"]
     assert isinstance(identity, dict)
-    assert identity["owned_children"] == [{"role": "ptp", "outcome": "unverified"}]
+    assert identity["owned_children"] == [
+        {"role": "ptp", "outcome": "unverified", "reason": "not-live"}
+    ]
 
 
 @pytest.mark.parametrize("reason", ["Trial check failed", "Trial check timed out"])
@@ -381,8 +435,9 @@ async def test_diagnostics_attest_all_owned_roles(
             result = await provider.get_diagnostics()
         identity = result["trial_binary"]
         assert isinstance(identity, dict)
+        expected_digest = private_trial.encode_public_digest(trial.EXPECTED_SHA)
         assert identity["owned_children"] == [
-            {"role": role, "outcome": "match", "actual_sha256": trial.EXPECTED_SHA}
+            {"role": role, "outcome": "match", "actual_sha256": expected_digest}
             for role in ("ptp", "stream", "pairing")
         ]
         encoded = json.dumps(identity)

@@ -301,8 +301,18 @@ def test_installer_provenance_fixed_safe_result(distribution: Path) -> None:
     assert distribution.is_file()
     assert trial.installer_provenance() == {
         "status": "verified-installer-provenance",
-        "commit": "a" * 40,
+        "commit": {
+            "encoding": "u32be-v1",
+            "words": [0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA, 0xAAAAAAAA],
+        },
     }
+
+
+@pytest.mark.parametrize("digest", ["A" * 40, "a" * 39, "a" * 41, "a" * 64 + "0"])
+def test_public_digest_encoding_rejects_unvalidated_values(digest: str) -> None:
+    """The diagnostic encoder accepts only full lower-case public SHA values."""
+    with pytest.raises(ValueError, match="Digest is not a lowercase SHA1 or SHA256 value"):
+        trial.encode_public_digest(digest)
 
 
 @pytest.mark.parametrize(

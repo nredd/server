@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ from music_assistant_models.media_items import (
 )
 
 from music_assistant.controllers.diagnostics import DiagnosticsController
+from music_assistant.helpers import private_trial
 from music_assistant.helpers.diagnostics import (
     LOG_RING_MAXLEN,
     MAX_EXCEPTION_FINGERPRINTS,
@@ -113,6 +115,37 @@ def test_sanitize_text_code_paths() -> None:
     raw = 'File "/opt/app/music_assistant/controllers/music.py", line 5'
     assert "/opt/app" not in sanitize_text(raw)
     assert 'File "music_assistant/controllers/music.py", line 5' in sanitize_text(raw)
+
+
+@pytest.mark.parametrize("digest", ["0123456789abcdef" * 4, "0123456789abcdef" * 2 + "01234567"])
+def test_private_digest_words_survive_diagnostics_sanitization(digest: str) -> None:
+    """Encoded known public digests retain exact identity without raw token-shaped text."""
+    encoded = private_trial.encode_public_digest(digest)
+    round_tripped = json.loads(json.dumps({"encoded": encoded, "raw": digest}))
+    sanitized = sanitize_data(round_tripped)
+    assert sanitized["raw"] == "<redacted-token>"
+    assert sanitized["encoded"] == encoded
+    assert "".join(f"{word:08x}" for word in sanitized["encoded"]["words"]) == digest
+
+
+async def test_private_provider_identity_through_actual_section_collector(
+    mass: MusicAssistant,
+) -> None:
+    """The actual API section pipeline preserves exact public identity, not raw tokens."""
+    controller = mass.diagnostics
+    digest = "0123456789abcdef" * 4
+    encoded = private_trial.encode_public_digest(digest)
+    name, section = await controller._collect_section(
+        "provider.airplay.private",
+        lambda: {"trial_binary": {"validated_sha256": encoded}, "raw": digest},
+        1.0,
+    )
+    assert name == "provider.airplay.private"
+    assert section["raw"] == "<redacted-token>"
+    assert (
+        "".join(f"{word:08x}" for word in section["trial_binary"]["validated_sha256"]["words"])
+        == digest
+    )
 
 
 def test_sanitize_data_recurses() -> None:

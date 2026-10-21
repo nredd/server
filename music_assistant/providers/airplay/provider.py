@@ -32,7 +32,7 @@ from music_assistant.helpers.config_entries import (
 )
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
-from music_assistant.helpers.private_trial import installer_provenance
+from music_assistant.helpers.private_trial import encode_public_digest, installer_provenance
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import (
     get_ip_addresses,
@@ -423,7 +423,7 @@ class AirPlayProvider(PlayerProvider):
             trial = {
                 "mode": "private-official-dev-trial",
                 "installer_provenance": await asyncio.to_thread(installer_provenance),
-                "expected_sha256": trial_binary.EXPECTED_SHA,
+                "expected_sha256": encode_public_digest(trial_binary.EXPECTED_SHA),
                 "startup_validation": self._trial_identity,
                 "owned_children": children,
             }

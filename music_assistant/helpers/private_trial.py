@@ -29,6 +29,7 @@ PRIVATE_API_PORT = 18095
 TRIAL_DEFAULT_PROVIDER_DOMAINS = frozenset({"airplay"})
 TRIAL_DISABLED_BUILTIN_PROVIDER_DOMAINS = frozenset({"sendspin", "sendspin_source"})
 _SHA = re.compile(r"[0-9a-f]{40}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[0-9a-f]{32}")
 _FRESH_ROOTS: set[Path] = set()
 
@@ -181,6 +182,16 @@ def bind_server_id(storage_path: str, server_id: str) -> None:
         _FRESH_ROOTS.discard(root)
 
 
+def encode_public_digest(digest: str) -> dict[str, SerializableType]:
+    """Encode a validated public SHA1/SHA256 digest without sanitizer-sensitive text."""
+    if not (_SHA.fullmatch(digest) or _SHA256.fullmatch(digest)):
+        raise ValueError("Digest is not a lowercase SHA1 or SHA256 value")
+    return {
+        "encoding": "u32be-v1",
+        "words": [int(digest[index : index + 8], 16) for index in range(0, len(digest), 8)],
+    }
+
+
 def installer_provenance() -> dict[str, SerializableType]:
     """Report bounded PEP 610 installer provenance, NOT immutable loaded-byte proof."""
     unverified: dict[str, SerializableType] = {"status": "unverified"}
@@ -215,7 +226,10 @@ def installer_provenance() -> dict[str, SerializableType]:
         commit = vcs.get("commit_id")
         if not isinstance(commit, str) or not _SHA.fullmatch(commit):
             return unverified
-        return {"status": "verified-installer-provenance", "commit": commit}
+        return {
+            "status": "verified-installer-provenance",
+            "commit": encode_public_digest(commit),
+        }
     except (
         OSError,
         ValueError,

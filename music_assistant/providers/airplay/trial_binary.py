@@ -8,6 +8,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import re
@@ -16,7 +17,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from music_assistant.helpers.private_trial import is_trial_target as _is_trial_target
+from music_assistant.helpers.private_trial import (
+    encode_public_digest,
+)
+from music_assistant.helpers.private_trial import (
+    is_trial_target as _is_trial_target,
+)
 from music_assistant.helpers.process import get_subprocess_env
 
 if TYPE_CHECKING:
@@ -38,6 +44,10 @@ class TrialBinaryError(RuntimeError):
     """Reject the private trial asset without stock or NTP fallback."""
 
 
+class ChildAttestationChangedError(ValueError):
+    """Reject an owned child whose executable changed during attestation."""
+
+
 def is_trial_target() -> bool:
     """Return whether this source overlay requires the fixed private trial pin."""
     return _is_trial_target()
@@ -56,8 +66,8 @@ async def validate_trial_binary() -> dict[str, SerializableType]:
         raise TrialBinaryError("Trial asset unavailable or unsafe") from err
     return {
         "mode": "private-official-dev-trial",
-        "expected_sha256": EXPECTED_SHA,
-        "validated_sha256": digest,
+        "expected_sha256": encode_public_digest(EXPECTED_SHA),
+        "validated_sha256": encode_public_digest(digest),
         "check_label": label,
         "check_outcome": "passed",
     }
@@ -68,15 +78,41 @@ async def attest_owned_child(child: AsyncProcess, role: str) -> dict[str, Serial
     result: dict[str, SerializableType] = {"role": role, "outcome": "unverified"}
     proc = child.proc
     if proc is None or child.closed or proc.returncode is not None:
+        result["reason"] = "not-live"
         return result
     try:
         digest = await asyncio.to_thread(_read_child_digest, proc.pid)
-    except OSError, ValueError:
+    except OSError as err:
+        result |= _attestation_os_error(err)
+        return result
+    except ChildAttestationChangedError:
+        result["reason"] = "child-changed-during-attestation"
+        return result
+    except ValueError:
+        result["reason"] = "executable-unstable-or-ineligible"
         return result
     if child.proc is not proc or child.closed or proc.returncode is not None:
+        result["reason"] = "child-changed-during-attestation"
         return result
-    result["actual_sha256"] = digest
-    result["outcome"] = "match" if digest == EXPECTED_SHA else "mismatch"
+    if digest != EXPECTED_SHA:
+        result["outcome"] = "mismatch"
+        return result
+    result["actual_sha256"] = encode_public_digest(digest)
+    result["outcome"] = "match"
+    return result
+
+
+def _attestation_os_error(err: OSError) -> dict[str, SerializableType]:
+    """Map procfs failures to finite diagnostics without exposing exception text."""
+    if err.errno in (errno.EACCES, errno.EPERM):
+        reason = "procfs-access-denied"
+    elif err.errno in (errno.ENOENT, errno.ENOTDIR, errno.ESRCH):
+        reason = "procfs-unavailable-or-child-exited"
+    else:
+        reason = "procfs-read-failed"
+    result: dict[str, SerializableType] = {"reason": reason}
+    if err.errno is not None:
+        result["errno"] = err.errno
     return result
 
 
@@ -206,7 +242,7 @@ def _read_child_digest(pid: int) -> str:
                 original.st_size,
                 original.st_mtime_ns,
             ):
-                raise ValueError("Owned executable changed during attestation")
+                raise ChildAttestationChangedError("Owned executable changed during attestation")
             return digest
         finally:
             os.close(fd)
