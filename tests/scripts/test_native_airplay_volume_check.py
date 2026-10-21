@@ -14,12 +14,15 @@ import json
 import logging
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
+from music_assistant.providers.airplay import session_volume
 from scripts import check_native_airplay_volume as check
+from tests.providers.airplay import test_session_volume
 from tests.providers.airplay.test_session_volume import make_rig
 
 
@@ -50,6 +53,25 @@ def test_source_checkout_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     check.assert_source_imports()
     monkeypatch.chdir(tmp_path)
     with pytest.raises(AssertionError, match="source root"):
+        check.assert_source_imports()
+
+
+@pytest.mark.parametrize("prefix", ["/usr/local", "/shared/developer-venv"])
+def test_source_imports_accept_shared_and_container_interpreters(
+    monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    """Import provenance depends on the checkout, not the interpreter's directory."""
+    monkeypatch.setattr(sys, "prefix", prefix)
+    check.assert_source_imports()
+
+
+@pytest.mark.parametrize("module", [session_volume, test_session_volume])
+def test_source_imports_reject_shadowed_modules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module: ModuleType
+) -> None:
+    """An unrelated installed module is rejected even with an otherwise valid source root."""
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "shadowed.py"))
+    with pytest.raises(AssertionError):
         check.assert_source_imports()
 
 

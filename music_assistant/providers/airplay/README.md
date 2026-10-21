@@ -75,7 +75,10 @@ UI success is claimed. `python -m scripts.check_native_airplay_volume --harness
 /absolute/path/to/airplay-cli/build/tests/test_live_metadata` exercises the real encrypted
 C peer, MA controller, fake confirmed actuators and atomic FIFO. The offline case verifies
 that a 63% request clamped to 61% returns committed state `610`, with unequal group levels
-preserved. This does not verify native output identity, UI routing or real hardware.
+preserved. Run from the MA source checkout; both the production module and fixture
+must import from that checkout. Shared worktree environments and CI container interpreters
+are supported, without treating interpreter location as source provenance. This does not
+verify native output identity, UI routing or real hardware.
 
 ## Radio metadata display
 
