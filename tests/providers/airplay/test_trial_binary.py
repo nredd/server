@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import cast
@@ -15,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from music_assistant.helpers import private_trial
-from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.process import AsyncProcess, descriptor_path
 from music_assistant.providers.airplay import helpers
 from music_assistant.providers.airplay import trial_binary as trial
 from music_assistant.providers.airplay.constants import StreamingProtocol
@@ -68,6 +69,16 @@ def asset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path.write_bytes(_elf())
     path.chmod(0o755)
     return path
+
+
+def test_digest_fd_is_offset_independent(asset: Path) -> None:
+    """FD hashing starts at offset zero and leaves the descriptor position unchanged."""
+    with asset.open("rb") as stream:
+        stream.seek(11)
+        before = stream.tell()
+        digest, _header = trial._digest_fd(stream.fileno())
+        assert digest == hashlib.sha256(_elf()).hexdigest()
+        assert stream.tell() == before
 
 
 async def test_correct_pin_revalidated_every_time(asset: Path) -> None:
@@ -150,8 +161,9 @@ async def test_replacement_during_check_rejected(asset: Path) -> None:
 @pytest.mark.parametrize(
     ("script", "error"),
     [
-        ("print('cliairplay check v5b3dcc4')", None),
-        ("print('cliairplay check v5b3dcc4'); raise SystemExit(1)", "failed"),
+        (f"print('cliairplay check {trial.EXPECTED_BUILD}')", None),
+        (f"print('cliairplay check {trial.EXPECTED_BUILD}'); raise SystemExit(1)", "failed"),
+        ("print('cliairplay check v5b3dcc4')", "failed"),
         ("print('cliairplay check v0000000')", "failed"),
         ("print('secret token=never-report')", "failed"),
         ("import time; time.sleep(10)", "timed out"),
@@ -159,14 +171,26 @@ async def test_replacement_during_check_rejected(asset: Path) -> None:
     ],
 )
 async def test_real_bounded_check(
-    script: str, error: str | None, monkeypatch: pytest.MonkeyPatch
+    script: str, error: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Exercise actual host children without ever executing a Linux ELF on macOS."""
+    root = tmp_path / "checked-media"
+    monkeypatch.setattr(trial, "TRIAL_ROOT", root)
+    monkeypatch.setattr(trial, "EXPECTED_SHA", hashlib.sha256(_elf()).hexdigest())
+    checked_asset = root / trial.EXPECTED_SHA / trial.ASSET_NAME
+    checked_asset.parent.mkdir(parents=True)
+    checked_asset.write_bytes(_elf())
+    checked_asset.chmod(0o755)
     spawn = asyncio.create_subprocess_exec
     children: list[asyncio.subprocess.Process] = []
 
     async def host_spawn(*args: object, **_kwargs: object) -> asyncio.subprocess.Process:
-        assert args == ("/fixed-test-binary", "--check")
+        inherited = _kwargs["pass_fds"]
+        assert isinstance(inherited, tuple)
+        descriptor = inherited[0]
+        assert isinstance(descriptor, int)
+        assert args == (descriptor_path(descriptor), "--check")
+        assert os.pread(descriptor, 64, 0) == _elf()
         child = await spawn(
             sys.executable,
             "-c",
@@ -183,12 +207,64 @@ async def test_real_bounded_check(
     monkeypatch.setattr(trial, "CHECK_TIMEOUT", 0.2)
     if error:
         with pytest.raises(trial.TrialBinaryError, match=error) as caught:
-            await trial._check_binary(Path("/fixed-test-binary"))
+            await trial._check_binary(checked_asset)
         assert "secret" not in str(caught.value)
     else:
-        assert await trial._check_binary(Path("/fixed-test-binary")) == trial.EXPECTED_BUILD
+        assert await trial._check_binary(checked_asset) == trial.EXPECTED_BUILD
     assert children
     assert all(child.returncode is not None for child in children)
+
+
+@pytest.mark.parametrize(
+    "ack",
+    [
+        b"[ATTEST] not-json\n",
+        b"[ATTEST] {}\n",
+        b'[ATTEST] {"version":2}\n',
+        b"x" * (trial.MAX_ATTEST_LINE + 1),
+    ],
+)
+async def test_private_process_rejects_bad_first_acknowledgement(
+    ack: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed, wrong-version, or oversized first stdout line kills the child."""
+    asset_fd = os.open(tmp_path / "asset", os.O_CREAT | os.O_RDWR, 0o700)
+    proc = trial.TrialAsyncProcess(["/fixed"], asset_fd=asset_fd, stdout=True)
+    proc.proc = MagicMock(returncode=None)
+    monkeypatch.setattr(proc, "_read_attestation_line", AsyncMock(return_value=ack))
+    monkeypatch.setattr(proc, "_kill_and_reap", AsyncMock())
+    with pytest.raises(trial.TrialBinaryError):
+        await proc._verify_acknowledgement()
+    os.close(asset_fd)
+
+
+async def test_private_process_binds_ack_to_exact_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the nonce and both pinned digests from this process create a trusted receipt."""
+    asset_fd = os.open(tmp_path / "asset", os.O_CREAT | os.O_RDWR, 0o700)
+    proc = trial.TrialAsyncProcess(["/fixed"], asset_fd=asset_fd, stdout=True)
+    child = MagicMock(returncode=None)
+    proc.proc = child
+    acknowledgement = {
+        "version": 1,
+        "kind": "current-image-match-at-ack",
+        "nonce": proc._attest_nonce,
+        "exec_fd_sha256": trial.EXPECTED_SHA,
+        "self_sha256": trial.EXPECTED_SHA,
+    }
+    monkeypatch.setattr(
+        proc,
+        "_read_attestation_line",
+        AsyncMock(return_value=("[ATTEST] " + json.dumps(acknowledgement) + "\n").encode()),
+    )
+    await proc._verify_acknowledgement()
+    assert proc._trusted_receipt is not None
+    assert proc._trusted_receipt.process is proc
+    assert proc._trusted_receipt.proc is child
+    assert proc._args[0] == descriptor_path(asset_fd)
+    assert "--attest-fd" in proc._args
+    os.close(asset_fd)
 
 
 async def test_early_failure_precedes_registration_and_ntp_fallback(asset: Path) -> None:
@@ -210,7 +286,7 @@ async def test_all_callers_select_same_pin_and_fail_closed(asset: Path) -> None:
     mass = cast("MagicMock", provider.mass)
     mass.streams.get_source_ip = AsyncMock(return_value="127.0.0.1")
     mass.create_task.side_effect = lambda coro: coro.close()
-    with patch("music_assistant.providers.airplay.provider.AsyncProcess") as spawn:
+    with patch.object(trial, "create_private_process", new_callable=AsyncMock) as spawn:
         spawn.return_value.start = AsyncMock()
         await provider._start_ptp_daemon()
         assert spawn.call_args.args[0][0] == str(asset)
@@ -224,7 +300,7 @@ async def test_all_callers_select_same_pin_and_fail_closed(asset: Path) -> None:
         device_id="test",
     )
     await pairing.start_pairing_session()
-    with patch("music_assistant.providers.airplay.pairing.AsyncProcess") as spawn:
+    with patch.object(trial, "create_private_process", new_callable=AsyncMock) as spawn:
         spawn.return_value.start = AsyncMock()
         with patch("asyncio.create_task", side_effect=lambda coro: coro.close()):
             await pairing._start_pair_setup_process()

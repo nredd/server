@@ -254,6 +254,7 @@ class AirPlayProvider(PlayerProvider):
         # Fail before any service registration; invalid pins must never look like NTP fallback.
         if trial_binary.is_trial_target():
             self._trial_identity = await trial_binary.validate_trial_binary()
+            await trial_binary.preflight_current_image()
         self._set_pyatv_log_level()
         self._drop_unverified_password_markers()
         self._reset_auto_pinned_compat_modes()
@@ -908,7 +909,12 @@ class AirPlayProvider(PlayerProvider):
         # timing issues from a user's log, and it is invisible otherwise: --if is left
         # out entirely for a default bind ip.
         self.logger.debug("Starting shared PTP clock daemon: if=%s", if_arg or "<all interfaces>")
-        daemon = AsyncProcess(args, stdout=True, stderr=True, name="cliairplay-ptp-daemon")
+        if trial_binary.is_trial_target():
+            daemon = await trial_binary.create_private_process(
+                args, stdout=True, stderr=True, name="cliairplay-ptp-daemon"
+            )
+        else:
+            daemon = AsyncProcess(args, stdout=True, stderr=True, name="cliairplay-ptp-daemon")
         # (Re)gate readiness for this daemon instance: not ready until a reader
         # sees the "daemon up" line (a restart clears any previous readiness).
         if self._ptp_daemon_ready is None:

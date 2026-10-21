@@ -215,9 +215,14 @@ class AirPlayPairing:
             self.address,
         ]
         self._pair_proc_stderr = []
-        self._pair_proc = AsyncProcess(
-            args, stdin=True, stdout=True, stderr=True, name="cliairplay-pair-setup"
-        )
+        if trial_binary.is_trial_target():
+            self._pair_proc = await trial_binary.create_private_process(
+                args, stdin=True, stdout=True, stderr=True, name="cliairplay-pair-setup"
+            )
+        else:
+            self._pair_proc = AsyncProcess(
+                args, stdin=True, stdout=True, stderr=True, name="cliairplay-pair-setup"
+            )
         await self._pair_proc.start()
         self._pair_proc.attach_stderr_reader(
             asyncio.create_task(self._pair_setup_stderr_reader(self._pair_proc))

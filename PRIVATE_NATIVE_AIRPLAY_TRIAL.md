@@ -26,6 +26,17 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
+The private CLI proof branch is pinned to `5c4901f01834498babeb7af8e0f3b919aef15a20`.
+Canonical CLI Build `39604837204` passed Linux native/cross, macOS, Python and sanitizer
+jobs; Linux tests exercise the real inherited-FD/self-image entrypoint. Its AArch64 artifact
+`12347767537` has ELF SHA256
+`c65b4ddb067c85fafe461ab51eb9828e999eb0c7f3a7f87942a830cb35479199`.
+The earlier `f41334b` run failed GCC's SHA256 buffer-extent check; that failure was fixed,
+not waived. The new asset is staged alongside the old pin, never substituted into stock MA.
+Its SSH-addon `--check` passed; its SSH-addon self-image probe failed closed. That musl
+compatibility-loader environment is not the protected MA container, so it proves neither
+protected success nor permission to skip the target preflight.
+
 ## Private bootstrap and HA isolation
 
 On this overlay's Linux ARM profile ONLY, the official entrypoint contract
@@ -83,8 +94,10 @@ The overlay is a read-only CONSUMER of media, even though the official app mount
 It never writes media, changes the packaged stock executable, downloads a binary or
 falls back to stock. All path components must be non-symlinks; the bounded regular
 executable must match SHA256 and ELF64 little-endian AArch64 headers before `--check`.
-The check has a five-second deadline, 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `v5b3dcc4` with exit zero.
+The build check executes a retained validated descriptor too, never a pathname which can
+be swapped and restored between pre/post validation. It has a five-second deadline,
+4096-byte combined-output limit and at most one
+second of cleanup, and must report `cliairplay`, `check` and `v5c4901f` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.
@@ -108,19 +121,43 @@ eight unsigned big-endian 32-bit words. This survives normal diagnostics sanitiz
 loosening it. This is INSTALLER provenance, NOT immutable loaded-byte or image proof. Compare
 the commit with the EXTERNAL private receipt, never a tracked self-referential overlay SHA.
 
-Startup validation is a historical claim, NOT current child attestation. Each available
-owned stream/PTP/pairing process is separately checked through `/proc/<knownpid>/exe`
-using bounded reads and pre/post process-liveness checks. No arbitrary PID/path API,
+Startup validation is a historical claim, NOT current child attestation. Before any
+private provider networking, the pinned CLI runs an `--attest-only` protected-self-read
+preflight from the same retained validated asset FD. It must acknowledge the exact fresh
+nonce and both pinned SHA-256 values, then intentionally exit zero. This preflight is
+historical only, never a live-child receipt. Each private PTP, stream, and pairing launch
+executes that same inherited read-only FD through `/proc/self/fd/<N>` with `pass_fds` and
+must emit one bounded first stdout `[ATTEST]` JSON acknowledgement before receiver I/O.
+The parent accepts it only when version, kind, nonce, both digests, and the exact owned
+live process object match. A malformed, stale, wrong, late, or missing first
+acknowledgement kills and reaps the owned child before stdout status, stderr `connected`,
+readiness, or PCM production can proceed. The private process's stdin writer also rejects
+all audio or pairing bytes until the exact live acknowledgement receipt exists, so a
+concurrent producer cannot bypass the caller's start/readiness ordering. The direct ffmpeg
+stdin-FD handoff also requires the same verified live receipt before exporting the pipe.
+A repeated acknowledgement in subsequent stdout
+is rejected by chunk, exact-size and line readers, revokes the receipt, and kills/reaps the
+child. Private stdout is line-framed; over-limit records fail closed rather than being
+silently discarded. Raw `communicate()` is unavailable for private children because it bypasses those
+checked reader/writer paths. An owned exit watcher releases the retained executable FD on
+natural termination too, even when a role's caller only polls its closed state.
+This is point-in-time
+`current-image-match-at-ack` evidence only, NOT a continuous image proof, parent-procfs
+proof, AppArmor policy change, capability change, or Docker-protection bypass. Later diagnostics
+require the same owned process object to remain live. Legacy non-FD-owned handles retain the
+original bounded `/proc/<knownpid>/exe` check; an FD-launched private child without a complete
+acknowledgement never falls back to that check. No arbitrary PID/path API,
 process arguments, environment, IDs, raw output or secrets are exposed. Absent pairing
 processes require no attestation; failures are `unverified` with only one finite reason:
-`not-live`, `procfs-unavailable-or-child-exited`, `procfs-access-denied`,
+`not-live`, `attestation-not-complete`, `procfs-unavailable-or-child-exited`, `procfs-access-denied`,
 `executable-unstable-or-ineligible`, `procfs-read-failed` or
 `child-changed-during-attestation`; `OSError` failures additionally retain only numeric
 `errno`. A live readable different executable is `mismatch` with no unexpected digest.
-Only a matching child includes encoded `actual_sha256`. Selection uses a mutable pathname,
-not an immutable execution sandbox: an adversarial concurrent media replacement after
-validation remains possible, so live child attestation is a separate required gate. None of
-these fields prove native UI controls or playback success.
+Only a matching child includes encoded `actual_sha256`. The fixed asset is opened without
+symlinks, validated, and retained as the executable descriptor; pathname replacement cannot
+select a different initial exec target. The acknowledged self-image hash must still match the
+external pin before readiness. This is not an immutable execution sandbox and does not detect
+a later exec or memory change. None of these fields prove native UI controls or playback success.
 
 ## Gates before any launch
 
@@ -157,8 +194,10 @@ these fields prove native UI controls or playback success.
   trial reached Linux private API readiness in 48.1 seconds with a distinct ID; a second
   no-playback trial completed normal fresh onboarding and verified old ports unbound.
   Its identity gate failed closed: full hashes were redacted by diagnostics and the
-  PTP child was `unverified`. Both trials restored stock through the independent
-  recovery route. These observations do not establish native feature acceptance or an
+  PTP child was `unverified`. A later `c378319` trial verified the exact installed source
+  and startup ELF, but its parent-procfs child read failed with `EACCES`; normal host audit
+  logs confirmed same-profile AppArmor `ptrace` process-read denials in both directions. All trials restored stock
+  through the independent recovery route, without playback. No policy or capability was changed. These observations do not establish native feature acceptance or an
   immutable installed image digest. Parent owns the full suite, review, external receipt,
   commit/push and live gates for each new source pin. Earlier observations do not authorize
   another source revision or playback.

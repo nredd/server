@@ -15,6 +15,7 @@ from music_assistant.constants import CONF_SYNC_ADJUST
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
 from music_assistant.helpers.ffmpeg import FFMpeg
 
+from . import trial_binary
 from .constants import (
     AIRPLAY_CLOCK_READY_LEAD_MS,
     AIRPLAY_CLOCK_READY_TIMEOUT_MS,
@@ -1427,10 +1428,16 @@ class AirPlayStreamSession:
         )
         cli_proc = stream._cli_proc
         assert cli_proc
-        assert cli_proc.proc
-        assert cli_proc.proc.stdin
-        stdin_transport = cli_proc.proc.stdin.transport
-        audio_output: str | int = stdin_transport.get_extra_info("pipe").fileno()
+        audio_output: str | int
+        if trial_binary.is_trial_target():
+            if not isinstance(cli_proc, trial_binary.TrialAsyncProcess):
+                raise trial_binary.TrialBinaryError("Private audio output has no verified child")
+            audio_output = cli_proc.verified_stdin_fd()
+        else:
+            assert cli_proc.proc
+            assert cli_proc.proc.stdin
+            stdin_transport = cli_proc.proc.stdin.transport
+            audio_output = stdin_transport.get_extra_info("pipe").fileno()
         ffmpeg = FFMpeg(
             audio_input="-",
             input_format=self.pcm_format,

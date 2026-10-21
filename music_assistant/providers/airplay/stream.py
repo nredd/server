@@ -27,6 +27,7 @@ from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thu
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import sanitize_http_header_value
+from music_assistant.providers.airplay import trial_binary
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_ARTWORK_RENDER_TIMEOUT,
     AIRPLAY_ARTWORK_SIZE,
@@ -340,18 +341,19 @@ class AirPlayStream:
         self.reset_reanchor_shift()
         args = await self._build_cli_args(use_shared_ptp)
         self.player.logger.debug("Starting cliairplay for player %s", self.player.player_id)
-        self._cli_proc = AsyncProcess(
-            args,
-            stdin=True,
-            stdout=True,
-            stderr=True,
-            name="cliairplay",
-            env={
-                "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": (
-                    "1" if self._homepod_remote_admission_requested else "0"
-                )
-            },
-        )
+        cli_env = {
+            "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": (
+                "1" if self._homepod_remote_admission_requested else "0"
+            )
+        }
+        if trial_binary.is_trial_target():
+            self._cli_proc = await trial_binary.create_private_process(
+                args, stdin=True, stdout=True, stderr=True, name="cliairplay", env=cli_env
+            )
+        else:
+            self._cli_proc = AsyncProcess(
+                args, stdin=True, stdout=True, stderr=True, name="cliairplay", env=cli_env
+            )
         try:
             await self.commands_pipe.create()
             await self._cli_proc.start()
