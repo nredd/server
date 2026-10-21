@@ -7,6 +7,8 @@
   "private_data_namespace": "/data/.native-radio-trial-7d964670ba5d42fd90a3a709c71ec462/data",
   "private_cache_namespace": "/data/.native-radio-trial-7d964670ba5d42fd90a3a709c71ec462/data/.cache",
   "private_marker_version": 1,
+  "private_api_port": 18095,
+  "private_ingress": "disabled-direct-api-only",
   "trial_ha_publication": "suppressed-before-token-creation",
   "installer_provenance": "pep610-not-immutable-loaded-byte-proof",
   "external_receipt_required": true,
@@ -19,7 +21,7 @@
     "ha-discovery-isolation-and-native-controls-acceptance"
   ],
   "frontend_repo": "",
-  "official_app_contract_sha": "56e9d912d977d5fdf45daa0266f19d311f76dd47",
+  "official_app_contract_sha": "869d9ebd37a09c2a8e1aef4d90bd8c34ba65b683",
   "cli_source_sha": "1c95c1a4d1c89ddc72c10f9c29d7b7faa59dca68",
   "cli_sha256": "078f71414f8a46811488fbbb8196ba8c1b60170cd19bc3c51c3819b8ee29279a",
   "cli_build_label": "v5b3dcc4",

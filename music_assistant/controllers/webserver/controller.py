@@ -65,6 +65,7 @@ from music_assistant.controllers.webserver.helpers.ssl import (
     format_certificate_info,
     verify_ssl_certificate,
 )
+from music_assistant.helpers import private_trial
 from music_assistant.helpers.api import parse_arguments, redact_json_secrets
 from music_assistant.helpers.json import json_dumps, json_loads
 from music_assistant.helpers.provider_access import with_derived_provider_filter
@@ -401,7 +402,7 @@ class WebserverController(CoreController):
         routes.append(("GET", "/sendspin", self._sendspin_proxy.handle_sendspin_proxy))
         await self.auth.setup()
         # start the webserver
-        if self.mass.running_as_hass_addon:
+        if self.mass.running_as_hass_addon and private_trial.should_setup_ingress():
             # if we're running on the HA supervisor we start an additional TCP site
             # on the internal ("172.30.32.") IP for the HA ingress proxy - that address
             # lives on a docker bridge, so it needs the unfiltered adapter list
@@ -414,7 +415,7 @@ class WebserverController(CoreController):
             ingress_tcp_site_params = None
         port_value = config.get_value(CONF_BIND_PORT)
         assert isinstance(port_value, int)
-        self.publish_port = port_value
+        self.publish_port = private_trial.get_webserver_bind_port(port_value)
         bind_ip = cast("str | None", config.get_value(CONF_BIND_IP))
         # Create SSL context if SSL is enabled
         ssl_context = None

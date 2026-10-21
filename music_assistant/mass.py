@@ -1340,6 +1340,8 @@ class MusicAssistant:
                 continue
             if not prov_manifest.builtin:
                 continue
+            if not private_trial.should_load_builtin_provider(prov_manifest.domain):
+                continue
             await self.config.create_builtin_provider_config(prov_manifest.domain)
 
         # load all configured (and enabled) builtin providers
@@ -1350,6 +1352,7 @@ class MusicAssistant:
             for prov_conf in prov_configs
             if (manifest := self._provider_manifests.get(prov_conf.domain))
             and manifest.builtin
+            and private_trial.should_load_builtin_provider(prov_conf.domain)
             and (prov_conf.enabled or manifest.allow_disable is False)
         ]
 
@@ -1370,7 +1373,9 @@ class MusicAssistant:
         default_providers_setup = set(self.config.get(CONF_DEFAULT_PROVIDERS_SETUP))
         changes_made = False
         newly_created_defaults: set[str] = set()
-        for default_provider, require_mdns in DEFAULT_PROVIDERS:
+        for default_provider, require_mdns in private_trial.get_default_providers(
+            DEFAULT_PROVIDERS
+        ):
             if default_provider in default_providers_setup:
                 # already processed/setup before, skip
                 continue
@@ -1414,6 +1419,9 @@ class MusicAssistant:
                 not (manifest := self._provider_manifests.get(prov_conf.domain))
                 or not manifest.builtin
             )
+            and private_trial.should_load_provider(
+                prov_conf.domain, manifest.builtin if manifest else False
+            )
         ]
         # load providers concurrently via tasks, bounded so a host with many providers does
         # not import every provider module at once (a torch-backed one costs hundreds of MB)
@@ -1433,6 +1441,13 @@ class MusicAssistant:
 
     async def _load_provider(self, conf: ProviderConfig, *, auto_setup: bool = False) -> None:
         """Load (or reload) a provider."""
+        domain = conf.domain
+        prov_manifest = self._provider_manifests.get(domain)
+        if not private_trial.should_load_provider(
+            domain, prov_manifest.builtin if prov_manifest else False
+        ):
+            msg = f"Provider {domain} is unavailable in the private trial"
+            raise SetupFailedError(msg)
         # if provider is already loaded, stop and unload it first
         await self.unload_provider(conf.instance_id)
         LOGGER.debug("Loading provider %s", conf.name or conf.domain)
@@ -1444,14 +1459,11 @@ class MusicAssistant:
         # (see below): the full options entries - and thus which values are required - are
         # only known once the instance exists.
 
-        domain = conf.domain
-        prov_manifest = self._provider_manifests.get(domain)
         # check for other instances of this provider
         existing = next((x for x in self.providers if x.domain == domain), None)
         if existing and prov_manifest and not prov_manifest.multi_instance:
             msg = f"Provider {domain} already loaded and only one instance allowed."
             raise SetupFailedError(msg)
-        # check valid manifest (just in case)
         if not prov_manifest:
             msg = f"Provider {domain} manifest not found"
             raise SetupFailedError(msg)

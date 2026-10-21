@@ -245,6 +245,26 @@ def test_nontrial_paths_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     trial.bind_server_id("/original", "ordinary-id")
 
 
+def test_runtime_profile_selectors_are_private_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep normal ports and providers unchanged while restricting the trial profile."""
+    defaults = {("airplay", False), ("chromecast", False), ("wiim", True)}
+
+    monkeypatch.setattr(trial, "is_trial_target", lambda: False)
+    assert trial.get_webserver_bind_port(8095) == 8095
+    assert trial.get_default_providers(defaults) is defaults
+    assert trial.should_setup_ingress() is True
+    assert trial.should_load_builtin_provider("sendspin") is True
+    assert trial.should_load_builtin_provider("builtin") is True
+
+    monkeypatch.setattr(trial, "is_trial_target", lambda: True)
+    assert trial.get_webserver_bind_port(8095) == trial.PRIVATE_API_PORT
+    assert trial.get_default_providers(defaults) == {("airplay", False)}
+    assert trial.should_setup_ingress() is False
+    assert trial.should_load_builtin_provider("sendspin") is False
+    assert trial.should_load_builtin_provider("sendspin_source") is False
+    assert trial.should_load_builtin_provider("builtin") is True
+
+
 def test_arbitrary_trial_path_rejected(app_data: Path) -> None:
     """No new generic path or seed interface is exposed."""
     with pytest.raises(trial.PrivateTrialError, match="fixed"):

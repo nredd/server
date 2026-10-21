@@ -25,6 +25,9 @@ NAMESPACE = ".native-radio-trial-7d964670ba5d42fd90a3a709c71ec462"
 MARKER = "trial-marker.json"
 VERSION = 1
 MAX_JSON = 1024 * 1024
+PRIVATE_API_PORT = 18095
+TRIAL_DEFAULT_PROVIDER_DOMAINS = frozenset({"airplay"})
+TRIAL_DISABLED_BUILTIN_PROVIDER_DOMAINS = frozenset({"sendspin", "sendspin_source"})
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ID = re.compile(r"[0-9a-f]{32}")
 _FRESH_ROOTS: set[Path] = set()
@@ -40,6 +43,45 @@ def is_trial_target() -> bool:
         "aarch64",
         "arm64",
     )
+
+
+def get_webserver_bind_port(configured_port: int) -> int:
+    """Return the private API port for the trial, otherwise the configured port."""
+    if is_trial_target():
+        return PRIVATE_API_PORT
+    return configured_port
+
+
+def get_default_providers(
+    providers: set[tuple[str, bool]],
+) -> set[tuple[str, bool]]:
+    """Return trial-safe default providers without changing ordinary profiles."""
+    if not is_trial_target():
+        return providers
+    return {
+        (domain, require_mdns)
+        for domain, require_mdns in providers
+        if domain in TRIAL_DEFAULT_PROVIDER_DOMAINS
+    }
+
+
+def should_load_builtin_provider(domain: str) -> bool:
+    """Return whether a builtin provider may run for this profile."""
+    return not is_trial_target() or domain not in TRIAL_DISABLED_BUILTIN_PROVIDER_DOMAINS
+
+
+def should_load_provider(domain: str, builtin: bool) -> bool:
+    """Return whether a provider may load in this private profile."""
+    if not is_trial_target():
+        return True
+    if builtin:
+        return should_load_builtin_provider(domain)
+    return domain in TRIAL_DEFAULT_PROVIDER_DOMAINS
+
+
+def should_setup_ingress() -> bool:
+    """Return whether the HA ingress listener may be created."""
+    return not is_trial_target()
 
 
 def prepare_data(data_dir: str, cache_dir: str) -> tuple[str, str]:

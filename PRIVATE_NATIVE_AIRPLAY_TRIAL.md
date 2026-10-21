@@ -17,7 +17,10 @@ never a floating branch. Keep `frontend_repo: ""` to use the bundled frontend.
 
 The official DEV app contract cached at
 `/Users/redd/code/airplay-cli/build/upstream-app-contract` is revision
-`56e9d912d977d5fdf45daa0266f19d311f76dd47`. It source-installs at startup, shares the
+`869d9ebd37a09c2a8e1aef4d90bd8c34ba65b683`. Fresh verification found only the
+config version changed to `2.11.0.dev2026102103`; the Dockerfile and entrypoint
+are byte-identical to cached `56e9d912d977d5fdf45daa0266f19d311f76dd47`.
+It source-installs at startup, shares the
 production app's ports and supplies its own internal official secrets. Do not read,
 extract or copy `app_secrets`, credentials or original databases. Do not redistribute
 an image derived from the official server image. The old local DEV app in ERROR and
@@ -45,6 +48,25 @@ An interrupted initial bootstrap deliberately requires owner investigation, not 
 repair or adoption. This is an offline bootstrap invariant, NOT evidence that HAOS has
 actually booted this namespace. A distinct live server ID must still be verified privately
 against the original before playback. The ID is not added to diagnostics or startup logs.
+
+## Private runtime profile
+
+On the Linux ARM trial target ONLY, the web API always binds to fixed port `18095`,
+ignoring any stored webserver port. The controller adopts the port actually bound before
+publishing its base URL, including an OS-selected fallback. It does NOT create the HA
+Ingress listener or inspect interface addresses for Ingress discovery. The HA Ingress
+panel is therefore unavailable for this trial. Use the direct private API/setup URL:
+`http://<trial-host>:18095/setup` (or the controller's logged actual base URL). Normal
+profiles retain their configured API port and HA Ingress listener.
+
+The private provider profile auto-creates only `airplay`. It does not auto-create other
+default providers, including mDNS-triggered device providers. It also neither creates nor
+loads `sendspin` or `sendspin_source`, including retained private configs after restart.
+Other builtins, including `builtin` URL radio and the trial's own internal `hass` provider,
+retain their normal behavior. AirPlay therefore has no Sendspin bridge/web-player/device
+claim path in this profile; existing absent-provider bridge paths remain graceful. This
+is private runtime isolation, not a public configuration feature and not a generic safe
+mode.
 
 Both trial publication paths are guarded before work: `_mass._tcp` registration/update
 and Supervisor `/discovery`, including before HA system-token creation. Cold setup,
@@ -124,6 +146,122 @@ required gate. None of these fields prove native UI controls or playback success
   controls, source/image identity, actual Linux startup and startup duration remain
   unverified. Parent owns final full suite, review, external receipt, commit/push and live
   gates. No deployment, live setting change or installer execution is part of this work.
+
+## Private recovery controller
+
+`scripts/private_airplay_recovery.py` is private HAOS recovery tooling. It uses the Python
+stdlib and installed native `/usr/bin/curl`, only the SSH add-on's `SUPERVISOR_TOKEN`,
+and fixed add-on slugs and target entity
+IDs. It never accepts an API host, endpoint, credential, media URL, queue, or raw add-on
+configuration as an argument or stores any of those values. Never add it, its tests, or its
+runbook procedure to upstream work.
+
+Copy the reviewed helper to the SSH add-on, verify its SHA-256 against the external
+receipt, and set `RECOVERY_SCRIPT` to that verified absolute path. It supports the SSH
+app's Python 3.13 independently of the server's Python 3.14. Read-only capture has been
+exercised against the actual Supervisor/Core wire responses; that is not restoration proof.
+
+Before a short authorized trial window, run this **on HAOS from the SSH add-on** while the
+fresh target state is known, not from a historical snapshot:
+
+```sh
+python3 "$RECOVERY_SCRIPT" capture --target main
+# prints /data/airplay-native-probe/recovery/<fresh-uuid>
+python3 "$RECOVERY_SCRIPT" arm --run <fresh-uuid> --timeout 120
+```
+
+`capture --target main|office|both` permits only those fixed target scopes and defaults to
+`both`. A single-target run never snapshots or restores the other target; it still refuses an
+active non-target MA stream. `capture` rejects an unprotected official add-on or any installed version other than exact
+`2.10.7`, target groups containing non-target players, malformed state, unsupported play state,
+and any other active Music Assistant media player. It writes a new UUID directory only beneath
+the dedicated `recovery` subdirectory, with `0700` directory and `0600` state permissions. It
+captures only target group membership, volume, play state, and the official/DEV app
+started/protected/version facts. It does not recover queues or media URLs. In particular,
+an idle ungrouped snapshot means restore must keep the players idle and ungrouped, not resume
+an older queue. This controller is HA/add-on scoped only: HA's idle state does not verify a
+native receiver, its direct reachability, its independent receiver volume, or peer grouping.
+Do not overwrite receiver volume from HA `volume_level`, fan peer telemetry into groups, or
+claim peer restoration from this receipt.
+
+`arm` uses native `posix_spawn` to exec a detached, new-session watchdog with only
+`SUPERVISOR_TOKEN` in its environment. No Python runs between fork and exec, including
+when the caller has other threads.
+It validates its UUID and nonce and invokes the same restore path at the hard deadline. Only
+arming requires a fresh snapshot; an already armed watchdog never refuses an emergency restore
+solely because its snapshot aged. On
+manual failure or deadline, restore stops DEV first, starts and checks official MA, and
+reloads its existing HA config entry only when this controller started the app. This resets
+HA's reconnect backoff without changing the entry's configuration or credentials or starting
+any discovery flow. It waits for the selected targets, restores groups/levels/play state,
+then verifies them before writing its
+owner-only receipt. A missing or `verified: false` receipt is a failed recovery -- do not
+claim success. A process-held application-wide lease prevents overlapping watchdogs for
+different run IDs. A matching verified completion receipt prevents a delayed old watchdog
+from stopping a subsequent trial. The lease remains held until that watchdog exits.
+The watchdog is independent of the DEV app, but mock tests are not real HAOS restoration
+evidence. A real short restart drill succeeded. A longer probe exposed shared HA
+reconnect backoff: both the target and another MA entity returned 159.4 seconds after MA
+restart, exceeding the controller's 90-second deadline. That failed receipt remains failed;
+it is not counted as successful restoration. The scoped existing-entry reload addresses that
+reconnect boundary, rather than suppressing the timeout or weakening state verification.
+Verify the revised path in a real same-duration drill before launching DEV.
+
+Run the nondestructive detached-child path before the live window:
+
+```sh
+python3 "$RECOVERY_SCRIPT" self-test
+```
+
+This creates a temporary private run and uses only its in-process fake transport in the
+child. It proves child detachment, run ownership, timeout wakeup, restore ordering and
+receipt handling without calling HAOS or a speaker. It is not a live restore test.
+
+### Recovery hardening notes
+
+Manual `restore` and a deadline watchdog take the same bounded, application-wide mutation
+lock before checking a completion receipt or changing DEV/official MA. This prevents one
+run's manual restore from racing another run's watchdog. A failed receipt remains private
+failure evidence, but the same run ID and nonce may atomically replace its own `verified:
+false` receipt with `verified: true` only after a later restore verifies; foreign or malformed
+receipts never become successful.
+
+Before reloading the existing HA entry after starting official MA, recovery waits within the
+same 90-second deadline for the fixed unauthenticated local MA `/info` endpoint. It retries
+only documented temporary availability responses. Target-state reads similarly retry only
+Core `404`, `502`, and `503`; authentication, schema, and other failures remain fail-closed.
+
+A snapshot's HA group member order is preserved because it may encode the leader. Recovery
+skips player service commands when the observed HA state already matches. It never maps HA
+`volume_level` to an independent native receiver level. A changed stored HA volume fails
+closed instead of issuing `volume_set`; restore receipts cover HA app/state only, not native
+peers, receiver reachability, native volume, or peer grouping. The parent must separately
+verify any explicitly authorized native-peer restoration.
+
+The fake transport is available to a detached `self-test-child` only when that exact armed
+run has an owner-only simulation marker bound to its UUID and nonce. An ordinary production
+snapshot cannot select fake transport. Snapshot schema 1 remains valid for emergency
+restores.
+
+The controller requires the installed native `/usr/bin/curl` (HAOS 8.22.0) and is therefore
+not pure-Python HTTP tooling. Each fixed Supervisor or local readiness request uses curl with
+`--disable`, a cleared child environment, a validated fixed path, `--max-time` and a matching
+parent timeout from the same remaining absolute deadline, a `65536`-byte response cap, and no
+redirect or TLS-relaxation options. The authorization header is supplied only through curl's
+stdin configuration, never arguments, files, logs, or inherited environment. Slow headers,
+slow bodies, DNS, connection, and transfer work cannot extend the 90-second recovery budget.
+
+`arm` rejects any existing `receipt.json`, including a broken receipt symlink. A manually
+completed run must receive a new capture UUID before arming; this prevents an old no-op
+watchdog receipt from leaving a later DEV trial without protection. A watchdog that was
+already armed still treats its own matching verified receipt as a settled no-op after it
+acquires the mutation lock.
+
+Failed receipts are bounded, exact-schema, nonce-bound evidence. Before a same-run verified
+promotion, recovery exclusively archives the false receipt as `failed_receipt.json` (`0600`),
+then atomically replaces the live receipt. The verified receipt explicitly scopes verification
+to HA app/state and excludes native peers. Mutation-lock waiting consumes the same absolute
+90-second recovery budget and rechecks the settled receipt only after lock acquisition.
 
 ## Local checks
 
