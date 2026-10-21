@@ -98,6 +98,8 @@ _DOCKER_SUBNET = ipaddress.ip_network("172.16.0.0/12")
 class AirPlayPlayer(Player):
     """Base implementation shared by all AirPlay players."""
 
+    _trial_pairing: AirPlayPairing | None = None
+
     def __init__(
         self,
         provider: AirPlayProvider,
@@ -1217,6 +1219,7 @@ class AirPlayPlayer(Player):
             finally:
                 # tears down the subprocess on retry, success and abort (cancellation)
                 await pairing.close()
+                self._trial_pairing = None
             collected[cred_key] = credentials
             if password_pairing:
                 # The device password authenticates every later stream too (the
@@ -1285,6 +1288,7 @@ class AirPlayPlayer(Player):
         started = False
         try:
             pairing = self._build_streaming_pairing(protocol)
+            self._trial_pairing = pairing
             await pairing.start_pairing_session()
             if pin_pairing:
                 await pairing.start_pin_pairing()
@@ -1298,6 +1302,7 @@ class AirPlayPlayer(Player):
         finally:
             if not started and pairing is not None:
                 await pairing.close()
+                self._trial_pairing = None
         assert pairing is not None  # reached only when started, i.e. a live session
         return pairing
 

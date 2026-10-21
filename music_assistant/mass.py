@@ -77,6 +77,7 @@ from music_assistant.controllers.tasks import TasksController
 from music_assistant.controllers.translations import TranslationController
 from music_assistant.controllers.webserver import WebserverController
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
+from music_assistant.helpers import private_trial
 from music_assistant.helpers.aiohttp_client import create_clientsession
 from music_assistant.helpers.api import APICommandHandler, api_command
 from music_assistant.helpers.build_info import get_official_build_info
@@ -267,6 +268,10 @@ class MusicAssistant:
 
     async def start(self) -> None:  # noqa: PLR0915
         """Start running the Music Assistant server."""
+        if private_trial.is_trial_target():
+            await asyncio.to_thread(
+                private_trial.validate_bootstrap, self.storage_path, self.cache_path
+            )
         self.loop = asyncio.get_running_loop()
         # start() runs on the event loop thread, so this is the loop's thread id.
         self.loop_thread_id = threading.get_ident()
@@ -280,6 +285,9 @@ class MusicAssistant:
         # setup config controller first and fetch important config values
         self.config = ConfigController(self)
         await self.config.setup()
+        if private_trial.is_trial_target():
+            await self.config.async_save()
+            await asyncio.to_thread(private_trial.bind_server_id, self.storage_path, self.server_id)
         self.discovery = DiscoveryController(self)
         # the shared http sessions resolve .local names through this zeroconf instance,
         # so it must exist before anything can send a request
@@ -290,7 +298,7 @@ class MusicAssistant:
         await self._setup_storage()
         LOGGER.info(
             "Starting Music Assistant Server (%s) version %s - HA add-on: %s - Safe mode: %s",
-            self.server_id,
+            "private-trial" if private_trial.is_trial_target() else self.server_id,
             self.version,
             self.running_as_hass_addon,
             self.safe_mode,

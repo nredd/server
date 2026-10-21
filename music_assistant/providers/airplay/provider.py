@@ -32,6 +32,7 @@ from music_assistant.helpers.config_entries import (
 )
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
+from music_assistant.helpers.private_trial import installer_provenance
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import (
     get_ip_addresses,
@@ -41,6 +42,7 @@ from music_assistant.helpers.util import (
 )
 from music_assistant.models.player_provider import PlayerProvider
 
+from . import trial_binary
 from .constants import (
     AIRPLAY_DISCOVERY_TYPE,
     AIRPLAY_VOLUME_MUTE,
@@ -104,6 +106,7 @@ class AirPlayProvider(PlayerProvider):
     """Player provider for AirPlay based players."""
 
     reload_on_streams_network_change = True
+    _trial_identity: dict[str, SerializableType] | None = None
     _dacp_server: asyncio.Server
     _dacp_info: AsyncServiceInfo
     _bridge_manager: SendspinBridgeManager
@@ -248,6 +251,9 @@ class AirPlayProvider(PlayerProvider):
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
+        # Fail before any service registration; invalid pins must never look like NTP fallback.
+        if trial_binary.is_trial_target():
+            self._trial_identity = await trial_binary.validate_trial_binary()
         self._set_pyatv_log_level()
         self._drop_unverified_password_markers()
         self._reset_auto_pinned_compat_modes()
@@ -398,7 +404,31 @@ class AirPlayProvider(PlayerProvider):
             # folded into either.
             route = player.stream.active_route or "unreported"
             streams_by_route[route] = streams_by_route.get(route, 0) + 1
+        trial: dict[str, SerializableType] = {"mode": "nontrial-packaged"}
+        if trial_binary.is_trial_target():
+            children: list[SerializableType] = []
+            if self._ptp_daemon is not None:
+                children.append(await trial_binary.attest_owned_child(self._ptp_daemon, "ptp"))
+            for player in self.get_players():
+                if player.stream and player.stream._cli_proc is not None:
+                    children.append(
+                        await trial_binary.attest_owned_child(player.stream._cli_proc, "stream")
+                    )
+                if player._trial_pairing and player._trial_pairing._pair_proc is not None:
+                    children.append(
+                        await trial_binary.attest_owned_child(
+                            player._trial_pairing._pair_proc, "pairing"
+                        )
+                    )
+            trial = {
+                "mode": "private-official-dev-trial",
+                "installer_provenance": await asyncio.to_thread(installer_provenance),
+                "expected_sha256": trial_binary.EXPECTED_SHA,
+                "startup_validation": self._trial_identity,
+                "owned_children": children,
+            }
         return {
+            "trial_binary": trial,
             "dacp_server_running": self._dacp_server.is_serving(),
             "ptp_daemon_running": self.ptp_daemon_running,
             "ptp_daemon_ready": self.ptp_daemon_ready,
@@ -843,6 +873,8 @@ class AirPlayProvider(PlayerProvider):
         """Spawn the shared PTP clock daemon (cliairplay --ptp-daemon)."""
         try:
             cli_binary = await get_cli_binary()
+        except trial_binary.TrialBinaryError:
+            raise
         except RuntimeError as err:
             self.logger.warning(
                 "cliairplay binary unavailable (%s) - "

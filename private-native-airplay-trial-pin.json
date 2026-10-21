@@ -1,0 +1,27 @@
+{
+  "purpose": "private-official-dev-trial-only-never-upstream",
+  "server_repo": "nredd/server",
+  "server_base_sha": "dfe07c8d4bc3e89be2948453bff6d3ae8eaacce2",
+  "server_overlay_sha": null,
+  "launch_authorized": false,
+  "private_data_namespace": "/data/.native-radio-trial-7d964670ba5d42fd90a3a709c71ec462/data",
+  "private_cache_namespace": "/data/.native-radio-trial-7d964670ba5d42fd90a3a709c71ec462/data/.cache",
+  "private_marker_version": 1,
+  "trial_ha_publication": "suppressed-before-token-creation",
+  "installer_provenance": "pep610-not-immutable-loaded-byte-proof",
+  "external_receipt_required": true,
+  "remaining_live_gates": [
+    "owner-approval-and-deadline",
+    "independent-startup-watchdog-and-restore-proof",
+    "actual-linux-startup-and-distinct-private-server-id",
+    "external-receipt-source-commit-and-image-identity",
+    "actual-linux-owned-child-attestation",
+    "ha-discovery-isolation-and-native-controls-acceptance"
+  ],
+  "frontend_repo": "",
+  "official_app_contract_sha": "56e9d912d977d5fdf45daa0266f19d311f76dd47",
+  "cli_source_sha": "1c95c1a4d1c89ddc72c10f9c29d7b7faa59dca68",
+  "cli_sha256": "078f71414f8a46811488fbbb8196ba8c1b60170cd19bc3c51c3819b8ee29279a",
+  "cli_build_label": "v5b3dcc4",
+  "cli_path": "/media/.native-airplay/078f71414f8a46811488fbbb8196ba8c1b60170cd19bc3c51c3819b8ee29279a/cliairplay-linux-aarch64"
+}

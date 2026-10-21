@@ -19,6 +19,7 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant.helpers.process import check_output
 from music_assistant.helpers.util import format_ip_for_url
 
+from . import trial_binary
 from .constants import AIRPLAY_BUFFER_DEPTH_DEFAULTS
 
 if TYPE_CHECKING:
@@ -315,6 +316,10 @@ async def get_cli_binary() -> str:
 
     :raises RuntimeError: If the binary cannot be found.
     """
+    if trial_binary.is_trial_target():
+        await trial_binary.validate_trial_binary()
+        return str(trial_binary.TRIAL_ROOT / trial_binary.EXPECTED_SHA / trial_binary.ASSET_NAME)
+    # Explicitly nontrial: packaged binaries retain their normal platform behavior.
     system = platform.system()
     architecture = platform.machine()
     binary_name = _get_cli_binary_name(system, architecture)

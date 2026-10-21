@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import ClientError
 
+from music_assistant.providers.airplay import trial_binary
 from music_assistant.providers.airplay.helpers import (
     _CLI_BINARY_CHECK_TIMEOUT,
     cli_clock_time,
@@ -130,11 +131,7 @@ async def test_get_cli_binary_uses_release_asset_name(
     expected_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Resolve platform aliases to the filename installed by development setup.
-
-    The runtime lookup must use the exact release asset name for every supported alias.
-    """
+    """Resolve nontrial aliases, while trial Linux aliases always require the media pin."""
     check_output = AsyncMock(return_value=(0, b"cliairplay v0.1.0 check"))
     monkeypatch.setattr("music_assistant.providers.airplay.helpers.platform.system", lambda: system)
     monkeypatch.setattr(
@@ -142,10 +139,20 @@ async def test_get_cli_binary_uses_release_asset_name(
     )
     monkeypatch.setattr("music_assistant.providers.airplay.helpers.check_output", check_output)
 
+    validation = AsyncMock()
+    monkeypatch.setattr(trial_binary, "validate_trial_binary", validation)
     result = await get_cli_binary()
 
-    assert result.endswith(f"/bin/{expected_name}")
-    check_output.assert_awaited_once_with(result, "--check", timeout=_CLI_BINARY_CHECK_TIMEOUT)
+    if system == "Linux" and machine in ("aarch64", "arm64"):
+        assert result == str(
+            trial_binary.TRIAL_ROOT / trial_binary.EXPECTED_SHA / trial_binary.ASSET_NAME
+        )
+        validation.assert_awaited_once()
+        check_output.assert_not_called()
+    else:
+        assert result.endswith(f"/bin/{expected_name}")
+        check_output.assert_awaited_once_with(result, "--check", timeout=_CLI_BINARY_CHECK_TIMEOUT)
+        validation.assert_not_called()
 
 
 async def test_get_cli_binary_raises_when_check_times_out(monkeypatch: pytest.MonkeyPatch) -> None:

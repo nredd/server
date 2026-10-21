@@ -28,6 +28,7 @@ from music_assistant.constants import (
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.hassio import supervisor_request
+from music_assistant.helpers.private_trial import is_trial_target
 from music_assistant.helpers.util import get_ip_pton, get_zeroconf_args
 from music_assistant.models.core_controller import CoreController
 
@@ -277,6 +278,8 @@ class DiscoveryController(CoreController):
 
     async def _register_mass_service(self) -> None:
         """Register the Music Assistant server on the network via Zeroconf."""
+        if is_trial_target():
+            return
         zeroconf_type = "_mass._tcp.local."
         server_id = self.mass.server_id
         self.logger.debug("Starting Zeroconf broadcast...")
@@ -481,6 +484,8 @@ class DiscoveryController(CoreController):
 
     async def _announce_to_homeassistant(self) -> None:
         """Announce Music Assistant Ingress server to Home Assistant via Supervisor API."""
+        if is_trial_target():
+            return
         addon_hostname = os.environ["HOSTNAME"]
         ha_integration_token = await self.mass.webserver.auth.get_homeassistant_system_user_token()
         discovery_payload = {
@@ -504,6 +509,8 @@ class DiscoveryController(CoreController):
 
     def _schedule_periodic_ha_announce(self) -> None:
         """Schedule the periodic (re)announce to Home Assistant."""
+        if is_trial_target():
+            return
 
         def run_announce() -> None:
             self.mass.create_task(self._announce_to_homeassistant())

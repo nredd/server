@@ -28,6 +28,7 @@ from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import format_ip_for_url
 
+from . import trial_binary
 from .constants import AIRPLAY_DEFAULT_PORT, RAOP_DEFAULT_PORT, StreamingProtocol
 from .helpers import get_cli_binary
 
@@ -202,6 +203,8 @@ class AirPlayPairing:
             raise PlayerCommandFailed("Pairing not started")
         if not self.device_id:
             raise PlayerCommandFailed("Pairing requires a DACP id")
+        if trial_binary.is_trial_target():
+            self._cli_binary = await get_cli_binary()
         args = [
             self._cli_binary,
             "--pair-setup",
