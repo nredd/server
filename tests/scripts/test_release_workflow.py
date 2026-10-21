@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -76,6 +77,41 @@ def repository_fixture(tmp_path: Path) -> tuple[Path, GitRepository]:
     _git(tmp_path, "config", "user.email", "release@example.com")
     _commit(tmp_path, "initial")
     return tmp_path, GitRepository(tmp_path)
+
+
+@pytest.mark.parametrize("cfg_source", ["global", "system", "command"])
+def test_fixture_git_ignores_developer_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cfg_source: str
+) -> None:
+    """Synthetic commits and lightweight tags never use developer signing configuration."""
+    cfg = tmp_path / "developer.gitconfig"
+    cfg.write_text(
+        "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tprogram = /usr/bin/false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    monkeypatch.setenv("GIT_EDITOR", "/usr/bin/false")
+    if cfg_source == "command":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "include.path")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(cfg))
+    else:
+        monkeypatch.setenv(f"GIT_CONFIG_{cfg_source.upper()}", str(cfg))
+        if cfg_source == "system":
+            monkeypatch.delenv("GIT_CONFIG_NOSYSTEM")
+
+    repo = tmp_path / "repository"
+    repo.mkdir()
+    _git(repo, "init", "-b", "dev")
+    _git(repo, "config", "user.name", "Release Test")
+    _git(repo, "config", "user.email", "release@example.com")
+    _commit(repo, "synthetic")
+    _git(repo, "tag", "test-tag")
+
+    assert "gpgsig " not in _git(repo, "cat-file", "commit", "HEAD")
+    assert _git(repo, "cat-file", "-t", "test-tag") == "commit"
 
 
 def test_channel_branch_is_explicit() -> None:
@@ -1051,8 +1087,13 @@ def _commit(path: Path, message: str) -> str:
 
 
 def _git(path: Path, *args: str) -> str:
+    """Run Git in disposable fixture repositories without developer configuration."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env |= {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
     result = subprocess.run(  # noqa: S603
         ["git", "-C", str(path), *args],  # noqa: S607
+        env=env,
+        timeout=10,
         check=True,
         capture_output=True,
         text=True,

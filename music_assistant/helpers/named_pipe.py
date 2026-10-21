@@ -7,6 +7,7 @@ import errno as errno_module
 import logging
 import os
 import select
+import threading
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
@@ -166,6 +167,43 @@ class AsyncNamedPipeWriter:
 
         async with self._write_lock:
             return await asyncio.to_thread(_write)
+
+    async def write_atomic(self, data: bytes) -> bool:
+        """Write one bounded transaction atomically, stopping retries on cancellation."""
+        if not data:
+            return False
+        cancelled = threading.Event()
+
+        def _write() -> bool:
+            if cancelled.is_set() or not self._ensure_write_fd():
+                return False
+            write_fd = self._write_fd
+            if write_fd is None or len(data) > os.fpathconf(write_fd, "PC_PIPE_BUF"):
+                return False
+            deadline = time.monotonic() + WRITE_STALL_TIMEOUT
+            while not cancelled.is_set() and self._write_fd == write_fd:
+                try:
+                    return os.write(write_fd, data) == len(data)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    self._wait_writable(write_fd)
+                except BrokenPipeError:
+                    if self._write_fd == write_fd:
+                        os.close(write_fd)
+                        self._write_fd = None
+                    return False
+            return False
+
+        async with self._write_lock:
+            worker = asyncio.create_task(asyncio.to_thread(_write))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                with suppress(OSError):
+                    await worker
+                raise
 
     async def remove(self) -> None:
         """Close write fd and remove the pipe."""

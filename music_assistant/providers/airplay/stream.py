@@ -18,13 +18,15 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import uuid4
 
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState
 from music_assistant_models.errors import PlayerCommandFailed
+from music_assistant_models.media_items import Radio
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.util import sanitize_http_header_value
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_ARTWORK_RENDER_TIMEOUT,
     AIRPLAY_ARTWORK_SIZE,
@@ -37,7 +39,10 @@ from music_assistant.providers.airplay.constants import (
     CONF_AIRPLAY_CREDENTIALS,
     CONF_BUFFER_DEPTH,
     CONF_ENCRYPTION,
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD,
+    CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
     RAOP_DEFAULT_PORT,
     STREAMING_MODE_AP2_COMPAT,
@@ -55,6 +60,7 @@ from music_assistant.providers.airplay.helpers import (
     get_decoded_property,
     serialize_txt_records,
 )
+from music_assistant.providers.airplay.session_volume import SessionVolumeBackend
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -219,6 +225,13 @@ class AirPlayStream:
         self._clock_ready = asyncio.Event()
         self._clock_ready_at_unix_ms: int = 0
         self._clock_readiness: ClockReadiness = ClockReadiness.UNREPORTED
+        self.supports_live_metadata = False
+        # PRE-SETUP policy selection, not connection or native UI success.
+        # None means unsupported/unreported by this process.
+        self.homepod_remote_admission: bool | None = None
+        self._homepod_remote_admission_reported = False
+        self._homepod_remote_admission_requested = False
+        self._metadata_is_live = False
         self._metadata_text_checksum = ""
         # Artwork identity (the source image url) whose rendered bytes were
         # last delivered to the binary. Settles on the first successful
@@ -275,6 +288,8 @@ class AirPlayStream:
         # receiver. Native teardowns need no flag: they stop the stream first,
         # and stop() marks it before it touches the receiver.
         self.superseded: bool = False
+        self.session_volume_requested = False
+        self.session_volume = SessionVolumeBackend(self)
 
     @property
     def running(self) -> bool:
@@ -318,13 +333,37 @@ class AirPlayStream:
             passes the same value to every member so a group never mixes PTP and
             NTP timing. None lets the stream decide from the daemon's readiness.
         """
+        self.homepod_remote_admission = None
+        self._homepod_remote_admission_reported = False
+        self._homepod_remote_admission_requested = (
+            self.prov.config.get_value(CONF_EXPERIMENTAL_HOMEPOD_REMOTE, False) is True
+        )
+        self.session_volume_requested = (
+            self._homepod_remote_admission_requested
+            and self.prov.config.get_value(CONF_EXPERIMENTAL_SESSION_VOLUME, False) is True
+        )
+        if self._cli_proc is not None:
+            await self.session_volume.close()
+            self.session_volume = SessionVolumeBackend(self)
         self._check_password_preflight()
         # A fresh cliairplay process re-anchors from scratch, so drop any shift
         # carried on this stream object.
         self.reset_reanchor_shift()
         args = await self._build_cli_args(use_shared_ptp)
         self.player.logger.debug("Starting cliairplay for player %s", self.player.player_id)
-        self._cli_proc = AsyncProcess(args, stdin=True, stdout=True, stderr=True, name="cliairplay")
+        self._cli_proc = AsyncProcess(
+            args,
+            stdin=True,
+            stdout=True,
+            stderr=True,
+            name="cliairplay",
+            env={
+                "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": (
+                    "1" if self._homepod_remote_admission_requested else "0"
+                ),
+                "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if self.session_volume_requested else "off",
+            },
+        )
         try:
             await self.commands_pipe.create()
             await self._cli_proc.start()
@@ -404,6 +443,7 @@ class AirPlayStream:
         async with self._stop_lock:
             if self._cleanup_complete:
                 return
+            await self.session_volume.close()
             self._stopping = True
             self._teardown_started.set()
             async with self._metadata_lock:
@@ -792,17 +832,33 @@ class AirPlayStream:
         artist = ""
         album = ""
         item_id = ""
+        is_live = False
         if metadata:
-            duration = self._full_media_duration(metadata)
             title = metadata.title or ""
             artist = metadata.artist or ""
             album = metadata.album or ""
+            is_live = (
+                metadata.media_type == MediaType.RADIO
+                and self.player.provider.config.get_value(CONF_RADIO_STATION_FIRST, False) is True
+            )
+            station = self._radio_station_title(metadata) if is_live else None
+            if station:
+                title = sanitize_http_header_value(title)
+                artist = sanitize_http_header_value(artist)
+                artist = " - ".join(
+                    part for part in (artist, title if title != station else "") if part
+                )
+                title = station
+                album = sanitize_http_header_value(album)
+            duration = 0 if is_live else self._full_media_duration(metadata)
             item_id = metadata.queue_item_id or ""
             # The identity deliberately excludes duration and image url: a
             # value that shifts per seek or per media-update would re-send the
             # full metadata each time — which makes an Apple TV re-render its
             # Now Playing popup.
             text_checksum = f"{item_id}|{title}|{artist}|{album}"
+            if self.supports_live_metadata:
+                text_checksum += f"|live={int(is_live)}"
             # the artwork identity must survive URL-form changes: the session
             # media and the player state carry the same image behind different
             # base URLs, and re-sending on such a flip would re-render and
@@ -856,6 +912,8 @@ class AirPlayStream:
                     cmd += f"DURATION={duration}\nITEMID={item_id}\n"
                     if artwork_file:
                         cmd += f"ARTWORKFILE={artwork_file}\n"
+                    if self.supports_live_metadata and (is_live or self._metadata_is_live):
+                        cmd += f"IS_LIVE={int(is_live)}\n"
                     cmd += "ACTION=SENDMETA\n"
                     if not await self.send_cli_command(cmd):
                         if artwork_render is not None:
@@ -865,6 +923,7 @@ class AirPlayStream:
                             self._artwork_render_generations.discard(metadata_generation)
                         return
                     self._metadata_text_checksum = text_checksum
+                    self._metadata_is_live = is_live if self.supports_live_metadata else False
                     # every identity push is followed by one explicit progress
                     # anchor, even at position zero: some receivers (WiiM Amp)
                     # mute a flushed-and-restarted session mid-track when no
@@ -913,6 +972,42 @@ class AirPlayStream:
                 await self._render_and_send_artwork(
                     artwork_url, metadata_generation, artwork_render
                 )
+
+    def _radio_station_title(self, metadata: PlayerMedia) -> str | None:
+        """Return the active radio station name only for this queue item and session."""
+        if (
+            metadata.media_type != MediaType.RADIO
+            or not metadata.source_id
+            or not metadata.queue_item_id
+            or self.session is None
+        ):
+            return None
+        session_media = self.session.media
+        if (
+            session_media.source_id != metadata.source_id
+            or session_media.queue_item_id != metadata.queue_item_id
+            or not session_media.queue_session_id
+            or (
+                metadata.queue_session_id is not None
+                and metadata.queue_session_id != session_media.queue_session_id
+            )
+        ):
+            return None
+        queue = self.mass.players.get_active_queue(self.player)
+        if (
+            queue is None
+            or not queue.active
+            or queue.queue_id != metadata.source_id
+            or (item := queue.current_item) is None
+            or item.queue_id != metadata.source_id
+            or item.queue_item_id != metadata.queue_item_id
+            or item.media_type != MediaType.RADIO
+            or item.streamdetails is None
+            or item.streamdetails.queue_session_id != session_media.queue_session_id
+            or not isinstance(item.media_item, Radio)
+        ):
+            return None
+        return sanitize_http_header_value(item.media_item.name) or None
 
     def _full_media_duration(self, metadata: PlayerMedia) -> int:
         """
@@ -1206,6 +1301,7 @@ class AirPlayStream:
         plus receiver-reported buffering window after connect, the audio formats
         the receiver advertises, and the result of MediaRemote now-playing
         pushes (Apple devices):
+          [STATUS] homepod_remote_admission enabled=<0|1> (PRE-SETUP policy only)
           [STATUS] route protocol=<raop|airplay2> flow=<...> timing=<ntp|ptp> buffered=<0|1>
           [STATUS] latency lead_ms=<int> device_min_frames=<int> device_max_frames=<int>
           [STATUS] capabilities requested=<hex> realtime_formats=<hex> realtime_known=<0|1>
@@ -1213,17 +1309,27 @@ class AirPlayStream:
           [STATUS] mrp path=<command> status=<http status>
           [EVENT] remote command=<play|pause|play_pause|next|previous>
         """
-        if not self._cli_proc:
+        process = self._cli_proc
+        backend = self.session_volume
+        if not process:
             return
         buffer = b""
-        while chunk := await self._cli_proc.read(1024):
+        while chunk := await process.read(1024):
+            if self._cli_proc is not process or self.session_volume is not backend:
+                return
             buffer += chunk
             while b"\n" in buffer:
+                if self._cli_proc is not process or self.session_volume is not backend:
+                    return
                 raw_line, buffer = buffer.split(b"\n", 1)
-                line = raw_line.decode("utf-8", errors="ignore").strip()
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
-                if "[STATUS] route" in line:
+                if backend.handle_stdout(line):
+                    continue
+                if line.startswith("[STATUS] homepod_remote_admission"):
+                    self._parse_homepod_remote_admission_status(line)
+                elif "[STATUS] route" in line:
                     self._parse_route_status(line)
                 elif "[STATUS] mrp" in line:
                     self._parse_mrp_status(line)
@@ -1237,8 +1343,50 @@ class AirPlayStream:
                     VERBOSE_LOG_LEVEL, "cliairplay for %s: %s", self.player.display_name, line
                 )
 
+        # Older binaries may not emit capabilities either. EOF is the only
+        # ordering-safe fallback; stderr's connected/exit can beat queued stdout.
+        if self._cli_proc is not process or self.session_volume is not backend:
+            return
+        self._report_unreported_homepod_remote_admission()
+        await backend.close()
+
+    def _parse_homepod_remote_admission_status(self, line: str) -> None:
+        """Record the CLI's PRE-SETUP policy selection, never native UI readiness."""
+        if self._homepod_remote_admission_reported:
+            self.player.logger.debug("Ignoring duplicate or late HomePod remote admission policy")
+            return
+        parts = line.split()
+        if parts not in (
+            ["[STATUS]", "homepod_remote_admission", "enabled=0"],
+            ["[STATUS]", "homepod_remote_admission", "enabled=1"],
+        ):
+            self.player.logger.debug("Ignoring malformed HomePod remote admission policy")
+            return
+        self.homepod_remote_admission = parts[2] == "enabled=1"
+        self._homepod_remote_admission_reported = True
+        self.player.logger.debug(
+            "HomePod remote admission policy selected for %s: %s "
+            "(PRE-SETUP selection only, not connection or native UI success)",
+            self.player.display_name,
+            "enabled" if self.homepod_remote_admission else "disabled",
+        )
+
+    def _report_unreported_homepod_remote_admission(self) -> None:
+        """Report an older or unrecognized CLI without changing ordinary playback."""
+        if self._homepod_remote_admission_reported:
+            return
+        self._homepod_remote_admission_reported = True
+        self.player.logger.log(
+            logging.WARNING if self._homepod_remote_admission_requested else logging.DEBUG,
+            "HomePod remote admission policy for %s: unsupported/unreported by CLI; "
+            "ordinary playback remains available",
+            self.player.display_name,
+        )
+
     def _parse_remote_event(self, line: str) -> None:
-        """Dispatch a normalized remote command reported by cliairplay."""
+        """Dispatch a normalized remote command reported by the current live stream."""
+        if self.player.stream is not self or self.superseded or self._stopping or self._stopped:
+            return
         command_value = line.removeprefix("[EVENT] remote command=").strip()
         try:
             command = AirPlayRemoteCommand(command_value)
@@ -1341,7 +1489,11 @@ class AirPlayStream:
         # which corrects a device that was unreachable when it was discovered.
         # Only the native AirPlay 2 flow reads them; the other routes report
         # zeroes with the known flags unset. A change applies to the next stream.
+        # Both reports use stdout: a supported PRE-SETUP marker must already
+        # have arrived here. stderr's connected report has no such ordering.
+        self._report_unreported_homepod_remote_admission()
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        self.supports_live_metadata = fields.get("live_metadata") == "1"
         formats = 0
         for mask_field, known_field in (
             ("realtime_formats", "realtime_known"),
@@ -1763,10 +1915,19 @@ class AirPlayStream:
     async def _send_current_volume(self) -> None:
         """Send the player's current volume level to the device, muted as zero."""
         volume = 0 if self.player.volume_muted else self.player.volume_level
-        await self.send_cli_command(f"VOLUME={volume}")
+        if self.session_volume_requested and self.session_volume.supported:
+            if volume is None:
+                return
+            try:
+                await self.session_volume.apply(volume)
+            except PlayerCommandFailed, TimeoutError:
+                self.player.logger.debug("Initial checked stream volume is unconfirmed")
+        else:
+            await self.send_cli_command(f"VOLUME={volume}")
 
     async def _cleanup_failed_start(self) -> None:
         """Release all resources owned by a cliairplay process that failed to start."""
+        await self.session_volume.close()
         self._stopping = True
         self._stopped = True
         stdout_reader_task = self._stdout_reader_task
@@ -1815,7 +1976,13 @@ class AirPlayStream:
             return False
         if not command.endswith("\n"):
             command += "\n"
-        command_delivered = await self.commands_pipe.write(command.encode("utf-8"))
+        data = command.encode("utf-8")
+        if command.startswith(("SESSION_VOLUME_", "STREAM_VOLUME_")):
+            if not self.session_volume_requested or not self.session_volume.supported:
+                return False
+            command_delivered = await self.commands_pipe.write_atomic(data)
+        else:
+            command_delivered = await self.commands_pipe.write(data)
         if command_delivered:
             self.player.last_command_sent = time.time()
             if command.startswith("VOLUME="):

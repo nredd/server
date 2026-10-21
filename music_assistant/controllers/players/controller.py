@@ -20,7 +20,7 @@ import asyncio
 import contextlib
 import time
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import suppress
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -132,6 +132,7 @@ from .constants import (
 )
 from .helpers import handle_player_command, wait_for_power_on
 from .protocol_linking import ProtocolLinkingMixin
+from .volume_execution import CheckedVolumeExecution
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -230,7 +231,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         player_id: str,
         purpose: PlayerLockPurpose = PlayerLockPurpose.PLAYBACK,
         strict: bool = False,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncGenerator[None]:
         """
         Acquire a purpose-scoped lock for a player, with re-entrant support.
 
@@ -281,7 +282,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
     @contextlib.asynccontextmanager
     async def get_group_and_player_lock(
         self, player_id: str, strict: bool = False
-    ) -> AsyncIterator[None]:
+    ) -> AsyncGenerator[None]:
         """
         Acquire the playback lock of a player, preceded by that of the group holding it.
 
@@ -2280,7 +2281,46 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 return self.get_active_queue(parent_player)
         return None
 
-    async def set_group_volume(self, group_player: Player, volume_level: int) -> None:
+    async def checked_group_volume(
+        self, player_id: str, volume_level: int, execution: CheckedVolumeExecution
+    ) -> int:
+        """Execute a preflighted volume change and return only confirmed logical state."""
+        execution.validate()
+        if not execution.levels:
+            raise PlayerCommandFailed("Checked volume has no confirmed members")
+        player = self.get_player(player_id, True)
+        assert player is not None
+        # Snapshot ordinary intents before waiting for any group/member locks. Only
+        # these obsolete targets may be reconciled; a newer queued UI intent wins.
+        targets = {
+            member_id: member.extra_data.get(ATTR_VOLUME_TARGET)
+            for member_id in execution.levels
+            if (member := self.get_player(member_id)) is not None
+        }
+        group_player = self._resolve_group_volume_player(player)
+        if group_player is None:
+            execution.preflight(player_id)
+            await self._set_member_volume(player_id, volume_level, execution)
+        else:
+            async with self.get_player_lock(group_player.player_id, PlayerLockPurpose.GROUP_VOLUME):
+                execution.validate()
+                await self.set_group_volume(group_player, volume_level, execution=execution)
+        execution.validate()
+        for member_id, level in execution.levels.items():
+            member = self.get_player(member_id)
+            if member is not None and member.extra_data.get(ATTR_VOLUME_TARGET) is targets.get(
+                member_id
+            ):
+                self._record_volume_target(member, level)
+        return max(execution.levels.values())
+
+    async def set_group_volume(
+        self,
+        group_player: Player,
+        volume_level: int,
+        *,
+        execution: CheckedVolumeExecution | None = None,
+    ) -> None:
         """
         Set the overall volume for a player group or synced players.
 
@@ -2291,7 +2331,11 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         :param group_player: The group player or sync leader.
         :param volume_level: Target volume level (0..100).
         """
-        cur_volume = group_player.state.group_volume
+        if execution is not None:
+            execution.validate()
+        cur_volume = (
+            max(execution.levels.values()) if execution else group_player.state.group_volume
+        )
         if cur_volume is None:
             return
 
@@ -2315,7 +2359,16 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         # the levels a nudge steps from are the ones the members were last commanded, so
         # the snapshot has to read the same source, or a change a member has not confirmed
         # yet puts the reference above the level being set and turns a step up into one down
-        snapshot: dict[str, int] | None = group_player.extra_data.get(ATTR_GROUP_VOLUME_SNAPSHOT)
+        if execution is not None:
+            if set(execution.levels) != {c.player_id for c in children}:
+                raise PlayerCommandFailed("Checked volume membership changed")
+            for child in children:
+                execution.preflight(child.player_id)
+        snapshot: dict[str, int] | None = (
+            dict(execution.reference if execution.reference is not None else execution.levels)
+            if execution is not None
+            else group_player.extra_data.get(ATTR_GROUP_VOLUME_SNAPSHOT)
+        )
         if snapshot is None or snapshot.keys() != {c.player_id for c in children}:
             snapshot = {c.player_id: self._volume_nudge_base(c) or 0 for c in children}
             group_player.extra_data[ATTR_GROUP_VOLUME_SNAPSHOT] = snapshot
@@ -2339,12 +2392,25 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 progress = volume_level / base_group
                 new_child_volume = round(child_base * progress)
             new_child_volume = max(0, min(100, new_child_volume))
-            coros.append(self._set_member_volume(child_player.player_id, new_child_volume))
-        await asyncio.gather(*coros)
+            coros.append(
+                self._set_member_volume(child_player.player_id, new_child_volume, execution)
+            )
+        # Checked operations settle every actuator before reporting partial failure.
+        # gather's default early raise would leave siblings executing after completion.
+        if execution is not None:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            execution.validate()
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise PlayerCommandFailed("Checked group volume is uncertain") from result
+        else:
+            await asyncio.gather(*coros)
 
         # notify active AudioSource once at the group level to prevent
         # feedback loops from per-child callbacks with different volume values
-        await self._notify_source_volume_change(group_player, volume_level)
+        await self._notify_source_volume_change(
+            group_player, max(execution.levels.values()) if execution else volume_level
+        )
 
     def iter_group_members(
         self,
@@ -2400,7 +2466,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         attribute_name: str | None = None,
         attribute_value: Any = _SENTINEL,
         timeout: float = 5.0,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncGenerator[None]:
         """
         Async context manager that waits for a player state update.
 
@@ -4329,7 +4395,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             return self.get_player(player.state.synced_to)
         return None
 
-    async def _set_member_volume(self, player_id: str, volume_level: int) -> None:
+    async def _set_member_volume(
+        self,
+        player_id: str,
+        volume_level: int,
+        execution: CheckedVolumeExecution | None = None,
+    ) -> None:
         """
         Set the volume of a single member as part of a group volume change.
 
@@ -4337,15 +4408,27 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         :param volume_level: logical volume level (0..100) to set on the member.
         """
         # record before waiting for the lock, for the same reason as cmd_volume_set
-        if member := self.get_player(player_id):
+        if execution is not None:
+            execution.validate()
+        elif member := self.get_player(player_id):
             self._record_volume_target(member, volume_level)
         # take the volume lock of the member itself, so a group volume change and an
         # individual volume command for that member can not overtake one another
         async with self.get_player_lock(player_id, PlayerLockPurpose.VOLUME):
-            await self._handle_cmd_volume_set(player_id, volume_level, record_target=False)
+            if execution is not None:
+                execution.validate()
+                execution.preflight(player_id)
+            await self._handle_cmd_volume_set(
+                player_id, volume_level, record_target=False, execution=execution
+            )
 
     async def _handle_cmd_volume_set(
-        self, player_id: str, volume_level: int, *, record_target: bool = True
+        self,
+        player_id: str,
+        volume_level: int,
+        *,
+        record_target: bool = True,
+        execution: CheckedVolumeExecution | None = None,
     ) -> None:
         """
         Handle Player volume set command.
@@ -4381,11 +4464,21 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         else:
             player.extra_data.pop(ATTR_FAKE_MUTE, None)
 
-        if record_target:
+        if record_target and execution is None:
             self._record_volume_target(player, volume_level)
 
         # Scale logical volume (0-100) to device volume (min_volume-max_volume)
         device_volume = self.scale_volume_to_device(player_id, volume_level)
+
+        if execution is not None:
+            execution.validate()
+            execution.preflight(player_id)
+            committed = await execution.apply(player_id, device_volume)
+            execution.validate()
+            execution.levels[player_id] = max(
+                0, min(100, self.scale_volume_from_device(player_id, committed))
+            )
+            return
 
         await self._notify_source_volume_change(player, volume_level)
 

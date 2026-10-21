@@ -1562,12 +1562,18 @@ class SendspinPlayer(SendspinBasePlayer):
         """Handle VOLUME_SET command on the player."""
         roles = self.api.roles_by_family("player")
         for role in roles:
-            role.set_player_volume(volume_level)
+            if isinstance(role, BridgePlayerRole) and role.volume_command is not None:
+                await role.volume_command(volume_level)
+            else:
+                role.set_player_volume(volume_level)
 
     async def volume_mute(self, muted: bool) -> None:
         """Handle VOLUME MUTE command on the player."""
         roles = self.api.roles_by_family("player")
         for role in roles:
+            if isinstance(role, BridgePlayerRole) and role.mute_command is not None:
+                await role.mute_command(muted)
+                return
             role.set_player_mute(muted)
         # Native clients don't always emit a VolumeChangedEvent in response to a
         # mute command, so update our state directly to keep MA in sync.
