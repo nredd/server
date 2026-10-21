@@ -1,0 +1,23 @@
+# Private fork-only validation. Never include in the upstream feature packet.
+name: Private native radio trial
+
+on:
+  push:
+    branches:
+      - native-radio-haos-trial
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  canonical:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref:
+          - "${{ github.sha }}"
+          - cd90698e52e83238446d021f558359c7ac37ac35
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ matrix.ref }}

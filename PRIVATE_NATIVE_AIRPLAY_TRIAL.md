@@ -140,14 +140,20 @@ files already report 13 diagnostics (12 errors and one deprecation warning) on p
 `dfe07c8`, reproduced from a complete `git archive` with the same interpreter/config.
 The overlay adds no diagnostics. The other changed Python files pass scoped `ty`, and
 full pre-commit including canonical mypy passes. This is NOT an all-green expanded
-`ty` gate; parent owns its disposition and the final full suite.
+`ty` gate; the existing baseline diagnostics remain explicitly recorded.
 
-An existing timing-sensitive AirPlay test also remains a gate blocker:
-`test_raop_session_resolves_ptp_for_first_ap2_late_joiner` can reach a `MagicMock`/integer
-comparison in unchanged `stream_session.py:536`. It passed alone but failed in the
-combined focused run (1105 passed, one failed); the pristine `dfe07c8` AirPlay suite
-reproduced the identical failure (1022 passed, one failed). No test was skipped, weakened
-or changed to hide it. Parent owns the separate fixture/source disposition and final gate.
+The late-join fixture blocker was repaired separately: its constructor now receives the
+real PCM format before deriving byte/frame rates. Frozen-timeline regressions cover
+anchors ahead of, at and inside the write head, without changing production clocks.
+The final local suite passed 22,233 tests with 23 existing skips and 76 snapshots;
+canonical pre-commit/mypy and private-module `ty` also passed.
+
+The fork's workflow registry initially exposed no workflows despite Actions being enabled
+and `test.yml` existing on `dev`, so manual dispatch returned 404. The private-only
+`private-native-trial.yml` push wrapper calls that existing canonical reusable workflow
+for the exact pushed trial SHA and isolated fixture commit
+`cd90698e52e83238446d021f558359c7ac37ac35`. It changes no repository settings or gates.
+CI success must still be verified; a local pass is not a CI or Linux startup claim.
 
 Synthetic ELF tests validate bytes but NEVER execute Linux ELF on macOS. Bounded check
 and liveness tests use real local children; synthetic procfs covers digest comparisons
