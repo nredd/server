@@ -39,6 +39,20 @@ With this repository cloned locally, execute the following commands in a termina
 
 NOTE: Always re-run the setup script after you fetch the latest code because requirements could have changed.
 
+### Running tests
+
+Run `pytest` from the repository root. Filesystem descriptor-leak tests use the native
+FD directory selected by `descriptor_path` (`/proc/self/fd` on Linux, `/dev/fd` on macOS).
+Release-workflow tests create synthetic Git history in disposable repositories; their
+fixture Git subprocesses ignore system/global configuration and inherited `GIT_*`
+settings so developer signing keys, hooks and templates are never used. This isolation
+does not change signing or hooks in the actual checkout.
+
+AirPlay PTP session tests pass the real `AIRPLAY_PCM_FORMAT` at construction time:
+wire frame sizes and byte rates are derived immediately, so configuring a mock afterward
+cannot repair them. Late-join tests freeze the CLI timeline and cover anchors ahead of,
+at, and inside the buffered write head with frame-aligned PCM and exact prime/skip counts.
+
 ### Using Devcontainer/Codespace
 We removed support for devcontainers because we do not have anyone willing to maintain it.
 It also is not very convenient due to all the port requirements, binaries etc.

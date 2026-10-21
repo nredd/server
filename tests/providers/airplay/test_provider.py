@@ -13,6 +13,8 @@ from music_assistant_models.enums import PlaybackState
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS,
+    AIRPLAY_PCM_FORMAT,
     PTP_DAEMON_WARN_BURST,
     PTP_DAEMON_WARN_WINDOW,
     AirPlayRemoteCommand,
@@ -579,9 +581,8 @@ async def _ack_commanded_instant(start_unix_ms: int = 0, *_args: object, **_kwar
 
 def _make_ptp_session(prov: MagicMock, sync_clients: list[MagicMock]) -> AirPlayStreamSession:
     """Build a stream session wired to a mock provider for PTP-decision tests."""
-    pcm_format = MagicMock()
     return AirPlayStreamSession(
-        prov, cast("list[AirPlayPlayer]", sync_clients), pcm_format, MagicMock()
+        prov, cast("list[AirPlayPlayer]", sync_clients), AIRPLAY_PCM_FORMAT, MagicMock()
     )
 
 
@@ -625,8 +626,15 @@ async def test_session_skips_ptp_wait_for_raop_members() -> None:
     prov.wait_ptp_daemon_ready.assert_not_awaited()
 
 
-async def test_raop_session_resolves_ptp_for_first_ap2_late_joiner() -> None:
-    """A deferred AP2 join still commits the session to the shared PTP clock."""
+@pytest.mark.parametrize(
+    ("write_head", "prime_seconds", "skip_seconds"),
+    [(7.0, 0.0, 0.5), (7.5, 0.0, 0.0), (8.0, 0.5, 0.0)],
+    ids=["ahead-of-write-head", "at-write-head", "inside-ring"],
+)
+async def test_raop_session_resolves_ptp_for_first_ap2_late_joiner(
+    write_head: float, prime_seconds: float, skip_seconds: float
+) -> None:
+    """A first AP2 join resolves PTP and maps real PCM on either side of the write head."""
     prov = MagicMock()
     raop_player = _raop_player()
     raop_player.player_id = "raop"
@@ -638,12 +646,13 @@ async def test_raop_session_resolves_ptp_for_first_ap2_late_joiner() -> None:
     ap2_player.player_id = "airplay2"
     ap2_player.stream = None
     session = _make_ptp_session(prov, [raop_player])
-    pcm_format = cast("MagicMock", session.pcm_format)
-    pcm_format.pcm_sample_size = 176_400
-    pcm_format.bit_depth = 16
-    pcm_format.channels = 2
-    session.start_time = time.time() - 5
-    session.seconds_streamed = 5
+    now = 1_000_000.0
+    session.start_time = now - 5
+    session.seconds_streamed = write_head
+    session.media.elapsed_time = 0
+    pcm_byte_rate = AIRPLAY_PCM_FORMAT.pcm_sample_size
+    session._pcm_total_fed = int(write_head * pcm_byte_rate)
+    session._pcm_buffer = bytearray(b"\x01" * (3 * pcm_byte_rate))
 
     async def _wait_ptp_daemon_ready() -> bool:
         assert not session._lock.locked()
@@ -663,9 +672,13 @@ async def test_raop_session_resolves_ptp_for_first_ap2_late_joiner() -> None:
         player.stream.warm_lead_ms = 0
         player.stream.flushed_head_unix_ms = 0
 
-    with patch.object(
-        session, "_start_client", new_callable=AsyncMock, side_effect=_start_client
-    ) as mock_start:
+    with (
+        patch.object(
+            session, "_start_client", new_callable=AsyncMock, side_effect=_start_client
+        ) as mock_start,
+        patch.object(session, "_write_chunk_to_player", new_callable=AsyncMock) as write_chunk,
+        patch("music_assistant.providers.airplay.stream_session.cli_clock_time", return_value=now),
+    ):
         await session.add_client(cast("AirPlayPlayer", ap2_player))
 
     prov.wait_ptp_daemon_ready.assert_awaited_once()
@@ -674,6 +687,17 @@ async def test_raop_session_resolves_ptp_for_first_ap2_late_joiner() -> None:
     await_args = mock_start.await_args
     assert await_args is not None
     assert await_args.args[1] is True
+    assert ap2_player in session.sync_clients
+    cast("MagicMock", ap2_player.stream).start.assert_awaited_once_with(
+        int(now * 1000) + AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS, 7500, join=True
+    )
+    assert session._client_skip_bytes[ap2_player.player_id] == int(skip_seconds * pcm_byte_rate)
+    if prime_seconds:
+        write_chunk.assert_awaited_once_with(
+            ap2_player, b"\x01" * int(prime_seconds * pcm_byte_rate)
+        )
+    else:
+        write_chunk.assert_not_awaited()
 
 
 async def test_session_start_applies_uniform_ptp_decision_to_all_members() -> None:

@@ -4,18 +4,19 @@ import os
 import subprocess
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import ContentType, MediaType, StreamType
 from music_assistant_models.errors import AudioError, MediaNotFoundError
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import AudioFormat, ItemMapping
+from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.streamdetails import MultiPartPath, StreamDetails
 
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_buffer import _probe_source_format
+from music_assistant.helpers.process import descriptor_path
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
 from music_assistant.providers.filesystem_local.cue import CueSheetHandler
 from music_assistant.providers.filesystem_local.helpers import open_real_path
@@ -209,12 +210,22 @@ async def test_overlay_reads_the_checked_file(tree: Path, repoint_after_check: R
         return_value=_local_stream(str(tree / "track.flac"), media_type=MediaType.SOUND_EFFECT)
     )
     audio = _make_audio(provider)
-    queue = SimpleNamespace(
-        overlay_source=SimpleNamespace(provider=INSTANCE_ID, item_id="track.flac", uri="x")
+    queue = PlayerQueue(
+        queue_id="checked-overlay",
+        active=True,
+        display_name="Checked overlay",
+        available=True,
+        items=0,
+        overlay_source=ItemMapping(
+            media_type=MediaType.SOUND_EFFECT,
+            provider=INSTANCE_ID,
+            item_id="track.flac",
+            name="Checked sound effect",
+        ),
     )
     repoint_after_check("track.flac")
 
-    overlay = await audio._resolve_overlay_input(queue)  # type: ignore[arg-type]
+    overlay = await audio._resolve_overlay_input(queue)
 
     assert overlay is not None
     overlay_input, pass_fds, _ = overlay
@@ -250,9 +261,10 @@ async def test_opening_parts_stops_at_a_refused_one_without_leaking(tree: Path) 
     (tree / "elsewhere.flac").symlink_to(tree.parent / "outside" / "track.flac")
     audio = _make_audio(_make_provider(tree))
     paths = [str(tree / "part1.flac"), str(tree / "elsewhere.flac")]
-    open_before = len(list(Path("/proc/self/fd").iterdir()))
+    fd_directory = Path(descriptor_path(0)).parent
+    open_before = len(list(fd_directory.iterdir()))
 
     with pytest.raises(AudioError):
         await audio.open_local_files(_local_stream(paths[0]), paths)
 
-    assert len(list(Path("/proc/self/fd").iterdir())) == open_before
+    assert len(list(fd_directory.iterdir())) == open_before
