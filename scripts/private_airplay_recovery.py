@@ -40,6 +40,7 @@ CAPTURE_TARGETS = {"main": (TARGETS[0],), "office": (TARGETS[1],), "both": TARGE
 MAX_RESPONSE = 64 * 1024
 ACTION_TIMEOUT = 30.0
 RESTORE_TIMEOUT = 90.0
+GROUP_RECONCILE_INTERVAL = 5.0
 VOLUME_TOLERANCE = 0.015
 SCHEMA = 1
 MAX_RUN_AGE = 600.0
@@ -538,6 +539,7 @@ def _wait_for_targets(
 def _restore_groups(transport: Transport, players: tuple[PlayerState, ...]) -> None:
     """Restore only changed HA group topology, preserving captured member order."""
     actual = tuple(_player_state(transport, player.entity_id) for player in players)
+    _assert_target_groups(actual, tuple(player.entity_id for player in players))
     changed = tuple(
         (expected, observed)
         for expected, observed in zip(players, actual, strict=True)
@@ -602,12 +604,22 @@ def _restore_playstate(transport: Transport, players: tuple[PlayerState, ...]) -
 
 
 def _verify(transport: Transport, expected: tuple[PlayerState, ...], deadline: float) -> None:
-    """Require the captured HA state within the remaining absolute budget."""
+    """Reconcile a delayed captured HA group without extending the absolute budget."""
+    next_group_reconcile = time.monotonic() + GROUP_RECONCILE_INTERVAL
+    targets = tuple(player.entity_id for player in expected)
     while True:
+        _require_deadline(deadline)
         actual = tuple(_player_state(transport, player.entity_id) for player in expected)
+        _require_deadline(deadline)
+        _assert_target_groups(actual, targets)
         if all(_matches(want, got) for want, got in zip(expected, actual, strict=True)):
             return
-        _require_deadline(deadline)
+        if time.monotonic() >= next_group_reconcile and any(
+            want.group_members != got.group_members
+            for want, got in zip(expected, actual, strict=True)
+        ):
+            _restore_groups(transport, expected)
+            next_group_reconcile = time.monotonic() + GROUP_RECONCILE_INTERVAL
         time.sleep(0.5)
 
 

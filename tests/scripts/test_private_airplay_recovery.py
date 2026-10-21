@@ -119,6 +119,125 @@ def snapshot() -> recovery.Snapshot:
     )
 
 
+class DelayedGroupTransport(RecordingTransport):
+    """Accept group requests before the startup group path becomes effective."""
+
+    def __init__(self, clock: list[float], ready_at: float) -> None:
+        """Bind deterministic startup readiness without changing the recovery deadline."""
+        super().__init__()
+        self.clock = clock
+        self.ready_at = ready_at
+        self.official_started = False
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        """Apply only joins made after readiness, matching the asynchronous service seam."""
+        if path == "/core/api/services/media_player/join":
+            self.calls.append(path)
+            assert method == "POST"
+            assert body == {
+                "entity_id": "media_player.officepod",
+                "group_members": ["media_player.mainpod"],
+            }
+            if self.clock[0] >= self.ready_at:
+                for entity, state in self.players.items():
+                    self.players[entity] = replace(
+                        state, group_members=("media_player.officepod", "media_player.mainpod")
+                    )
+            return None
+        return super().request(method, path, body)
+
+
+@pytest.mark.parametrize("ready_at", [1.0, 6.0])
+def test_restore_reconciles_startup_group_within_original_deadline(
+    monkeypatch: pytest.MonkeyPatch, ready_at: float
+) -> None:
+    """An ineffective first join must not strand a now-recoverable captured group."""
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    transport = DelayedGroupTransport(clock, ready_at)
+    state = snapshot()
+    state = replace(
+        state,
+        players=tuple(
+            replace(player, group_members=("media_player.officepod", "media_player.mainpod"))
+            for player in state.players
+        ),
+    )
+    recovery.restore(transport, state, 20.0)
+    assert all(
+        recovery._matches(expected, transport.players[expected.entity_id])
+        for expected in state.players
+    )
+    assert transport.calls.count("/core/api/services/media_player/join") >= 2
+    assert clock[0] < 20.0
+
+
+def test_restore_never_extends_deadline_for_missing_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A group unavailable throughout the original budget still fails closed."""
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    transport = DelayedGroupTransport(clock, 1000.0)
+    state = snapshot()
+    state = replace(
+        state,
+        players=tuple(
+            replace(player, group_members=("media_player.officepod", "media_player.mainpod"))
+            for player in state.players
+        ),
+    )
+    with pytest.raises(recovery.RecoveryError, match="recovery deadline expired"):
+        recovery.restore(transport, state, 12.0)
+    assert clock[0] == 12.0
+    assert all(not player.group_members for player in transport.players.values())
+
+
+def test_restore_refuses_new_uncaptured_group_before_unjoin() -> None:
+    """Restoration must not mutate a newly grouped player outside the captured scope."""
+    transport = RecordingTransport()
+    entity = "media_player.mainpod"
+    transport.players[entity] = replace(
+        transport.players[entity], group_members=(entity, "media_player.uncaptured")
+    )
+    with pytest.raises(recovery.RecoveryError, match="not exclusively recoverable"):
+        recovery.restore(transport, snapshot(), time.monotonic() + 1)
+    assert "/core/api/services/media_player/unjoin" not in transport.calls
+
+
+def test_verify_never_turns_volume_telemetry_into_group_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A volume-only mismatch must not authorize retries or receiver volume commands."""
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    transport = RecordingTransport()
+    transport.bad_verify = True
+    with pytest.raises(recovery.RecoveryError, match="recovery deadline expired"):
+        recovery._verify(transport, snapshot().players, 12.0)
+    assert all("/services/" not in path for path in transport.calls)
+    assert clock[0] == 12.0
+
+
+def test_verify_rejects_matching_state_read_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a matching response cannot promote recovery after the absolute deadline."""
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    class SlowReadTransport(RecordingTransport):
+        """Consume the shared budget while retrieving otherwise matching state."""
+
+        def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+            """Advance the fake clock only at the real HA state-read seam."""
+            if path.startswith("/core/api/states/"):
+                clock[0] += 1.0
+            return super().request(method, path, body)
+
+    with pytest.raises(recovery.RecoveryError, match="recovery deadline expired"):
+        recovery._verify(SlowReadTransport(), snapshot().players, 1.0)
+
+
 def test_restore_stops_dev_before_official_and_is_idempotent() -> None:
     """Restoration stops DEV first and safely repeats an already restored state."""
     transport = RecordingTransport()
@@ -168,12 +287,13 @@ def test_restore_fails_closed_on_changed_volume_before_mutating_it() -> None:
 
 
 def test_restore_fails_on_group_verification(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed exact target group verification is never a successful restore."""
+    """Malformed observed membership must fail before any group mutation."""
     transport = RecordingTransport()
     transport.bad_group = True
     monkeypatch.setattr(time, "sleep", lambda _: None)
-    with pytest.raises(recovery.RecoveryError, match="deadline"):
+    with pytest.raises(recovery.RecoveryError, match="not exclusively recoverable"):
         recovery.restore(transport, snapshot(), time.monotonic() + 0.01)
+    assert "/core/api/services/media_player/unjoin" not in transport.calls
 
 
 def test_capture_rejects_wrong_protected_version() -> None:

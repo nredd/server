@@ -170,7 +170,8 @@ a later exec or memory change. None of these fields prove native UI controls or 
 - Resolve the startup budget before launch: pinned source install happens at startup,
   so a two-minute listening window is NOT a build-time estimate. Establish a hard
   startup deadline and an independent watchdog that restores the official app even if
-  DEV never becomes ready. No startup-time measurement or HA trial has happened here.
+  DEV never becomes ready. The earlier private boot reached its API in 48.1 seconds;
+  that measurement is not a readiness guarantee for a different source or cold start.
 - HA core 2026.9.2's matching cached `config_flow.py` confirms a NEW server ID always
   enters `hassio_confirm`/`discovery_confirm`; a SAME ID can update the original token/URL.
   Fresh MA config controller 83 defaults to `uuid4`. The fixed private namespace and
@@ -200,7 +201,13 @@ a later exec or memory change. None of these fields prove native UI controls or 
   through the independent recovery route, without playback. No policy or capability was changed. These observations do not establish native feature acceptance or an
   immutable installed image digest. Parent owns the full suite, review, external receipt,
   commit/push and live gates for each new source pin. Earlier observations do not authorize
-  another source revision or playback.
+  another source revision or playback. Protected source `c1969e478f77ff51486e6b73808057db1d1d18c4`
+  subsequently passed installed-source, startup ELF and live owned PTP
+  `current-image-match-at-ack` verification without policy changes, and restored stock.
+  A later bounded real-radio window also reached an attested PTP stream with native
+  station-first/song metadata. Its initial grouped restoration expired; a later watchdog
+  restored the captured HA group. That failure remains recorded, and neither runtime
+  metadata nor later recovery proves native UI/volume acceptance.
 
 ## Private recovery controller
 
@@ -250,8 +257,16 @@ reloads its existing HA config entry only when this controller started the app. 
 HA's reconnect backoff without changing the entry's configuration or credentials or starting
 any discovery flow. It waits for the selected targets, restores groups/levels/play state,
 then verifies them before writing its
-owner-only receipt. A missing or `verified: false` receipt is a failed recovery -- do not
-claim success. A process-held application-wide lease prevents overlapping watchdogs for
+owner-only receipt. A group join accepted during startup can precede effective group
+readiness. Verification re-reads membership and reconciles a still-missing captured group
+at five-second intervals, inside the SAME absolute 90-second recovery deadline. It does
+not extend that budget, retry volume commands, or promote receiver telemetry into control.
+Before every group mutation and during verification it rejects groups containing an
+uncaptured player or malformed membership. A matching response read after the deadline
+also remains failure. A missing or `verified: false` receipt is a failed recovery -- do not
+claim success. The one-shot reconciliation gap is reproduced offline; the precise phase
+that exhausted the original live window remains unproven, so a new grouped cold-recovery
+proof is required before another radio experiment. A process-held application-wide lease prevents overlapping watchdogs for
 different run IDs. A matching verified completion receipt prevents a delayed old watchdog
 from stopping a subsequent trial. The lease remains held until that watchdog exits.
 The watchdog is independent of the DEV app, but mock tests are not real HAOS restoration
