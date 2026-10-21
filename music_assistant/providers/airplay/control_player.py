@@ -321,7 +321,7 @@ class AirPlayControlPlayer(AirPlayPlayer):
 
     async def volume_set(self, volume_level: int) -> None:
         """Set stream or native device volume."""
-        if self._stream_active:
+        if self.checked_volume_enabled or self._stream_active:
             await super().volume_set(volume_level)
             return
         device = self._device_for_feature(FeatureName.SetVolume)
@@ -333,7 +333,7 @@ class AirPlayControlPlayer(AirPlayPlayer):
 
     async def volume_mute(self, muted: bool) -> None:
         """Mute an active stream or native device volume."""
-        if self._stream_active:
+        if self.checked_volume_enabled or self._stream_active:
             await super().volume_mute(muted)
             return
         device = self._device_for_feature(FeatureName.SetVolume)

@@ -4045,13 +4045,12 @@ class TestGroupVolumeOrdering:
             finally:
                 in_flight -= 1
 
-        controller.set_group_volume = _track_overlap  # type: ignore[method-assign]
-
-        first = asyncio.create_task(controller.cmd_group_volume("leader", 80))
-        await slow_leader.reached.wait()
-        # a synced member adjusts the very same group as its leader
-        second = asyncio.create_task(controller.cmd_group_volume("member", 30))
-        await asyncio.gather(first, second)
+        with patch.object(controller, "set_group_volume", side_effect=_track_overlap):
+            first = asyncio.create_task(controller.cmd_group_volume("leader", 80))
+            await slow_leader.reached.wait()
+            # a synced member adjusts the very same group as its leader
+            second = asyncio.create_task(controller.cmd_group_volume("member", 30))
+            await asyncio.gather(first, second)
 
         assert overlapped is False
         for player in players.values():

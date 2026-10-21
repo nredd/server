@@ -14,7 +14,7 @@ callbacks instead of a WebSocket connection.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from aiosendspin.models.core import ServerStateMessage
@@ -71,6 +71,10 @@ class BridgePlayerRole(Role):
         self._on_stream_end_cb: Callable[[], None] | None = None
         self._on_explicit_stop_cb: Callable[[], None] | None = None
         self._audio_requirements: AudioRequirements | None = None
+        # MA can await a bridge command without entering the SDK's optimistic setters.
+        # External SDK controllers keep the existing synchronous command callbacks.
+        self.volume_command: Callable[[int], Awaitable[None]] | None = None
+        self.mute_command: Callable[[bool], Awaitable[None]] | None = None
         self._volume: int = 100
         self._muted: bool = False
         # Bridge-specific timing reported to PushStream so server scheduling

@@ -119,6 +119,7 @@ def make_player(  # noqa: PLR0913
     player.state.active_group = None
     player.device_info.manufacturer = manufacturer
     player.ignore_volume_reports = manufacturer.lower() == "apple"
+    player.checked_volume_enabled = False
     player.volume_muted = False
     player.volume_level = 50
     if has_stream:
