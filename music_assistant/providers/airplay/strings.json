@@ -8,6 +8,10 @@
       "label": "Experimental checked logical session volume",
       "description": "Default-off backend contract for a verified trial CLI. Requires experimental native admission and a version 1 CLI handshake on new connections. Does not publish native volume availability or prove native UI identity. Older binaries continue playback without checked volume support. Sendspin and unconfirmed mixed-output groups remain unavailable. Not for production deployment."
     },
+    "private_native_volume_capture": {
+      "label": "Private native-volume observation capture",
+      "description": "Private trial only. Retains bounded aggregate historical observations from new eligible AirPlay 2 connections. Requires experimental HomePod remote admission. Does not publish availability, bind identities, dispatch commands, or prove native volume UI support. Coordinator sets and restores this private setting explicitly; never use it in production."
+    },
     "radio_station_first": {
       "label": "Show radio station as main title",
       "description": "Show the radio station name as the main Now Playing title, with programme or song information on the secondary artist line. Disabled by default to keep the usual metadata display. Only applies when the current Music Assistant radio station can be identified."

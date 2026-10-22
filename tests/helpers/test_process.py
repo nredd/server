@@ -233,6 +233,490 @@ async def test_iter_stdout_drains_lines_buffered_after_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_iter_stderr_drains_final_status_buffered_after_exit() -> None:
+    """A terminal child summary survives reaping before its stderr reader starts."""
+    proc = AsyncProcess(
+        ["sh", "-c", "printf '[STATUS] native_volume_capture version=1\\n' >&2"],
+        stderr=True,
+    )
+    await proc.start()
+    await proc.wait()
+
+    assert [line async for line in proc.iter_stderr()] == [
+        "[STATUS] native_volume_capture version=1"
+    ]
+    await proc.close()
+
+
+@pytest.mark.parametrize("cleanup", ["close", "kill"])
+async def test_stderr_read_after_cleanup_does_not_wait_on_retained_lock(cleanup: str) -> None:
+    """Cleanup-owned stderr reports EOF even when its stream lock remains held."""
+    proc = AsyncProcess(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=True, stderr=True
+    )
+    await proc.start()
+    await getattr(proc, cleanup)()
+    # close retains its locks; model the same cleanup ownership after kill's drain.
+    if not proc._stderr_lock.locked():
+        await proc._stderr_lock.acquire()
+    assert await asyncio.wait_for(proc.read_stderr(), 0.2) == b""
+
+
+@pytest.mark.parametrize(("attached", "hold_lock"), [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("cleanup", ["close", "kill"])
+async def test_stderr_reader_keeps_ownership_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch, attached: bool, hold_lock: bool, cleanup: str
+) -> None:
+    """A reader held across cleanup drains the real child's tail without cancellation."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('ready\\ntail\\n'); sys.stderr.flush(); sys.stdin.read()",
+        ],
+        stdin=True,
+        stderr=True,
+    )
+    await proc.start()
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    lines: list[bytes] = []
+
+    async def _reader() -> None:
+        """Hold the actual stream lock until cleanup has spent its release budget."""
+        assert proc.proc is not None
+        assert proc.proc.stderr is not None
+        async with proc._stderr_lock:
+            lines.append(await proc.proc.stderr.readline())
+            ready.set()
+            if hold_lock:
+                await release.wait()
+        await release.wait()
+        while line := await proc.read_stderr():
+            lines.append(line)
+
+    reader = asyncio.create_task(_reader())
+    if attached:
+        proc.attach_stderr_reader(reader)
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        await asyncio.wait_for(getattr(proc, cleanup)(), 5)
+        assert not reader.done(), "cleanup cancelled the stderr owner"
+        release.set()
+        await asyncio.wait_for(reader, 1)
+        assert lines == [b"ready\n", b"tail\n"]
+        assert proc.returncode is not None
+    finally:
+        release.set()
+        if not reader.done():
+            reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        await proc.kill()
+
+
+@pytest.mark.parametrize("attached", [False, True])
+async def test_close_stderr_owner_drains_gated_child_without_communicate(
+    monkeypatch: pytest.MonkeyPatch, attached: bool
+) -> None:
+    """A child released at the reap boundary flushes beyond pipe capacity and exits normally."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    gate_read, gate_write = os.pipe()
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; sys.stderr.write('ready\\n'); sys.stderr.flush(); "
+            f"sys.stdin.read(); os.read({gate_read}, 1); "
+            f"sys.stderr.write('{_SLOW_EXIT_LINE}\\n' * {_SLOW_EXIT_LINES}); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stderr=True,
+        pass_fds=(gate_read,),
+    )
+    await proc.start()
+    assert proc.proc is not None
+    waiting = asyncio.Event()
+    ready = asyncio.Event()
+    lines: list[str] = []
+    original_wait = proc.proc.wait
+
+    async def _wait() -> int:
+        """Expose the real reap boundary, without replacing the actual process wait."""
+        waiting.set()
+        return await original_wait()
+
+    async def _forbidden_communicate() -> tuple[bytes, bytes]:
+        """Fail if cleanup steals a stream still owned by the reader."""
+        pytest.fail("communicate raced the stderr owner")
+
+    monkeypatch.setattr(proc.proc, "wait", _wait)
+    monkeypatch.setattr(proc.proc, "communicate", _forbidden_communicate)
+    reader = asyncio.create_task(_collect_lines(proc.iter_stderr(), lines, ready))
+    if attached:
+        proc.attach_stderr_reader(reader)
+    closing: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        closing = asyncio.create_task(proc.close())
+        await asyncio.wait_for(waiting.wait(), 1)
+        os.write(gate_write, b"x")
+        await asyncio.wait_for(closing, 5)
+        await asyncio.wait_for(reader, 1)
+        assert proc.returncode == 0
+        assert lines == ["ready", *[_SLOW_EXIT_LINE] * _SLOW_EXIT_LINES]
+    finally:
+        os.close(gate_write)
+        os.close(gate_read)
+        await proc.kill()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        if not reader.done():
+            reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize("with_stdout_reader", [False, True])
+async def test_close_drains_stderr_when_attached_reader_stops_before_eof(
+    monkeypatch: pytest.MonkeyPatch, with_stdout_reader: bool
+) -> None:
+    """An initial stderr handoff drains even while another reader retains stdout."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('ready\\n'); sys.stderr.flush(); sys.stdin.read(); "
+            "sys.stderr.write('x' * 300000); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stdout=with_stdout_reader,
+        stderr=True,
+    )
+    await proc.start()
+    out = asyncio.create_task(proc.read_stdout()) if with_stdout_reader else None
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _reader() -> None:
+        """End after the first line once close has claimed the pending task."""
+        assert await proc.read_stderr() == b"ready\n"
+        ready.set()
+        await release.wait()
+
+    reader = asyncio.create_task(_reader())
+    proc.attach_stderr_reader(reader)
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        assert proc._stdout_lock.locked() is with_stdout_reader
+        # close signals EOF before waiting for this task. Let EOF release it so
+        # completion happens during cleanup, not before the ownership snapshot.
+        assert proc.proc is not None
+        assert proc.proc.stdin is not None
+        original_close = proc.proc.stdin.close
+
+        def _close_stdin() -> None:
+            """Release the reader at the real stdin-EOF boundary."""
+            original_close()
+            release.set()
+
+        monkeypatch.setattr(proc.proc.stdin, "close", _close_stdin)
+        await asyncio.wait_for(proc.close(), 5)
+        assert proc.returncode == 0
+        await reader
+    finally:
+        release.set()
+        await proc.kill()
+        await asyncio.gather(reader, return_exceptions=True)
+        if out is not None:
+            assert await asyncio.wait_for(out, 1) == b""
+        assert proc.proc is not None
+        assert proc.proc.stderr is not None
+        # A failing handoff leaves buffered stderr after SIGKILL; finish its transport.
+        await asyncio.wait_for(proc.proc.stderr.read(), 1)
+        await asyncio.wait_for(proc.proc.wait(), 1)
+
+
+async def _read_stderr_until_released(
+    proc: AsyncProcess, ready: asyncio.Event, release: asyncio.Event
+) -> None:
+    """Read a real child's ready line, then finish only after the test releases ownership."""
+    assert await proc.read_stderr() == b"ready\n"
+    ready.set()
+    await release.wait()
+
+
+@pytest.mark.parametrize("release_at_timeout", [False, True])
+async def test_close_reclaims_stderr_when_attached_reader_finishes_during_reap(
+    monkeypatch: pytest.MonkeyPatch, release_at_timeout: bool
+) -> None:
+    """Late reader completion must hand its buffered tail back before SIGKILL escalation."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('ready\\n'); sys.stderr.flush(); sys.stdin.read(); "
+            "sys.stderr.write('x' * 300000); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stderr=True,
+    )
+    await proc.start()
+    assert proc.proc is not None
+    original_wait = proc.proc.wait
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    reader = asyncio.create_task(_read_stderr_until_released(proc, ready, release))
+    proc.attach_stderr_reader(reader)
+
+    async def _wait() -> int:
+        """Release the actual reader at entry or cancellation of the real process wait."""
+        if not release_at_timeout:
+            release.set()
+        try:
+            return await original_wait()
+        except asyncio.CancelledError:
+            release.set()
+            await reader
+            raise
+
+    monkeypatch.setattr(proc.proc, "wait", _wait)
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        await asyncio.wait_for(proc.close(), 10)
+        await reader
+        assert proc.returncode == 0
+    finally:
+        release.set()
+        await proc.kill()
+        await asyncio.gather(reader, return_exceptions=True)
+        assert proc.proc.stderr is not None
+        # The red case leaves unread buffered output after killing the healthy child.
+        await asyncio.wait_for(proc.proc.stderr.read(), 5)
+        await asyncio.wait_for(original_wait(), 5)
+
+
+@pytest.mark.parametrize("cancel_drain", [False, True])
+async def test_late_stderr_handoff_keeps_reap_and_cancellation_bounded(
+    monkeypatch: pytest.MonkeyPatch, cancel_drain: bool
+) -> None:
+    """Late handoff drains once, then either reaps with cancellation or escalates a stuck child."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    if not cancel_drain:
+        monkeypatch.setattr(process_module, "PIPE_DRAIN_TIMEOUT", 0.01)
+    gate_read, gate_write = os.pipe()
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; sys.stderr.write('ready\\n'); sys.stderr.flush(); "
+            f"sys.stdin.read(); os.read({gate_read}, 1); "
+            "sys.stderr.write('x' * 300000); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stderr=True,
+        pass_fds=(gate_read,),
+    )
+    await proc.start()
+    assert proc.proc is not None
+    original_wait = proc.proc.wait
+    original_drain = proc._drain_pipe
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    draining = asyncio.Event()
+    drained_streams: list[asyncio.StreamReader] = []
+
+    async def _wait() -> int:
+        """Release the attached owner only after its initial release budget expired."""
+        release.set()
+        return await original_wait()
+
+    async def _drain(
+        stream: asyncio.StreamReader, cancelled: asyncio.CancelledError | None
+    ) -> asyncio.CancelledError | None:
+        """Observe the actual bounded drain without replacing its behavior."""
+        drained_streams.append(stream)
+        draining.set()
+        return await original_drain(stream, cancelled)
+
+    reader = asyncio.create_task(_read_stderr_until_released(proc, ready, release))
+    proc.attach_stderr_reader(reader)
+    monkeypatch.setattr(proc.proc, "wait", _wait)
+    monkeypatch.setattr(proc, "_drain_pipe", _drain)
+    closing: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        closing = asyncio.create_task(proc.close())
+        await asyncio.wait_for(draining.wait(), 5)
+        if cancel_drain:
+            closing.cancel()
+            os.write(gate_write, b"x")
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 5)
+            assert proc.returncode == 0
+        else:
+            await asyncio.wait_for(closing, 5)
+            assert proc.returncode == -SIGKILL
+        assert drained_streams == [proc.proc.stderr]
+        await reader
+    finally:
+        os.close(gate_write)
+        os.close(gate_read)
+        release.set()
+        await proc.kill()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+async def test_close_reclaims_stderr_from_unattached_one_line_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-line reader releasing within budget must not force a healthy child into SIGKILL."""
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.read(); "
+            "sys.stderr.write('ready\\n' + 'x' * 300000); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stderr=True,
+    )
+    await proc.start()
+    acquired = asyncio.Event()
+    original_acquire = proc._stderr_lock.acquire
+
+    async def _acquire() -> bool:
+        """Signal actual lock ownership before letting cleanup start."""
+        result = await original_acquire()
+        acquired.set()
+        return result
+
+    monkeypatch.setattr(proc._stderr_lock, "acquire", _acquire)
+    reader = asyncio.create_task(proc.read_stderr())
+    try:
+        await asyncio.wait_for(acquired.wait(), 5)
+        await asyncio.wait_for(proc.close(), 10)
+        assert await reader == b"ready\n"
+        assert proc.returncode == 0
+    finally:
+        await proc.kill()
+        await asyncio.gather(reader, return_exceptions=True)
+        assert proc.proc is not None
+        assert proc.proc.stderr is not None
+        # The red case leaves a paused transport full of unread output after SIGKILL.
+        await asyncio.wait_for(proc.proc.stderr.read(), 5)
+        await asyncio.wait_for(proc.proc.wait(), 5)
+
+
+async def test_close_reraises_cancellation_during_shielded_stderr_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External cancellation at the attached-reader wait is deferred until reap, not lost."""
+    proc = AsyncProcess(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=True, stderr=True
+    )
+    await proc.start()
+    release = asyncio.Event()
+    waiting = asyncio.Event()
+
+    async def _reader() -> None:
+        """Represent an attached stderr consumer processing its current line."""
+        await release.wait()
+
+    attached = asyncio.create_task(_reader())
+    proc.attach_stderr_reader(attached)
+    original_wait = proc._wait_for_stderr_reader
+
+    async def _wait(
+        cancelled: asyncio.CancelledError | None,
+    ) -> asyncio.CancelledError | None:
+        """Signal entry to the real shielded wait without changing its implementation."""
+        waiting.set()
+        return await original_wait(cancelled)
+
+    monkeypatch.setattr(proc, "_wait_for_stderr_reader", _wait)
+    closing = asyncio.create_task(proc.close())
+    try:
+        await asyncio.wait_for(waiting.wait(), 5)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert proc.returncode is not None
+        assert not attached.done()
+        assert not attached.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(closing, attached, return_exceptions=True)
+        await proc.kill()
+
+
+@pytest.mark.parametrize("cleanup", ["close", "kill"])
+async def test_attached_stderr_reader_can_run_its_own_cleanup(
+    monkeypatch: pytest.MonkeyPatch, cleanup: str
+) -> None:
+    """Reader-owned cleanup must not await itself, including indirectly through shield."""
+    proc = AsyncProcess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('ready\\n'); sys.stderr.flush(); sys.stdin.read(); "
+            "sys.stderr.write('x' * 300000); sys.stderr.flush()",
+        ],
+        stdin=True,
+        stderr=True,
+    )
+    await proc.start()
+    original_shield = asyncio.shield
+
+    def _shield(task: asyncio.Task[None]) -> asyncio.Future[None]:
+        """Reject self-waits at the actual asyncio boundary."""
+        assert task is not asyncio.current_task(), "stderr reader awaited itself"
+        return original_shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", _shield)
+
+    async def _reader() -> None:
+        """Run cleanup from the same task registered as stderr owner."""
+        assert await proc.read_stderr() == b"ready\n"
+        await getattr(proc, cleanup)()
+
+    reader = asyncio.create_task(_reader())
+    proc.attach_stderr_reader(reader)
+    try:
+        await asyncio.wait_for(reader, 5)
+        assert proc.returncode == (0 if cleanup == "close" else -SIGKILL)
+    finally:
+        await proc.kill()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+async def test_close_does_not_raise_a_stderr_readers_own_cancellation() -> None:
+    """A reader cancelled independently does not cancel otherwise normal process cleanup."""
+    proc = AsyncProcess(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=True, stderr=True
+    )
+    await proc.start()
+
+    async def _reader() -> None:
+        """Wait for a line that will never arrive before caller cancellation."""
+        await proc.read_stderr()
+
+    reader = asyncio.create_task(_reader())
+    proc.attach_stderr_reader(reader)
+    reader.cancel()
+    await asyncio.gather(reader, return_exceptions=True)
+    try:
+        await asyncio.wait_for(proc.close(), 5)
+        assert proc.returncode == 0
+    finally:
+        await proc.kill()
+
+
+@pytest.mark.asyncio
 async def test_write_eof_marks_stdin_closed_while_the_process_lives() -> None:
     """
     A process that was sent EOF keeps running but can no longer be fed.
@@ -499,7 +983,7 @@ async def test_close_reaps_a_child_while_its_attached_stderr_reader_is_blocked(
     """
     An attached stderr reader that never sees EOF does not keep close() from reaping.
 
-    The reader is cancelled once the release budget is spent, and the child is
+    The reader stays in charge once the release budget is spent, and the child is
     escalated to SIGKILL like any other that holds its pipes open.
     """
     monkeypatch.setattr(process_module, "PIPE_DRAIN_TIMEOUT", 0.2)
@@ -515,7 +999,8 @@ async def test_close_reaps_a_child_while_its_attached_stderr_reader_is_blocked(
         await proc.close()
 
     assert proc.returncode == -SIGKILL
-    assert reader.cancelled()
+    await asyncio.wait_for(reader, 1)
+    assert not reader.cancelled()
 
 
 @pytest.mark.asyncio
@@ -537,6 +1022,19 @@ async def test_a_concurrent_close_does_not_leave_stdout_to_a_reader(
 
     assert proc.returncode is not None
     assert await asyncio.wait_for(proc.read_stdout(), 1) == b""
+
+
+async def test_concurrent_close_keeps_stderr_cleanup_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second close must not mistake the first cleanup's stderr lock for a reader."""
+    monkeypatch.setattr(process_module, "STREAM_RELEASE_TIMEOUT", 0.01)
+    proc = AsyncProcess(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=True, stderr=True
+    )
+    await proc.start()
+    await asyncio.wait_for(asyncio.gather(proc.close(), proc.close()), 5)
+    assert await asyncio.wait_for(proc.read_stderr(), 0.2) == b""
 
 
 def test_parse_child_process_name() -> None:

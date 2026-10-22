@@ -15,7 +15,7 @@ import sys
 
 # if TYPE_CHECKING:
 from collections import Counter
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from signal import SIGINT, SIGKILL
@@ -191,6 +191,7 @@ class AsyncProcess:
         # set by close() or kill() when a reader still held stdout: that reader then
         # stays in charge of the stream until EOF
         self._stdout_left_to_reader = False
+        self._stderr_left_to_reader = False
         self._returncode: int | None = None
 
     @property
@@ -317,7 +318,7 @@ class AsyncProcess:
             await self.proc.stdin.drain()
 
     @asynccontextmanager
-    async def stdin_quiesced(self, timeout: float = 5.0) -> AsyncIterator[bool]:
+    async def stdin_quiesced(self, timeout: float = 5.0) -> AsyncGenerator[bool]:
         """
         Hold stdin quiet for a block, with what was already written seen through to the pipe.
 
@@ -369,8 +370,13 @@ class AsyncProcess:
                 pass
 
     async def read_stderr(self) -> bytes:
-        """Read line from stderr."""
-        if self.returncode is not None:
+        """
+        Read buffered stderr through EOF, including output written before child exit.
+
+        After cleanup starts, only a stream left to its reader remains readable.
+        Buffered diagnostics do not imply that the child is still alive.
+        """
+        if self._close_called and not self._stderr_left_to_reader:
             return b""
         assert self.proc is not None  # for type checking
         assert self.proc.stderr is not None  # for type checking
@@ -420,10 +426,15 @@ class AsyncProcess:
         An enclosing timeout is not a reliable bound on this call: the cleanup may
         swallow the cancellation and run to completion, and a cancellation that does
         land is only re-raised after the terminate/SIGKILL escalation has run.
+        Cancellation during the attached stderr wait is preserved until reap;
+        earlier feeder and stream-lock waits remain best-effort cancellation points.
 
         A reader the caller keeps on stdout or stderr past the release budget is
         left in place: it keeps draining its stream while the process is waited
-        for and, if need be, killed.
+        for and, if need be, killed. If an attached reader finishes during the
+        initial release or a reap wait, cleanup reclaims its free stderr pipe
+        and drains it once within the existing drain budget before escalating,
+        independently of whether a reader still owns stdout.
         """
         if self._close_called and self.returncode is not None:
             # Already closed and reaped, so there is nothing left to signal or
@@ -431,8 +442,14 @@ class AsyncProcess:
             # (or were left to a reader) and would only be waited out again.
             return
         # a concurrent second close() times out on the locks the first one holds,
-        # so only the first call may leave stdout to a reader
+        # so only the first call may leave a stream to a reader
         first_close = not self._close_called
+        if first_close:
+            self._stderr_left_to_reader = self._stderr_lock.locked() or bool(
+                self._stderr_reader_task
+                and not self._stderr_reader_task.done()
+                and self._stderr_reader_task is not asyncio.current_task()
+            )
         self._close_called = True
         if not self.proc:
             return
@@ -462,18 +479,7 @@ class AsyncProcess:
             self._stdout_left_to_reader = stdout_left_to_reader
         if self.proc.stdout and not stdout_left_to_reader and not self.proc.stdout.at_eof():
             cancelled = await self._drain_pipe(self.proc.stdout, cancelled)
-        # stderr needs no flag of its own: read_stderr() keys on the returncode and
-        # a reader left there reads on until the exit anyway
-        stderr_left_to_reader = False
-        # if we have a stderr task active, allow it to finish
-        if self._stderr_reader_task:
-            with suppress(TimeoutError, asyncio.CancelledError):
-                await asyncio.wait_for(self._stderr_reader_task, STREAM_RELEASE_TIMEOUT)
-        elif self.proc.stderr and not self.proc.stderr.at_eof():
-            stderr_left_to_reader = not await self._acquire_stream_lock(self._stderr_lock)
-            if not stderr_left_to_reader:
-                # drain stderr
-                cancelled = await self._drain_pipe(self.proc.stderr, cancelled)
+        stderr_left_to_reader, cancelled = await self._prepare_stderr_close(first_close, cancelled)
 
         # make sure the process is really cleaned up.
         # especially with pipes this can cause deadlocks if not properly guarded
@@ -492,6 +498,14 @@ class AsyncProcess:
             except (TimeoutError, asyncio.CancelledError) as err:
                 if isinstance(err, asyncio.CancelledError):
                     cancelled = cancelled or err
+                if stderr_left_to_reader:
+                    stderr_left_to_reader, cancelled = await self._reclaim_finished_stderr_reader(
+                        cancelled
+                    )
+                    if not stderr_left_to_reader:
+                        # One ownership transition, not a retry budget reset: the
+                        # next reap cannot take this handoff branch again.
+                        continue
                 terminate_attempts += 1
                 self.logger.debug(
                     "Process %s with PID %s is still running (attempt %d). Sending SIGKILL...",
@@ -532,9 +546,15 @@ class AsyncProcess:
         A reader the caller still has on stdout or stderr is left in place: it
         keeps draining its stream until the kill closes the pipe.
         """
-        # only the first close() or kill() may leave stdout to a reader: a lock a
+        # only the first close() or kill() may leave a stream to a reader: a lock a
         # concurrent close() holds is not a reader's
         first_close = not self._close_called
+        if first_close:
+            self._stderr_left_to_reader = self._stderr_lock.locked() or bool(
+                self._stderr_reader_task
+                and not self._stderr_reader_task.done()
+                and self._stderr_reader_task is not asyncio.current_task()
+            )
         self._close_called = True
         if not self.proc or self.returncode is not None:
             return
@@ -543,7 +563,7 @@ class AsyncProcess:
 
         if self._stdin_feeder_task:
             await self._cancel_and_await(self._stdin_feeder_task, "stdin feeder")
-        if self._stderr_reader_task:
+        if self._stderr_reader_task and self._stderr_reader_task.done():
             await self._cancel_and_await(self._stderr_reader_task, "stderr reader")
 
         # Close stdin to signal we're done sending data
@@ -572,7 +592,9 @@ class AsyncProcess:
                 (self.proc.stdout, self._stdout_lock),
                 (self.proc.stderr, self._stderr_lock),
             )
-            if stream is not None and not lock.locked()
+            if stream is not None
+            and not lock.locked()
+            and not (lock is self._stderr_lock and self._stderr_left_to_reader)
         ]
         try:
             await asyncio.wait_for(asyncio.gather(*drains), 2)
@@ -617,8 +639,85 @@ class AsyncProcess:
         return await asyncio.wait_for(self.wait(), timeout)
 
     def attach_stderr_reader(self, task: asyncio.Task[None]) -> None:
-        """Attach a stderr reader task to this process."""
+        """
+        Attach the task owning stderr, including time spent processing lines.
+
+        Close waits up to the release budget without cancelling this task; kill
+        leaves it draining too. The caller must handle any work remaining after
+        cleanup returns. Neither method makes buffered stderr evidence of liveness.
+        A reader invoking cleanup itself is not awaited and relinquishes stderr
+        when it no longer holds the read lock.
+        """
         self._stderr_reader_task = task
+
+    async def _prepare_stderr_close(
+        self, first_close: bool, cancelled: asyncio.CancelledError | None
+    ) -> tuple[bool, asyncio.CancelledError | None]:
+        """Settle initial stderr ownership and return whether cleanup left it to a reader."""
+        assert self.proc is not None
+        # An attached reader owns the stream even while processing outside the
+        # read lock. An unattached reader hands it back by releasing that lock.
+        cancelled = await self._wait_for_stderr_reader(cancelled)
+        left_to_reader = (
+            self._stderr_left_to_reader
+            if self._stderr_reader_task or not self.proc.stderr
+            else not await self._acquire_stream_lock(self._stderr_lock)
+        )
+        if self._stderr_reader_task and self.proc.stderr and not left_to_reader:
+            # The attached reader relinquished stderr during the initial wait.
+            # Claim only a free lock, without yielding to another reader or
+            # spending another release budget, just like the late handoff.
+            left_to_reader = self._stderr_lock.locked()
+            if not left_to_reader:
+                await self._stderr_lock.acquire()
+        if first_close:
+            self._stderr_left_to_reader = left_to_reader
+        if self.proc.stderr and not left_to_reader:
+            cancelled = await self._drain_pipe(self.proc.stderr, cancelled)
+        return left_to_reader, cancelled
+
+    async def _reclaim_finished_stderr_reader(
+        self, cancelled: asyncio.CancelledError | None
+    ) -> tuple[bool, asyncio.CancelledError | None]:
+        """Drain a finished owner's free pipe once; return whether a reader still owns it."""
+        assert self.proc is not None
+        if (
+            not self._stderr_left_to_reader
+            or self._stderr_reader_task is None
+            or not self._stderr_reader_task.done()
+            or self._stderr_lock.locked()
+            or self.proc.stderr is None
+        ):
+            return True, cancelled
+        # No await can suspend between the free-lock check and acquiring it.
+        # Keep the lock like the initial cleanup drain, preventing concurrent reads.
+        await self._stderr_lock.acquire()
+        self._stderr_left_to_reader = False
+        cancelled = await self._drain_pipe(self.proc.stderr, cancelled)
+        return False, cancelled
+
+    async def _wait_for_stderr_reader(
+        self, cancelled: asyncio.CancelledError | None
+    ) -> asyncio.CancelledError | None:
+        """Wait within budget, preserving external cancellation for re-raising after reap."""
+        current = asyncio.current_task()
+        if self._stderr_reader_task is None or self._stderr_reader_task is current:
+            return cancelled
+        try:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(self._stderr_reader_task), STREAM_RELEASE_TIMEOUT
+                )
+        except asyncio.CancelledError as err:
+            # A cancelled reader also cancels its shield, but only cancellation
+            # directed at close itself must be propagated after cleanup.
+            if current is not None and current.cancelling():
+                cancelled = cancelled or err
+        # A reader may deliberately stop before EOF. Once it has finished and no
+        # other read holds the stream, cleanup must drain what it left behind.
+        if self._stderr_reader_task.done() and not self._stderr_lock.locked():
+            self._stderr_left_to_reader = False
+        return cancelled
 
     async def _readline(self, stream: asyncio.StreamReader, lock: asyncio.Lock) -> bytes:
         """

@@ -22,8 +22,8 @@
   ],
   "frontend_repo": "",
   "official_app_contract_sha": "869d9ebd37a09c2a8e1aef4d90bd8c34ba65b683",
-  "cli_source_sha": "5c4901f01834498babeb7af8e0f3b919aef15a20",
-  "cli_sha256": "c65b4ddb067c85fafe461ab51eb9828e999eb0c7f3a7f87942a830cb35479199",
-  "cli_build_label": "v5c4901f",
-  "cli_path": "/media/.native-airplay/c65b4ddb067c85fafe461ab51eb9828e999eb0c7f3a7f87942a830cb35479199/cliairplay-linux-aarch64"
+  "cli_source_sha": "716f89457fc24cff37aa6f9470bcf572e887c094",
+  "cli_sha256": "c5e397d3a2b67e46c610140758ee79867d75bc6459b5b30208c2f6e2bcf7f792",
+  "cli_build_label": "v716f894",
+  "cli_path": "/media/.native-airplay/c5e397d3a2b67e46c610140758ee79867d75bc6459b5b30208c2f6e2bcf7f792/cliairplay-linux-aarch64"
 }

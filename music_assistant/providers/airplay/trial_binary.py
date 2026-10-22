@@ -36,8 +36,8 @@ from music_assistant.helpers.process import (
 if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
 
-EXPECTED_SHA = "c65b4ddb067c85fafe461ab51eb9828e999eb0c7f3a7f87942a830cb35479199"
-EXPECTED_BUILD = "v5c4901f"
+EXPECTED_SHA = "c5e397d3a2b67e46c610140758ee79867d75bc6459b5b30208c2f6e2bcf7f792"
+EXPECTED_BUILD = "v716f894"
 TRIAL_ROOT = Path("/media/.native-airplay")
 ASSET_NAME = "cliairplay-linux-aarch64"
 MAX_BINARY_SIZE = 64 * 1024 * 1024
@@ -119,6 +119,11 @@ class TrialAsyncProcess(AsyncProcess):
         except BaseException:
             await self._kill_and_reap()
             raise
+
+    def has_historical_receipt(self) -> bool:
+        """Match the acknowledged child even after exit, never as live authority."""
+        receipt = self._trusted_receipt
+        return receipt is not None and receipt.process is self and receipt.proc is self.proc
 
     def has_current_receipt(self) -> bool:
         """Return whether this exact owned child has a current acknowledgement receipt."""

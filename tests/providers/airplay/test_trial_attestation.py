@@ -53,7 +53,11 @@ def acknowledgement(nonce: str) -> dict[str, Any]:
 
 
 def install_host_spawn(
-    monkeypatch: pytest.MonkeyPatch, mode: str, spawned: asyncio.Event | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    spawned: asyncio.Event | None = None,
+    *,
+    capture_summary: str = "",
 ) -> list[asyncio.subprocess.Process]:
     """Replace only foreign execution with a real bounded host child and inherited FD."""
     actual_spawn = asyncio.create_subprocess_exec
@@ -85,7 +89,16 @@ def install_host_spawn(
                     else b"[STATUS] ready\n"
                 )
                 body += f"os.write(1,{status!r})\n"
-        if mode == "natural":
+        if mode in ("capture_final", "capture_late_duplicate", "capture_held_stdout"):
+            body += "sys.stdin.buffer.read(1)\n"
+            body += "os.write(2,b'[STATUS] connected\\n')\n"
+            body += f"os.write(2,{(capture_summary + chr(10)).encode()!r})\n"
+            if mode == "capture_late_duplicate":
+                body += "os.close(2)\nsys.stdin.buffer.read(1)\n"
+                body += f"os.write(1,{line.encode()!r})\n"
+            elif mode == "capture_held_stdout":
+                body += "os.close(2)\ntime.sleep(0.1)\n"
+        elif mode == "natural":
             body += "sys.stdin.buffer.read(1)\n"
         elif mode != "exit":
             body += "time.sleep(10)\n"

@@ -9,10 +9,14 @@ import logging
 import os
 import socket
 import time
+from collections import deque
+from collections.abc import Callable
 from contextlib import suppress
+from copy import deepcopy
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import TYPE_CHECKING, Final, cast
 
+from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, PlaybackState
 from music_assistant_models.errors import MediaNotFoundError
@@ -32,7 +36,11 @@ from music_assistant.helpers.config_entries import (
 )
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
-from music_assistant.helpers.private_trial import encode_public_digest, installer_provenance
+from music_assistant.helpers.private_trial import (
+    encode_public_digest,
+    installer_provenance,
+    is_trial_target,
+)
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import (
     get_ip_addresses,
@@ -53,6 +61,7 @@ from .constants import (
     CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD_INVALID,
     CONF_PASSWORD_MARKERS_REVIEWED,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
     CONF_RADIO_STATION_FIRST,
     CONF_STORED_VOLUME,
     CONF_STREAMING_MODE,
@@ -80,6 +89,7 @@ from .helpers import (
     probe_audio_formats,
 )
 from .player import AirPlayPlayer, GenericAirPlayPlayer
+from .private_volume_capture import PrivateVolumeCapture, classify_dacp
 from .sendspin_bridge import SendspinBridgeManager
 
 if TYPE_CHECKING:
@@ -126,6 +136,7 @@ class AirPlayProvider(PlayerProvider):
     _ptp_daemon_warn_window_start: float | None = None
     _ptp_daemon_warns_in_window: int = 0
     _ptp_daemon_warns_suppressed: int = 0
+    _unregister_private_capture_api: Callable[[], None] | None = None
 
     @property
     def bridge_manager(self) -> SendspinBridgeManager:
@@ -241,6 +252,19 @@ class AirPlayProvider(PlayerProvider):
                 required=False,
                 advanced=True,
             ),
+            *(
+                (
+                    ConfigEntry(
+                        key=CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+                        type=ConfigEntryType.BOOLEAN,
+                        default_value=False,
+                        required=False,
+                        advanced=True,
+                    ),
+                )
+                if is_trial_target()
+                else ()
+            ),
             ConfigEntry(
                 key=CONF_RADIO_STATION_FIRST,
                 type=ConfigEntryType.BOOLEAN,
@@ -275,6 +299,8 @@ class AirPlayProvider(PlayerProvider):
         # planned, so all rooms render the clip in sync (managed by
         # announce.py, pruned as plans pass).
         self._announce_plans: dict[tuple[str, str], int] = {}
+        self._private_capture_history: deque[PrivateVolumeCapture] = deque(maxlen=16)
+        self._unregister_private_capture_api = None
 
         # Initialize Sendspin bridge manager for protocol linking
         self._bridge_manager = SendspinBridgeManager(self)
@@ -310,6 +336,16 @@ class AirPlayProvider(PlayerProvider):
         # AirPlay 2 streams attach to it (--ptp-shared) so multi-room sync groups
         # lock to a single grandmaster while UDP 319/320 is bound only once.
         await self._start_ptp_daemon()
+
+    async def loaded_in_mass(self) -> None:
+        """Register private trial API commands after the provider has loaded."""
+        await super().loaded_in_mass()
+        if is_trial_target():
+            self._unregister_private_capture_api = self.mass.register_api_command(
+                "airplay/private_native_volume_capture/get",
+                self.get_private_native_volume_capture,
+                required_scope=Scope.SYSTEM_MANAGE,
+            )
 
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Handle logic when the config is updated."""
@@ -370,6 +406,9 @@ class AirPlayProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        if unregister := getattr(self, "_unregister_private_capture_api", None):
+            unregister()
+            self._unregister_private_capture_api = None
         # Unregister all dashboard endpoints
         dashboards = getattr(self, "dashboards", None)
         if dashboards:
@@ -436,7 +475,7 @@ class AirPlayProvider(PlayerProvider):
                 "startup_validation": self._trial_identity,
                 "owned_children": children,
             }
-        return {
+        diagnostics: dict[str, SerializableType] = {
             "trial_binary": trial,
             "dacp_server_running": self._dacp_server.is_serving(),
             "ptp_daemon_running": self.ptp_daemon_running,
@@ -445,6 +484,26 @@ class AirPlayProvider(PlayerProvider):
             "streams_by_type": streams_by_type,
             "streams_by_route": streams_by_route,
         }
+        if is_trial_target():
+            history = getattr(self, "_private_capture_history", ())
+            diagnostics["private_native_volume_capture"] = {
+                "records": [capture.diagnostics() for capture in history]
+            }
+        return diagnostics
+
+    async def get_private_native_volume_capture(self) -> dict[str, list[SerializableType]]:
+        """Return bounded, historical private native-volume capture records."""
+        if not is_trial_target():
+            msg = "Private native-volume capture is unavailable outside the trial target"
+            raise RuntimeError(msg)
+        history = getattr(self, "_private_capture_history", ())
+        return {"records": deepcopy([capture.diagnostics() for capture in history])}
+
+    def record_private_capture(self, capture: PrivateVolumeCapture) -> None:
+        """Retain one bounded detached historical record without stream identity."""
+        history = getattr(self, "_private_capture_history", None)
+        if history is not None:
+            history.append(capture)
 
     def get_players(self) -> list[AirPlayPlayer]:
         """Return all airplay players belonging to this instance."""
@@ -1077,12 +1136,17 @@ class AirPlayProvider(PlayerProvider):
                 if len(recv) < 1024:
                     break
             if not raw_request:
+                self._observe_dacp_capture(raw_request, None)
                 # Some device (Phorus PS10) seems to send empty request
                 # Maybe as a ack message? we have nothing to do here with empty request
                 # so we return early.
                 return
 
-            request = raw_request.decode("UTF-8")
+            try:
+                request = raw_request.decode("UTF-8")
+            except UnicodeDecodeError:
+                self._observe_dacp_capture(raw_request, None)
+                return
             if "\r\n\r\n" in request:
                 headers_raw, body = request.split("\r\n\r\n", 1)
             else:
@@ -1096,7 +1160,11 @@ class AirPlayProvider(PlayerProvider):
                 x, y = line.split(":", 1)
                 headers[x.strip()] = y.strip()
             active_remote = headers.get("Active-Remote")
-            _, path, _ = headers_split[0].split(" ")
+            try:
+                _, path, _ = headers_split[0].split(" ")
+            except ValueError:
+                self._observe_dacp_capture(raw_request, None)
+                return
             # lookup airplay player by active remote id
             player: AirPlayPlayer | None = next(
                 (
@@ -1106,15 +1174,19 @@ class AirPlayProvider(PlayerProvider):
                 ),
                 None,
             )
-            self.logger.debug(
-                "DACP request for %s (%s): %s -- %s",
-                player.name if player else "UNKNOWN PLAYER",
-                active_remote,
-                path,
-                body,
-            )
+            self._observe_dacp_capture(raw_request, player)
+            if not self._private_capture_active(player):
+                self.logger.debug(
+                    "DACP request for %s (%s): %s -- %s",
+                    player.name if player else "UNKNOWN PLAYER",
+                    active_remote,
+                    path,
+                    body,
+                )
             # machine-parseable capture of raw DACP traffic for building replay test fixtures
-            if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+            if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL) and not self._private_capture_active(
+                player
+            ):
                 capture = {
                     "player": player.name if player else None,
                     "active_remote": active_remote,
@@ -1257,10 +1329,50 @@ class AirPlayProvider(PlayerProvider):
             )
             writer.write(response.encode())
             await writer.drain()
+        except ValueError:
+            if not self._private_capture_active(None):
+                raise
+            # Numeric conversion exceptions include the request value. Keep
+            # private failures finite rather than letting the server log them.
+            for candidate in self.get_players():
+                observation = getattr(candidate.stream, "native_volume_capture", None)
+                if observation is not None:
+                    observation.mark_dacp_error()
         finally:
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
+
+    def _private_capture_active(self, _player: AirPlayPlayer | None) -> bool:
+        """Suppress raw requests throughout the selected private capture window."""
+        if (
+            is_trial_target()
+            and self.config.get_value(CONF_PRIVATE_NATIVE_VOLUME_CAPTURE, False) is True
+        ):
+            return True
+        return any(
+            getattr(candidate.stream, "native_volume_capture", None) is not None
+            for candidate in self.get_players()
+        )
+
+    def _observe_dacp_capture(self, raw_request: bytes, player: AirPlayPlayer | None) -> None:
+        """Capture finite DACP classes before parsing values or dispatching actions."""
+        if player is not None and (stream := player.stream) is not None:
+            if (capture := stream.native_volume_capture) is not None:
+                child = stream._cli_proc
+                current_owner = (
+                    stream.running
+                    and not stream.superseded
+                    and capture.owns(child)
+                    and isinstance(child, trial_binary.TrialAsyncProcess)
+                    and child.has_current_receipt()
+                )
+                capture.observe_dacp(classify_dacp(raw_request, True), current_owner)
+                return
+        for candidate in self.get_players():
+            stream = candidate.stream
+            if stream is not None and (capture := stream.native_volume_capture) is not None:
+                capture.observe_dacp(classify_dacp(raw_request, False), False)
 
     def _drop_unverified_password_markers(self) -> None:
         """

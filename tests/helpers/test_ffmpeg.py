@@ -1137,6 +1137,7 @@ class _FakeProc:
         self.returncode: int | None = None
         self.stdin: _FakeStream | None = _FakeStream()
         self.stdout = _FakeStream()
+        self.stderr: _FakeStream | None = None
 
     async def communicate(self) -> tuple[bytes, bytes]:
         self.returncode = 0
@@ -1158,7 +1159,9 @@ class _FakeProcRacingExit(_FakeProc):
         raise ProcessLookupError("no such process")
 
 
-async def test_log_reader_reports_decode_errors_once_and_aborts() -> None:
+async def test_log_reader_reports_decode_errors_once_and_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Crossing the decode-error threshold logs a single line and aborts the stream.
 
@@ -1176,10 +1179,12 @@ async def test_log_reader_reports_decode_errors_once_and_aborts() -> None:
         for _ in range(20):
             yield "Reserved bit set."
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     error_lines: list[str] = []
-    ffmpeg.logger.error = lambda msg, *args: error_lines.append(msg % args if args else msg)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        ffmpeg.logger, "error", lambda msg, *args: error_lines.append(msg % args if args else msg)
+    )
 
     await ffmpeg._log_reader_task()
     assert ffmpeg._abort_task is not None
@@ -1189,7 +1194,7 @@ async def test_log_reader_reports_decode_errors_once_and_aborts() -> None:
     assert ffmpeg.closed
 
 
-async def test_log_reader_below_threshold_does_not_abort() -> None:
+async def test_log_reader_below_threshold_does_not_abort(monkeypatch: pytest.MonkeyPatch) -> None:
     """A handful of decode errors, well under the threshold, triggers no report or abort."""
     ffmpeg = FFMpeg(audio_input="-", input_format=_PCM_FORMAT, output_format=_PCM_FORMAT)
 
@@ -1198,10 +1203,12 @@ async def test_log_reader_below_threshold_does_not_abort() -> None:
             yield "Invalid data found when processing input"
         yield "Reserved bit set."
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     error_lines: list[str] = []
-    ffmpeg.logger.error = lambda msg, *args: error_lines.append(msg % args if args else msg)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        ffmpeg.logger, "error", lambda msg, *args: error_lines.append(msg % args if args else msg)
+    )
 
     await ffmpeg._log_reader_task()
 
@@ -1210,7 +1217,7 @@ async def test_log_reader_below_threshold_does_not_abort() -> None:
     assert not ffmpeg.closed
 
 
-async def test_log_reader_abort_does_not_self_deadlock() -> None:
+async def test_log_reader_abort_does_not_self_deadlock(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     The detached abort task can close() the reader's own process without a self-await.
 
@@ -1223,13 +1230,13 @@ async def test_log_reader_abort_does_not_self_deadlock() -> None:
     ``RuntimeError: Task cannot await on itself`` rather than a hang.
     """
     ffmpeg = FFMpeg(audio_input="-", input_format=_PCM_FORMAT, output_format=_PCM_FORMAT)
-    ffmpeg.proc = _FakeProc()  # type: ignore[assignment]
+    monkeypatch.setattr(ffmpeg, "proc", _FakeProc())
 
     async def fake_stderr() -> AsyncGenerator[str]:
         for _ in range(50):
             yield "Invalid data found when processing input"
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     reader_task = asyncio.create_task(ffmpeg._log_reader_task())
     ffmpeg._stderr_reader_task = reader_task
@@ -1241,7 +1248,9 @@ async def test_log_reader_abort_does_not_self_deadlock() -> None:
     assert ffmpeg.closed
 
 
-async def test_abort_survives_send_signal_racing_process_exit() -> None:
+async def test_abort_survives_send_signal_racing_process_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     The fire-and-forget abort must not crash if the process exits before it is signalled.
 
@@ -1251,13 +1260,13 @@ async def test_abort_survives_send_signal_racing_process_exit() -> None:
     escaping as an untracked "Task exception was never retrieved".
     """
     ffmpeg = FFMpeg(audio_input="-", input_format=_PCM_FORMAT, output_format=_PCM_FORMAT)
-    ffmpeg.proc = _FakeProcRacingExit()  # type: ignore[assignment]
+    monkeypatch.setattr(ffmpeg, "proc", _FakeProcRacingExit())
 
     async def fake_stderr() -> AsyncGenerator[str]:
         for _ in range(50):
             yield "Invalid data found when processing input"
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     reader_task = asyncio.create_task(ffmpeg._log_reader_task())
     ffmpeg._stderr_reader_task = reader_task
@@ -1273,21 +1282,25 @@ async def test_abort_survives_send_signal_racing_process_exit() -> None:
 # -- _log_reader_task (concat-demuxer demux-error gating) --
 
 
-async def test_log_reader_ignores_demuxing_error_without_concat_demuxer() -> None:
+async def test_log_reader_ignores_demuxing_error_without_concat_demuxer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A demux error from a non-concat input (e.g. HTTP reconnect at EOF) is not fatal."""
     ffmpeg = FFMpeg(audio_input="-", input_format=_PCM_FORMAT, output_format=_PCM_FORMAT)
 
     async def fake_stderr() -> AsyncGenerator[str]:
         yield "[in#0/mp3 @ 0x600000e58fc0] Error during demuxing: Input/output error"
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     await ffmpeg._log_reader_task()
 
     assert ffmpeg.concat_error is False
 
 
-async def test_log_reader_sets_concat_error_for_concat_demuxer() -> None:
+async def test_log_reader_sets_concat_error_for_concat_demuxer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A demux error while the concat demuxer is in use still marks the stream as failed."""
     ffmpeg = FFMpeg(
         audio_input="-",
@@ -1299,7 +1312,7 @@ async def test_log_reader_sets_concat_error_for_concat_demuxer() -> None:
     async def fake_stderr() -> AsyncGenerator[str]:
         yield "[concat @ 0x600000e58fc0] Error during demuxing: Input/output error"
 
-    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    monkeypatch.setattr(ffmpeg, "iter_stderr", fake_stderr)
 
     await ffmpeg._log_reader_task()
 

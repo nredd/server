@@ -26,16 +26,55 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
-The private CLI proof branch is pinned to `5c4901f01834498babeb7af8e0f3b919aef15a20`.
-Canonical CLI Build `39604837204` passed Linux native/cross, macOS, Python and sanitizer
-jobs; Linux tests exercise the real inherited-FD/self-image entrypoint. Its AArch64 artifact
-`12347767537` has ELF SHA256
-`c65b4ddb067c85fafe461ab51eb9828e999eb0c7f3a7f87942a830cb35479199`.
+The private CLI observation branch is pinned to `716f89457fc24cff37aa6f9470bcf572e887c094`.
+Canonical CLI Build `39843845256` passed Linux platform and sanitizer jobs; Linux tests exercise
+the real inherited-FD/self-image entrypoint. Its AArch64 artifact has ELF SHA256
+`c5e397d3a2b67e46c610140758ee79867d75bc6459b5b30208c2f6e2bcf7f792` (6173544 bytes).
 The earlier `f41334b` run failed GCC's SHA256 buffer-extent check; that failure was fixed,
-not waived. The new asset is staged alongside the old pin, never substituted into stock MA.
-Its SSH-addon `--check` passed; its SSH-addon self-image probe failed closed. That musl
-compatibility-loader environment is not the protected MA container, so it proves neither
-protected success nor permission to skip the target preflight.
+not waived. The new observation asset is verified locally only: it has NOT been staged,
+executed or substituted into stock MA. The earlier `5c4901f` asset's SSH-addon `--check`
+passed and its self-image probe failed closed; those historical results do not apply to
+this new asset or prove protected target execution.
+
+## Private aggregate volume capture
+
+The advanced `private_native_volume_capture` provider flag exists only in this private
+profile and defaults to false. It is an additive private configuration value, not a
+normal-provider option or an environment inherited by all children. The operator must set
+its value explicitly for each window and restore it afterward. Only a private, eligible
+AirPlay 2 stream with the existing HomePod-remote option explicitly enabled can request
+`CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE=1`; other child launches explicitly receive `0`.
+Capture does not enable logical volume, attach transports, subscribe to updates or publish
+availability.
+
+The existing provider diagnostics retain a bounded history of scalar CLI summaries and
+finite DACP classes, never UID values, request headers/bodies, Active-Remote values or raw
+status/error lines. DACP classification precedes suppression and numeric conversion. Raw
+DACP logging is suppressed provider-wide during capture, including unmapped and malformed
+requests; value-bearing parse failures invalidate the capture without escaping to server
+exception logs. Legitimate DACP actions remain unchanged.
+
+The private `airplay/private_native_volume_capture/get` command requires `SYSTEM_MANAGE`
+and returns only `{"records": [...]}` from the bounded history, including after the player
+stream is cleared. It is registered only on the private target, rejects direct calls
+outside that target and unregisters on provider unload. Its fixed name deliberately fails
+closed if another AirPlay instance already owns it. The coordinator must use this narrow
+command, never broad `diagnostics/get`, which includes unrelated sections and exceptions
+when log-tail collection is disabled.
+
+A valid final record is historical observation from the exact acknowledged child, not
+current identity, readiness or command authority. Natural exit preserves that history;
+revoked acknowledgements, stale actors, force-kill, missing/duplicate/malformed summaries,
+overflow and unavailable planes cannot become successful evidence. A terminal audio status
+does not end collection before the later shutdown summary. Production records remain
+provisional until stdout reaches validated EOF too. Graceful stop gives that validator a
+bounded two-second tail before cancellation; timeout/cancellation marks `incomplete-stdout`,
+and late acknowledgement revocation invalidates even an already detached record. Detached
+records survive stream cleanup without retaining the child reference.
+`planes_connected_at_cutoff` describes only
+the final snapshot; `interval_coverage_verified` remains false because this aggregate does
+not prove uninterrupted coverage or gesture-to-packet causality. Native UI/group volume
+acceptance still requires the independent bounded hardware loop and real binding proof.
 
 ## Private bootstrap and HA isolation
 
@@ -97,7 +136,7 @@ executable must match SHA256 and ELF64 little-endian AArch64 headers before `--c
 The build check executes a retained validated descriptor too, never a pathname which can
 be swapped and restored between pre/post validation. It has a five-second deadline,
 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `v5c4901f` with exit zero.
+second of cleanup, and must report `cliairplay`, `check` and `v716f894` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.
@@ -383,3 +422,13 @@ Synthetic ELF tests validate bytes but NEVER execute Linux ELF on macOS. Bounded
 and liveness tests use real local children; synthetic procfs covers digest comparisons
 on macOS, and real procfs is used when available. No skipped tests or weakened signing
 hooks are needed. Local tests are not a deployment or native UI success claim.
+
+The private aggregate capture integration's latest local gate passes canonical pre-commit
+including mypy, changed-file `ty`, and 22,524 tests with 23 existing skips and 76 snapshots.
+Real child/request regressions cover buffered and late-reader stderr cleanup, stdout ACK
+revocation before/after stderr EOF and during graceful stop, and finite malformed numeric
+DACP handling. Explicit force-stop and actual SIGKILL escalation invalidate records even
+after detachment. The FFmpeg test doubles now model optional stderr and use restored
+monkeypatches instead of assignment waivers. These are private collector tests, not native
+output-role binding, interval coverage or hardware feature acceptance. No new HAOS source
+or asset is authorized by these local results.

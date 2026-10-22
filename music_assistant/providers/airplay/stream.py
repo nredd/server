@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import signal
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
     CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
     RAOP_DEFAULT_PORT,
@@ -61,6 +63,7 @@ from music_assistant.providers.airplay.helpers import (
     get_decoded_property,
     serialize_txt_records,
 )
+from music_assistant.providers.airplay.private_volume_capture import PrivateVolumeCapture
 from music_assistant.providers.airplay.session_volume import SessionVolumeBackend
 
 if TYPE_CHECKING:
@@ -103,6 +106,10 @@ _COMMAND_PIPE_READER_TIMEOUT: Final[float] = 2.0
 # means its reader has stalled -- for which the cold restart it falls back to is
 # the right answer anyway.
 _STDIN_DRAIN_TIMEOUT: Final[float] = 2.0
+
+# Keep the private ACK validator on stdout through graceful EOF before raw process
+# cleanup takes over. Never wait from stderr: rejection cleanup itself joins stderr.
+_CAPTURE_STDOUT_TIMEOUT: Final[float] = 2.0
 
 
 @dataclass
@@ -290,6 +297,7 @@ class AirPlayStream:
         # and stop() marks it before it touches the receiver.
         self.superseded: bool = False
         self.session_volume_requested = False
+        self.native_volume_capture: PrivateVolumeCapture | None = None
         self.session_volume = SessionVolumeBackend(self)
 
     @property
@@ -343,6 +351,14 @@ class AirPlayStream:
             self._homepod_remote_admission_requested
             and self.prov.config.get_value(CONF_EXPERIMENTAL_SESSION_VOLUME, False) is True
         )
+        capture_eligible = (
+            trial_binary.is_trial_target()
+            and (self.player.protocol_override or self.player.protocol)
+            == StreamingProtocol.AIRPLAY2
+            and self._homepod_remote_admission_requested
+            and self.prov.config.get_value(CONF_PRIVATE_NATIVE_VOLUME_CAPTURE, False) is True
+        )
+        self.native_volume_capture = None
         if self._cli_proc is not None:
             await self.session_volume.close()
             self.session_volume = SessionVolumeBackend(self)
@@ -357,6 +373,7 @@ class AirPlayStream:
                 "1" if self._homepod_remote_admission_requested else "0"
             ),
             "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if self.session_volume_requested else "off",
+            "CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE": "1" if capture_eligible else "0",
         }
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(
@@ -366,9 +383,14 @@ class AirPlayStream:
             self._cli_proc = AsyncProcess(
                 args, stdin=True, stdout=True, stderr=True, name="cliairplay", env=cli_env
             )
+        if capture_eligible:
+            self.native_volume_capture = PrivateVolumeCapture()
+            self.native_volume_capture.require_stdout_validation()
         try:
             await self.commands_pipe.create()
             await self._cli_proc.start()
+            if self.native_volume_capture:
+                self.native_volume_capture.trust(self._cli_proc)
             self._cli_proc.attach_stderr_reader(self.mass.create_task(self._stderr_reader()))
             self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
         except BaseException:
@@ -457,8 +479,22 @@ class AirPlayStream:
                     try:
                         await self.commands_pipe.remove()
                     finally:
-                        # stop the stdout reader first so process close can drain the pipe
+                        # Private capture must validate the stdout tail before process
+                        # close can drain it raw, including ACKs queued during STOP.
                         stdout_reader_task = self._stdout_reader_task
+                        if force and self.native_volume_capture:
+                            self.native_volume_capture.mark_force_killed()
+                            self.native_volume_capture.end(self._cli_proc, "force-killed")
+                        if (
+                            self.native_volume_capture
+                            and not force
+                            and self._cli_proc
+                            and stdout_reader_task
+                        ):
+                            await self._cli_proc.write_eof()
+                            await asyncio.wait(
+                                (stdout_reader_task,), timeout=_CAPTURE_STDOUT_TIMEOUT
+                            )
                         if stdout_reader_task and not stdout_reader_task.done():
                             stdout_reader_task.cancel()
                             with suppress(asyncio.CancelledError):
@@ -473,6 +509,12 @@ class AirPlayStream:
                                 if self._cli_proc and not self._cli_proc.closed:
                                     await self._cli_proc.close()
                         finally:
+                            if (
+                                self.native_volume_capture
+                                and self._cli_proc
+                                and self._cli_proc.returncode == -signal.SIGKILL
+                            ):
+                                self.native_volume_capture.mark_force_killed()
                             self.player.set_state_from_stream(
                                 state=PlaybackState.IDLE,
                                 elapsed_time=0,
@@ -1313,16 +1355,45 @@ class AirPlayStream:
         """
         process = self._cli_proc
         backend = self.session_volume
+        capture = self.native_volume_capture
         if not process:
             return
+        complete = False
+        try:
+            complete = await self._read_stdout(process, backend, capture)
+        except trial_binary.TrialBinaryError:
+            if capture is None:
+                raise
+            # The private reader already revoked and reaped the rejected child.
+            # Do not expose exception text or raw protocol data in capture logs.
+        finally:
+            if capture and isinstance(process, trial_binary.TrialAsyncProcess):
+                capture.finish_stdout(
+                    acknowledged=process.has_historical_receipt(), complete=complete
+                )
+
+    async def _read_stdout(
+        self,
+        process: AsyncProcess,
+        backend: SessionVolumeBackend,
+        capture: PrivateVolumeCapture | None,
+    ) -> bool:
+        """Drain one process epoch; return True only after validated stdout EOF."""
         buffer = b""
         while chunk := await process.read(1024):
             if self._cli_proc is not process or self.session_volume is not backend:
-                return
+                return False
+            if capture and (
+                self._stopped
+                or self._stopping
+                or not isinstance(process, trial_binary.TrialAsyncProcess)
+                or not process.has_current_receipt()
+            ):
+                continue
             buffer += chunk
             while b"\n" in buffer:
                 if self._cli_proc is not process or self.session_volume is not backend:
-                    return
+                    return False
                 raw_line, buffer = buffer.split(b"\n", 1)
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -1348,9 +1419,10 @@ class AirPlayStream:
         # Older binaries may not emit capabilities either. EOF is the only
         # ordering-safe fallback; stderr's connected/exit can beat queued stdout.
         if self._cli_proc is not process or self.session_volume is not backend:
-            return
+            return False
         self._report_unreported_homepod_remote_admission()
         await backend.close()
+        return True
 
     def _parse_homepod_remote_admission_status(self, line: str) -> None:
         """Record the CLI's PRE-SETUP policy selection, never native UI readiness."""
@@ -1551,6 +1623,29 @@ class AirPlayStream:
             self.device_max_frames,
         )
 
+    def _consume_capture_stderr(
+        self, proc: AsyncProcess, capture: PrivateVolumeCapture | None, line: str
+    ) -> bool:
+        """Keep historical capture and stale statuses outside live stream handling."""
+        if (
+            capture
+            and isinstance(proc, trial_binary.TrialAsyncProcess)
+            and not proc.has_historical_receipt()
+        ):
+            capture.end(proc, "revoked-acknowledgement")
+            return True
+        if capture and capture.consume_stderr(proc, line):
+            return True
+        if self._cli_proc is not proc or self.native_volume_capture is not capture:
+            return True
+        if capture is None:
+            return False
+        if self._stopped:
+            return True
+        if isinstance(proc, trial_binary.TrialAsyncProcess) and proc.has_current_receipt():
+            return False
+        return line not in ("[STATUS] eof", "[STATUS] idle_timeout")
+
     async def _stderr_reader(self) -> None:
         """
         Monitor stderr for the running cliairplay process.
@@ -1570,13 +1665,20 @@ class AirPlayStream:
         """
         player = self.player
         logger = player.logger
-        if not self._cli_proc:
+        proc = self._cli_proc
+        capture = self.native_volume_capture
+        if not proc:
             return
-        async for line in self._cli_proc.iter_stderr():
+        async for line in proc.iter_stderr():
+            if self._consume_capture_stderr(proc, capture, line):
+                continue
             if self._stopped:
                 break
             if self._handle_status_line(line):
                 self.ended_cleanly = True
+                if capture:
+                    await self._finish_stderr_actor(proc)
+                    continue
                 break
             # Routine binary output is verbose-only so it never floods a user's log, but
             # its own diagnostics (a failed socket bind, a missing receiver clock) are the
@@ -1592,6 +1694,25 @@ class AirPlayStream:
             await asyncio.sleep(0)
 
         logger.debug("cliairplay stderr reader ended for %s", player.display_name)
+        if capture:
+            reason = (
+                "revoked-acknowledgement"
+                if isinstance(proc, trial_binary.TrialAsyncProcess)
+                and not proc.has_historical_receipt()
+                else "missing-summary"
+            )
+            capture.end(proc, reason)
+            cast("AirPlayProvider", self.prov).record_private_capture(capture)
+        if self._cli_proc is not proc or self.native_volume_capture is not capture:
+            return
+        await self._finish_stderr_actor(proc)
+
+    async def _finish_stderr_actor(self, proc: AsyncProcess) -> None:
+        """Finalize this child's operational state without discarding its capture tail."""
+        if self._cli_proc is not proc:
+            return
+        player = self.player
+        logger = player.logger
         self._process_ended.set()
         if not self._stopped and not self._stopping:
             self._stopped = True
@@ -1942,6 +2063,8 @@ class AirPlayStream:
             except Exception as err:
                 self.player.logger.debug("cliairplay stdout reader cleanup failed: %s", err)
         try:
+            if self.native_volume_capture:
+                self.native_volume_capture.end(self._cli_proc, "force-killed")
             if self._cli_proc and not self._cli_proc.closed:
                 await self._cli_proc.kill()
         finally:

@@ -16,6 +16,7 @@ DOMAIN = "airplay"
 CONF_RADIO_STATION_FIRST: Final[str] = "radio_station_first"
 CONF_EXPERIMENTAL_HOMEPOD_REMOTE: Final[str] = "experimental_homepod_remote"
 CONF_EXPERIMENTAL_SESSION_VOLUME: Final[str] = "experimental_session_volume"
+CONF_PRIVATE_NATIVE_VOLUME_CAPTURE: Final[str] = "private_native_volume_capture"
 
 
 class StreamingProtocol(IntEnum):
