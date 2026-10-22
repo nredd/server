@@ -120,10 +120,14 @@ class TrialAsyncProcess(AsyncProcess):
             await self._kill_and_reap()
             raise
 
+    def has_current_receipt(self) -> bool:
+        """Return whether this exact owned child has a current acknowledgement receipt."""
+        return self._current_receipt() is not None
+
     def verified_stdin_fd(self) -> int:
         """Export the owned input pipe only after this live child has acknowledged."""
         proc = self.proc
-        if self._current_receipt() is None or proc is None or proc.stdin is None:
+        if not self.has_current_receipt() or proc is None or proc.stdin is None:
             raise TrialBinaryError("Trial input descriptor is blocked before image acknowledgement")
         if proc.stdin.is_closing():
             raise TrialBinaryError("Trial input descriptor is already closing")

@@ -15,7 +15,7 @@ import contextlib
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from types import SimpleNamespace
 from typing import Any, NamedTuple, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, call, patch
@@ -436,7 +436,9 @@ class TestNativeSetMembersGuard:
 class TestGroupUngroup:
     """Test group and ungroup commands."""
 
-    async def test_group_command(self, mock_mass: MagicMock) -> None:
+    async def test_group_command(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test the group command (cmd_group)."""
         controller = PlayerController(mock_mass)
         provider = MockProvider("test_provider", instance_id="test", mass=mock_mass)
@@ -469,7 +471,7 @@ class TestGroupUngroup:
             # Call the original to update group_members
             await original_set_members(player_ids_to_add, player_ids_to_remove)
 
-        leader.set_members = mock_set_members  # type: ignore[method-assign]
+        monkeypatch.setattr(leader, "set_members", mock_set_members)
 
         # Mock power handling to skip power control (focus is on grouping logic)
         async def mock_handle_cmd_power(
@@ -477,7 +479,7 @@ class TestGroupUngroup:
         ) -> None:
             pass
 
-        controller._handle_cmd_power = mock_handle_cmd_power  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "_handle_cmd_power", mock_handle_cmd_power)
 
         # Execute group command
         await controller.cmd_group("member", "leader")
@@ -589,7 +591,7 @@ def _group_with_member(
 @contextlib.contextmanager
 def _restricted_user(
     visible_player_ids: list[str], own_player_id: str | None = None
-) -> Iterator[None]:
+) -> Generator[None]:
     """
     Run the wrapped block as a non-admin user that may only see the given players.
 
@@ -900,8 +902,16 @@ class TestUnscopedPlayerLookups:
             player.initialized.set()
             player.update_state(signal_event=False)
 
+        class TestPlayerProvider(PlayerProvider):
+            """Concrete provider exposing the inherited player view under test."""
+
+            def __init__(self) -> None:
+                """Reuse the test provider's registered identity and controller."""
+                self.mass = mock_mass
+                self.config = MagicMock(instance_id=provider.instance_id)
+
         with _restricted_user(["plain"]):
-            owned = set(PlayerProvider.players.fget(provider))  # type: ignore[attr-defined]
+            owned = set(TestPlayerProvider().players)
 
         assert owned == {plain, protocol}
 
@@ -1929,7 +1939,7 @@ class TestCmdUngroupNewBranches:
 
     @pytest.mark.asyncio
     async def test_ungroup_group_player_with_power_uses_power_off(
-        self, mock_mass: MagicMock
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Ungroup on a group with explicit power control routes through cmd_power(False)."""
         controller = PlayerController(mock_mass)
@@ -1957,19 +1967,22 @@ class TestCmdUngroupNewBranches:
         async def _power(
             player_id: str,
             powered: bool,
-            skip_auto_play: bool = False,  # noqa: ARG001
+            skip_auto_play: bool = False,
         ) -> None:
+            assert not skip_auto_play
             called["player_id"] = player_id
             called["powered"] = powered
 
-        controller._handle_cmd_power = _power  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "_handle_cmd_power", _power)
 
         await controller.cmd_ungroup("g1")
 
         assert called == {"player_id": "g1", "powered": False}
 
     @pytest.mark.asyncio
-    async def test_ungroup_powerless_group_calls_stop(self, mock_mass: MagicMock) -> None:
+    async def test_ungroup_powerless_group_calls_stop(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Ungroup on a powerless group falls through to _handle_cmd_stop."""
         controller = PlayerController(mock_mass)
         provider = MockProvider("test_group", instance_id="test_group", mass=mock_mass)
@@ -1990,25 +2003,19 @@ class TestCmdUngroupNewBranches:
         async def _stop(player_id: str) -> None:
             stop_called.append(player_id)
 
-        controller._handle_cmd_stop = _stop  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "_handle_cmd_stop", _stop)
         # also stub power to make sure we did NOT go down that branch
-        power_called: list[str] = []
-
-        async def _power(
-            player_id: str,
-            powered: bool,  # noqa: ARG001
-            skip_auto_play: bool = False,  # noqa: ARG001
-        ) -> None:
-            power_called.append(player_id)
-
-        controller._handle_cmd_power = _power  # type: ignore[method-assign]
+        power_command = AsyncMock()
+        monkeypatch.setattr(controller, "_handle_cmd_power", power_command)
 
         await controller.cmd_ungroup("g1")
 
         assert stop_called == ["g1"]
-        assert power_called == []  # powerless group → never goes through cmd_power
+        power_command.assert_not_awaited()
 
-    async def test_ungroup_many_skips_unavailable_players(self, mock_mass: MagicMock) -> None:
+    async def test_ungroup_many_skips_unavailable_players(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Unknown or unavailable ids are skipped so the remaining players still ungroup."""
         controller = PlayerController(mock_mass)
         provider = MockProvider("test_group", instance_id="test_group", mass=mock_mass)
@@ -2030,11 +2037,12 @@ class TestCmdUngroupNewBranches:
         leader._attr_available = False
         leader.update_state(signal_event=False)
         assert follower.state.synced_to == "leader"
-        controller._handle_cmd_stop = AsyncMock()  # type: ignore[method-assign]
+        stop = AsyncMock()
+        monkeypatch.setattr(controller, "_handle_cmd_stop", stop)
 
         await controller.cmd_ungroup_many(["missing", "gone", "follower", "g1"])
 
-        controller._handle_cmd_stop.assert_awaited_once_with("g1")
+        stop.assert_awaited_once_with("g1")
 
 
 class TestPowerOffEndsTheQueue:
@@ -2080,7 +2088,7 @@ class TestPowerOffEndsTheQueue:
         mock_mass.player_queues._handle_stop = queue_stop
 
         @contextlib.asynccontextmanager
-        async def _no_wait(*_args: Any, **_kwargs: Any) -> AsyncIterator[None]:
+        async def _no_wait(*_args: Any, **_kwargs: Any) -> AsyncGenerator[None]:
             """Stand in for the real wait, which burns its full timeout here."""
             yield
 
@@ -2158,7 +2166,7 @@ class TestPowerOffEndsTheQueue:
     @pytest.mark.parametrize("member_type", [PlayerType.PLAYER, PlayerType.STEREO_PAIR])
     @pytest.mark.asyncio
     async def test_powering_off_a_group_member_does_not_end_the_groups_queue(
-        self, mock_mass: MagicMock, member_type: PlayerType
+        self, mock_mass: MagicMock, member_type: PlayerType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A member of a group is ungrouped instead of stopped, so the group plays on."""
         mock_mass.config.get_raw_player_config_value = MagicMock(
@@ -2181,7 +2189,7 @@ class TestPowerOffEndsTheQueue:
         async def _ungroup(player_id: str) -> None:
             ungrouped.append(player_id)
 
-        controller.cmd_ungroup = _ungroup  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "cmd_ungroup", _ungroup)
 
         await controller._handle_cmd_power("member", False)
 
@@ -2228,7 +2236,9 @@ class TestSyncLeaderPowerOffUngroup:
         return controller, leader
 
     @staticmethod
-    def _report_power_natively(controller: PlayerController, leader: MockPlayer) -> None:
+    def _report_power_natively(
+        controller: PlayerController, leader: MockPlayer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
         Give the leader a native power control that reports the new state right away.
 
@@ -2247,12 +2257,12 @@ class TestSyncLeaderPowerOffUngroup:
             leader._attr_powered = powered
             leader.update_state()
 
-        leader.power = _power  # type: ignore[method-assign]
+        monkeypatch.setattr(leader, "power", _power)
 
     @pytest.mark.parametrize("player_type", [PlayerType.PLAYER, PlayerType.STEREO_PAIR])
     @pytest.mark.asyncio
     async def test_ma_power_off_ungroups_a_sync_leader(
-        self, mock_mass: MagicMock, player_type: PlayerType
+        self, mock_mass: MagicMock, player_type: PlayerType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An MA power off removes a sync leader from its own session."""
         controller, leader = self._sync_leader(mock_mass, player_type)
@@ -2262,7 +2272,7 @@ class TestSyncLeaderPowerOffUngroup:
         async def _ungroup(player_id: str) -> None:
             ungrouped.append(player_id)
 
-        controller.cmd_ungroup = _ungroup  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "cmd_ungroup", _ungroup)
 
         await controller._handle_cmd_power("leader", False)
 
@@ -2283,7 +2293,10 @@ class TestSyncLeaderPowerOffUngroup:
 
     @pytest.mark.asyncio
     async def test_ma_power_off_ungroups_a_sync_leader_once(
-        self, mock_mass: MagicMock, running_background_tasks: None
+        self,
+        mock_mass: MagicMock,
+        running_background_tasks: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
         The power off a leader reports back on an MA power command does not ungroup it again.
@@ -2293,22 +2306,26 @@ class TestSyncLeaderPowerOffUngroup:
         external power off of a sync leader.
         """
         controller, leader = self._sync_leader(mock_mass, PlayerType.PLAYER)
-        self._report_power_natively(controller, leader)
-        controller.cmd_ungroup = AsyncMock()  # type: ignore[method-assign]
+        self._report_power_natively(controller, leader, monkeypatch)
+        ungroup = AsyncMock()
+        monkeypatch.setattr(controller, "cmd_ungroup", ungroup)
 
         await controller._handle_cmd_power("leader", False)
 
         assert leader.state.powered is False
         assert leader.state.group_members == ["leader", "follower"]
-        controller.cmd_ungroup.assert_awaited_once_with("leader")
+        ungroup.assert_awaited_once_with("leader")
 
     @pytest.mark.asyncio
     async def test_ma_power_off_ungroups_once_when_the_stop_powers_the_device_off(
-        self, mock_mass: MagicMock, running_background_tasks: None
+        self,
+        mock_mass: MagicMock,
+        running_background_tasks: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A device that reports off as soon as it is stopped is not ungrouped twice either."""
         controller, leader = self._sync_leader(mock_mass, PlayerType.PLAYER)
-        self._report_power_natively(controller, leader)
+        self._report_power_natively(controller, leader, monkeypatch)
         leader._attr_playback_state = PlaybackState.PLAYING
         leader._cache.clear()
         leader.update_state(signal_event=False)
@@ -2329,19 +2346,23 @@ class TestSyncLeaderPowerOffUngroup:
 
     @pytest.mark.asyncio
     async def test_external_power_off_after_an_ma_power_off_still_ungroups(
-        self, mock_mass: MagicMock, running_background_tasks: None
+        self,
+        mock_mass: MagicMock,
+        running_background_tasks: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """An MA power command only claims the power off it caused, not a later one."""
         controller, leader = self._sync_leader(mock_mass, PlayerType.PLAYER)
-        self._report_power_natively(controller, leader)
-        controller.cmd_ungroup = AsyncMock()  # type: ignore[method-assign]
+        self._report_power_natively(controller, leader, monkeypatch)
+        ungroup = AsyncMock()
+        monkeypatch.setattr(controller, "cmd_ungroup", ungroup)
         await controller._handle_cmd_power("leader", False)
-        controller.cmd_ungroup.assert_awaited_once_with("leader")
+        ungroup.assert_awaited_once_with("leader")
 
         # a further on->off report stands in for a power off outside of MA later on
         controller.signal_player_state_update(leader, {"powered": (True, False)})
 
-        assert controller.cmd_ungroup.await_count == 2
+        assert ungroup.await_count == 2
 
     def test_a_stale_ma_power_off_does_not_claim_an_external_power_off(
         self, mock_mass: MagicMock
@@ -2385,7 +2406,7 @@ class TestSyncLeaderPowerOffUngroup:
 
     @pytest.mark.asyncio
     async def test_power_off_of_a_groups_leader_leaves_its_members_powered(
-        self, mock_mass: MagicMock, running_background_tasks: None
+        self, mock_mass: MagicMock, running_background_tasks: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         Powering off the member a group player elected as leader releases only that member.
@@ -2412,7 +2433,7 @@ class TestSyncLeaderPowerOffUngroup:
         async def _ungroup(player_id: str) -> None:
             ungrouped.append(player_id)
 
-        controller.cmd_ungroup = _ungroup  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "cmd_ungroup", AsyncMock(side_effect=_ungroup))
 
         await controller._handle_cmd_power("leader", False)
 
@@ -2421,7 +2442,7 @@ class TestSyncLeaderPowerOffUngroup:
 
     @pytest.mark.asyncio
     async def test_ma_power_off_ungroups_a_leader_synced_over_a_linked_protocol(
-        self, mock_mass: MagicMock
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         An MA power off ungroups a leader whose session lives on a linked output protocol.
@@ -2465,7 +2486,7 @@ class TestSyncLeaderPowerOffUngroup:
         async def _ungroup(player_id: str) -> None:
             ungrouped.append(player_id)
 
-        controller.cmd_ungroup = _ungroup  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "cmd_ungroup", AsyncMock(side_effect=_ungroup))
 
         await controller._handle_cmd_power("leader", False)
 
@@ -2516,7 +2537,7 @@ class TestExternalPowerOffUnsync:
 
         controller.signal_player_state_update(player, {"powered": (True, False)})
 
-        controller.cmd_ungroup.assert_called_once_with("p1")  # type: ignore[attr-defined]
+        cast("MagicMock", controller.cmd_ungroup).assert_called_once_with("p1")
 
     def test_power_on_does_not_unsync(self, mock_mass: MagicMock) -> None:
         """An off->on power transition leaves the player synced."""
@@ -2524,7 +2545,7 @@ class TestExternalPowerOffUnsync:
 
         controller.signal_player_state_update(player, {"powered": (False, True)})
 
-        controller.cmd_ungroup.assert_not_called()  # type: ignore[attr-defined]
+        cast("MagicMock", controller.cmd_ungroup).assert_not_called()
 
     def test_no_power_control_is_ignored(self, mock_mass: MagicMock) -> None:
         """A None->off transition (player without power control) is ignored."""
@@ -2532,7 +2553,7 @@ class TestExternalPowerOffUnsync:
 
         controller.signal_player_state_update(player, {"powered": (None, False)})
 
-        controller.cmd_ungroup.assert_not_called()  # type: ignore[attr-defined]
+        cast("MagicMock", controller.cmd_ungroup).assert_not_called()
 
     def test_power_off_ungrouped_player_is_not_ungrouped(self, mock_mass: MagicMock) -> None:
         """Powering off a player that is not in any group has nothing to ungroup."""
@@ -2717,7 +2738,7 @@ class TestExternalPowerOffEndsTheQueue:
         controller.signal_player_state_update(group, {"powered": (True, False)})
 
         assert len(_scheduled_queue_stops(mock_mass)) == 1
-        controller.cmd_ungroup.assert_not_called()  # type: ignore[attr-defined]
+        cast("MagicMock", controller.cmd_ungroup).assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_scheduled_stop_ends_the_players_own_queue(
@@ -2808,7 +2829,9 @@ class TestPlayMediaOverride:
     """
 
     @pytest.mark.asyncio
-    async def test_override_disabled_redirects_to_group(self, mock_mass: MagicMock) -> None:
+    async def test_override_disabled_redirects_to_group(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """With override disabled, play_media on a captured child redirects to the group."""
         controller = PlayerController(mock_mass)
         group_provider = MockProvider("test_group", instance_id="test_group", mass=mock_mass)
@@ -2839,10 +2862,12 @@ class TestPlayMediaOverride:
 
         played_on: list[str] = []
 
-        async def _handle_play_media(player_id: str, media: object) -> None:  # noqa: ARG001
+        async def _handle_play_media(player_id: str, _media: object) -> None:
             played_on.append(player_id)
 
-        controller._handle_play_media = _handle_play_media  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            controller, "_handle_play_media", AsyncMock(side_effect=_handle_play_media)
+        )
         # the play_media wrapper acquires a playback lock; stub it out
         controller._player_command_locks = {}
 
@@ -2853,7 +2878,9 @@ class TestPlayMediaOverride:
         assert played_on == ["g1"]
 
     @pytest.mark.asyncio
-    async def test_override_releases_dynamic_member(self, mock_mass: MagicMock) -> None:
+    async def test_override_releases_dynamic_member(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """With override enabled, play_media on a dynamic group member releases it first."""
         controller = PlayerController(mock_mass)
         group_provider = MockProvider("test_group", instance_id="test_group", mass=mock_mass)
@@ -2889,21 +2916,24 @@ class TestPlayMediaOverride:
 
         async def _cmd_set_members(
             target_player: str,
-            player_ids_to_add: list[str] | None = None,  # noqa: ARG001
+            player_ids_to_add: list[str] | None = None,
             player_ids_to_remove: list[str] | None = None,
         ) -> None:
+            assert player_ids_to_add is None
             set_members_calls.append(
                 {"player_id": target_player, "remove": player_ids_to_remove or []}
             )
 
-        controller.cmd_set_members = _cmd_set_members  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "cmd_set_members", AsyncMock(side_effect=_cmd_set_members))
 
         played_on: list[str] = []
 
-        async def _handle_play_media(player_id: str, media: object) -> None:  # noqa: ARG001
+        async def _handle_play_media(player_id: str, _media: object) -> None:
             played_on.append(player_id)
 
-        controller._handle_play_media = _handle_play_media  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            controller, "_handle_play_media", AsyncMock(side_effect=_handle_play_media)
+        )
         controller._player_command_locks = {}
 
         media = MagicMock(uri="x", source_id="src")
@@ -2920,7 +2950,9 @@ class TestPlayMediaOverride:
         assert played_on == ["member"]
 
     @pytest.mark.asyncio
-    async def test_override_stops_static_group(self, mock_mass: MagicMock) -> None:
+    async def test_override_stops_static_group(
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """With override enabled, play_media on a STATIC group member stops the group."""
         controller = PlayerController(mock_mass)
         group_provider = MockProvider("test_group", instance_id="test_group", mass=mock_mass)
@@ -2960,19 +2992,22 @@ class TestPlayMediaOverride:
         async def _power(
             player_id: str,
             powered: bool,
-            skip_auto_play: bool = False,  # noqa: ARG001
+            skip_auto_play: bool = False,
         ) -> None:
+            assert not skip_auto_play
             power_calls.append((player_id, powered))
 
-        controller._handle_cmd_stop = _stop  # type: ignore[method-assign]
-        controller._handle_cmd_power = _power  # type: ignore[method-assign]
+        monkeypatch.setattr(controller, "_handle_cmd_stop", AsyncMock(side_effect=_stop))
+        monkeypatch.setattr(controller, "_handle_cmd_power", AsyncMock(side_effect=_power))
 
         played_on: list[str] = []
 
-        async def _handle_play_media(player_id: str, media: object) -> None:  # noqa: ARG001
+        async def _handle_play_media(player_id: str, _media: object) -> None:
             played_on.append(player_id)
 
-        controller._handle_play_media = _handle_play_media  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            controller, "_handle_play_media", AsyncMock(side_effect=_handle_play_media)
+        )
         controller._player_command_locks = {}
 
         media = MagicMock(uri="x", source_id="src")
@@ -3264,8 +3299,9 @@ class TestMirrorsParentMedia:
         synced_to: str | None = None,
         player_type: PlayerType = PlayerType.PLAYER,
         protocol_parent_id: str | None = None,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> MagicMock:
+        return MagicMock(
+            spec=Player,
             player_id=player_id,
             state=SimpleNamespace(active_group=active_group, synced_to=synced_to, type=player_type),
             protocol_parent_id=protocol_parent_id,
@@ -3273,30 +3309,30 @@ class TestMirrorsParentMedia:
 
     def test_standalone_player_owns_media(self, controller: PlayerController) -> None:
         """A standalone player resolves its own media (and palette)."""
-        assert controller._mirrors_parent_media(self._fake_player()) is False  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(self._fake_player()) is False
 
     def test_group_member_mirrors(self, controller: PlayerController) -> None:
         """A group member borrows its parent's media."""
-        assert controller._mirrors_parent_media(self._fake_player(active_group="g1")) is True  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(self._fake_player(active_group="g1")) is True
 
     def test_synced_member_mirrors(self, controller: PlayerController) -> None:
         """A synced member borrows its leader's media."""
-        assert controller._mirrors_parent_media(self._fake_player(synced_to="leader")) is True  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(self._fake_player(synced_to="leader")) is True
 
     def test_protocol_child_mirrors(self, controller: PlayerController) -> None:
         """A protocol child borrows its parent's media."""
         player = self._fake_player(player_type=PlayerType.PROTOCOL, protocol_parent_id="parent")
-        assert controller._mirrors_parent_media(player) is True  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(player) is True
 
     def test_protocol_player_without_parent_owns_media(self, controller: PlayerController) -> None:
         """A protocol player with no parent resolves its own media."""
         player = self._fake_player(player_type=PlayerType.PROTOCOL)
-        assert controller._mirrors_parent_media(player) is False  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(player) is False
 
     def test_self_referential_parent_owns_media(self, controller: PlayerController) -> None:
         """A self-referential active_group/synced_to is not a real parent, so resolve locally."""
         player = self._fake_player(player_id="p1", synced_to="p1", active_group="p1")
-        assert controller._mirrors_parent_media(player) is False  # type: ignore[arg-type]
+        assert controller._mirrors_parent_media(player) is False
 
 
 class TestVolumeScalingOnRedirect:
@@ -4045,13 +4081,12 @@ class TestGroupVolumeOrdering:
             finally:
                 in_flight -= 1
 
-        controller.set_group_volume = _track_overlap  # type: ignore[method-assign]
-
-        first = asyncio.create_task(controller.cmd_group_volume("leader", 80))
-        await slow_leader.reached.wait()
-        # a synced member adjusts the very same group as its leader
-        second = asyncio.create_task(controller.cmd_group_volume("member", 30))
-        await asyncio.gather(first, second)
+        with patch.object(controller, "set_group_volume", side_effect=_track_overlap):
+            first = asyncio.create_task(controller.cmd_group_volume("leader", 80))
+            await slow_leader.reached.wait()
+            # a synced member adjusts the very same group as its leader
+            second = asyncio.create_task(controller.cmd_group_volume("member", 30))
+            await asyncio.gather(first, second)
 
         assert overlapped is False
         for player in players.values():
@@ -7050,7 +7085,7 @@ class TestScheduleActiveOutputProtocolClear:
 async def _skip_player_update_wait(
     *_args: object,
     **_kwargs: object,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None]:
     """Skip provider-driven state propagation in command-routing tests."""
     yield
 
@@ -7404,7 +7439,7 @@ class TestAddCurrentlyPlayingToFavorites:
         queue.current_item.media_item.media_type = MediaType.TRACK
         acting_users: list[User | None] = []
 
-        async def _capture_acting_user(item: Any) -> None:  # noqa: ARG001
+        async def _capture_acting_user(_item: Any) -> None:
             acting_users.append(get_current_user())
 
         mock_mass.music.add_item_to_favorites = AsyncMock(side_effect=_capture_acting_user)
@@ -7427,7 +7462,9 @@ class TestAddCurrentlyPlayingToFavorites:
 
 
 @contextlib.asynccontextmanager
-async def _lock_held_elsewhere(controller: PlayerController, player_id: str) -> AsyncIterator[None]:
+async def _lock_held_elsewhere(
+    controller: PlayerController, player_id: str
+) -> AsyncGenerator[None]:
     """Hold the player's playback lock from another task for the duration of the block."""
     held = asyncio.Event()
     release = asyncio.Event()
@@ -7507,7 +7544,7 @@ class TestPlayerLockTimeouts:
         assert ran.is_set()
 
     async def test_a_strict_group_and_player_lock_takes_both_strictly(
-        self, mock_mass: MagicMock
+        self, mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The group's lock, taken before the member's, is waited for just as strictly."""
         controller, _group, _member = _group_with_member(mock_mass)
@@ -7522,7 +7559,7 @@ class TestPlayerLockTimeouts:
             acquisitions.append((player_id, strict))
             return acquire_lock(player_id, purpose, strict=strict)
 
-        controller.get_player_lock = _record  # type: ignore[assignment]
+        monkeypatch.setattr(controller, "get_player_lock", _record)
         async with controller.get_group_and_player_lock("member", strict=True):
             pass
 

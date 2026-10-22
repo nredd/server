@@ -134,7 +134,12 @@ acknowledgement kills and reaps the owned child before stdout status, stderr `co
 readiness, or PCM production can proceed. The private process's stdin writer also rejects
 all audio or pairing bytes until the exact live acknowledgement receipt exists, so a
 concurrent producer cannot bypass the caller's start/readiness ordering. The direct ffmpeg
-stdin-FD handoff also requires the same verified live receipt before exporting the pipe.
+stdin-FD handoff also requires the same verified live receipt before exporting the pipe. Private
+command FIFO writes recheck that the same private process instance still has a live receipt after
+opening the FIFO and immediately before each OS write, so a command queued behind another write is
+dropped if an exit or duplicate acknowledgement revokes the receipt first. This cannot make process
+liveness and an OS write atomic, or turn the point-in-time receipt into continuous execution or
+memory-integrity proof.
 A repeated acknowledgement in subsequent stdout
 is rejected by chunk, exact-size and line readers, revokes the receipt, and kills/reaps the
 child. Private stdout is line-framed; over-limit records fail closed rather than being
@@ -158,6 +163,17 @@ symlinks, validated, and retained as the executable descriptor; pathname replace
 select a different initial exec target. The acknowledged self-image hash must still match the
 external pin before readiness. This is not an immutable execution sandbox and does not detect
 a later exec or memory change. None of these fields prove native UI controls or playback success.
+
+The private overlay includes the upstream-shaped, default-off logical session-volume backend
+only as a composite local integration. It starts disabled, requires both experimental options,
+a current private child acknowledgement, the v1 CLI handshake, exact current source ownership,
+confirmed backend receipts, and the offline-only `verified_identity=True` binding seam. No
+private call site binds an output identity. The attestation-gated command FIFO does not publish
+native availability or infer any UID equivalence. This source is NOT deployed or authorized for
+a launch, and group/session native volume and native UI controls remain unaccepted. The separate
+main-pod radio trial has owner-confirmed station-first/song/art/LIVE metadata and physical
+Apple Music button volume audibility, but it does not establish native-state synchronization,
+Control Other Speakers volume, grouping, slider routing, or this backend's identity binding.
 
 ## Gates before any launch
 

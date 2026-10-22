@@ -41,6 +41,7 @@ from music_assistant.providers.airplay.constants import (
     CONF_BUFFER_DEPTH,
     CONF_ENCRYPTION,
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD,
     CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
@@ -60,9 +61,10 @@ from music_assistant.providers.airplay.helpers import (
     get_decoded_property,
     serialize_txt_records,
 )
+from music_assistant.providers.airplay.session_volume import SessionVolumeBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.player import PlayerMedia
@@ -287,6 +289,8 @@ class AirPlayStream:
         # receiver. Native teardowns need no flag: they stop the stream first,
         # and stop() marks it before it touches the receiver.
         self.superseded: bool = False
+        self.session_volume_requested = False
+        self.session_volume = SessionVolumeBackend(self)
 
     @property
     def running(self) -> bool:
@@ -335,6 +339,13 @@ class AirPlayStream:
         self._homepod_remote_admission_requested = (
             self.prov.config.get_value(CONF_EXPERIMENTAL_HOMEPOD_REMOTE, False) is True
         )
+        self.session_volume_requested = (
+            self._homepod_remote_admission_requested
+            and self.prov.config.get_value(CONF_EXPERIMENTAL_SESSION_VOLUME, False) is True
+        )
+        if self._cli_proc is not None:
+            await self.session_volume.close()
+            self.session_volume = SessionVolumeBackend(self)
         self._check_password_preflight()
         # A fresh cliairplay process re-anchors from scratch, so drop any shift
         # carried on this stream object.
@@ -344,7 +355,8 @@ class AirPlayStream:
         cli_env = {
             "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": (
                 "1" if self._homepod_remote_admission_requested else "0"
-            )
+            ),
+            "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if self.session_volume_requested else "off",
         }
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(
@@ -433,6 +445,7 @@ class AirPlayStream:
         async with self._stop_lock:
             if self._cleanup_complete:
                 return
+            await self.session_volume.close()
             self._stopping = True
             self._teardown_started.set()
             async with self._metadata_lock:
@@ -1298,15 +1311,23 @@ class AirPlayStream:
           [STATUS] mrp path=<command> status=<http status>
           [EVENT] remote command=<play|pause|play_pause|next|previous>
         """
-        if not self._cli_proc:
+        process = self._cli_proc
+        backend = self.session_volume
+        if not process:
             return
         buffer = b""
-        while chunk := await self._cli_proc.read(1024):
+        while chunk := await process.read(1024):
+            if self._cli_proc is not process or self.session_volume is not backend:
+                return
             buffer += chunk
             while b"\n" in buffer:
+                if self._cli_proc is not process or self.session_volume is not backend:
+                    return
                 raw_line, buffer = buffer.split(b"\n", 1)
-                line = raw_line.decode("utf-8", errors="ignore").strip()
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
+                    continue
+                if backend.handle_stdout(line):
                     continue
                 if line.startswith("[STATUS] homepod_remote_admission"):
                     self._parse_homepod_remote_admission_status(line)
@@ -1326,7 +1347,10 @@ class AirPlayStream:
 
         # Older binaries may not emit capabilities either. EOF is the only
         # ordering-safe fallback; stderr's connected/exit can beat queued stdout.
+        if self._cli_proc is not process or self.session_volume is not backend:
+            return
         self._report_unreported_homepod_remote_admission()
+        await backend.close()
 
     def _parse_homepod_remote_admission_status(self, line: str) -> None:
         """Record the CLI's PRE-SETUP policy selection, never native UI readiness."""
@@ -1893,10 +1917,19 @@ class AirPlayStream:
     async def _send_current_volume(self) -> None:
         """Send the player's current volume level to the device, muted as zero."""
         volume = 0 if self.player.volume_muted else self.player.volume_level
-        await self.send_cli_command(f"VOLUME={volume}")
+        if self.session_volume_requested and self.session_volume.supported:
+            if volume is None:
+                return
+            try:
+                await self.session_volume.apply(volume)
+            except PlayerCommandFailed, TimeoutError:
+                self.player.logger.debug("Initial checked stream volume is unconfirmed")
+        else:
+            await self.send_cli_command(f"VOLUME={volume}")
 
     async def _cleanup_failed_start(self) -> None:
         """Release all resources owned by a cliairplay process that failed to start."""
+        await self.session_volume.close()
         self._stopping = True
         self._stopped = True
         stdout_reader_task = self._stdout_reader_task
@@ -1941,11 +1974,36 @@ class AirPlayStream:
 
     async def _write_cli_command(self, command: str) -> bool:
         """Write an interactive command regardless of stream teardown state."""
-        if not self._cli_proc or self._cli_proc.closed:
+        process = self._cli_proc
+        if not process or process.closed:
             return False
+        write_guard: Callable[[], bool] | None = None
+        if trial_binary.is_trial_target():
+            if (
+                not isinstance(process, trial_binary.TrialAsyncProcess)
+                or not process.has_current_receipt()
+            ):
+                return False
+
+            def current_receipt_guard() -> bool:
+                return self._cli_proc is process and process.has_current_receipt()
+
+            write_guard = current_receipt_guard
+
         if not command.endswith("\n"):
             command += "\n"
-        command_delivered = await self.commands_pipe.write(command.encode("utf-8"))
+        data = command.encode("utf-8")
+        if command.startswith(("SESSION_VOLUME_", "STREAM_VOLUME_")):
+            if not self.session_volume_requested or not self.session_volume.supported:
+                return False
+            if write_guard is None:
+                command_delivered = await self.commands_pipe.write_atomic(data)
+            else:
+                command_delivered = await self.commands_pipe.write_atomic(data, guard=write_guard)
+        elif write_guard is None:
+            command_delivered = await self.commands_pipe.write(data)
+        else:
+            command_delivered = await self.commands_pipe.write(data, guard=write_guard)
         if command_delivered:
             self.player.last_command_sent = time.time()
             if command.startswith("VOLUME="):

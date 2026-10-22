@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import descriptor_path
 from music_assistant.providers.airplay import trial_binary as trial
 from music_assistant.providers.airplay.stream import AirPlayStream
@@ -78,7 +79,12 @@ def install_host_spawn(
             elif mode == "duplicate_overflow":
                 body += "os.write(1,b'[ATTEST] '+b'x'*70000+b'\\n')\n"
             else:
-                body += "os.write(1,b'[STATUS] ready\\n')\n"
+                status = (
+                    b"[STATUS] session_volume version=1\n"
+                    if mode == "session_volume"
+                    else b"[STATUS] ready\n"
+                )
+                body += f"os.write(1,{status!r})\n"
         if mode == "natural":
             body += "sys.stdin.buffer.read(1)\n"
         elif mode != "exit":
@@ -177,6 +183,111 @@ async def test_stream_cannot_attach_early_connected_reader_before_ack(
             with suppress(asyncio.CancelledError):
                 await task
         await stream._cleanup_failed_start()
+    assert children
+    assert all(child.returncode is not None for child in children)
+
+
+async def test_private_volume_transaction_requires_current_receipt(
+    fixed_asset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The private FIFO path admits session-volume IPC only after the live child ACK."""
+    children = install_host_spawn(monkeypatch, "session_volume")
+    player = _make_player()
+    stream = AirPlayStream(player)
+    stream.session_volume_requested = True
+    stream.commands_pipe = MagicMock(
+        write=AsyncMock(return_value=True), write_atomic=AsyncMock(return_value=True)
+    )
+    proc = await trial.create_private_process([str(fixed_asset)], stdin=True, stdout=True)
+    assert isinstance(proc, trial.TrialAsyncProcess)
+    stream._cli_proc = proc
+    transaction = (
+        "STREAM_VOLUME_GENERATION=1\nSTREAM_VOLUME_ORDINAL=1\n"
+        "STREAM_VOLUME_LEVEL=50\nACTION=STREAM_VOLUME_APPLY"
+    )
+    try:
+        assert await stream._write_cli_command(transaction) is False
+        stream.commands_pipe.write_atomic.assert_not_awaited()
+
+        await proc.start()
+        assert stream.session_volume.handle_stdout((await proc.read_stdout()).decode().strip())
+        assert stream.session_volume.supported is True
+        assert await stream._write_cli_command(transaction) is True
+        stream.commands_pipe.write_atomic.assert_awaited_once()
+        assert stream.commands_pipe.write_atomic.await_args.args == ((transaction + "\n").encode(),)
+        assert callable(stream.commands_pipe.write_atomic.await_args.kwargs["guard"])
+
+        stream.session_volume_requested = False
+        assert await stream._write_cli_command("VOLUME=50") is True
+        stream.commands_pipe.write.assert_awaited_once()
+        assert stream.commands_pipe.write.await_args.args == (b"VOLUME=50\n",)
+        assert callable(stream.commands_pipe.write.await_args.kwargs["guard"])
+    finally:
+        await proc.kill()
+    assert children
+    assert all(child.returncode is not None for child in children)
+
+
+@pytest.mark.parametrize("revocation", ["child_exit", "duplicate_ack"])
+@pytest.mark.parametrize(
+    ("command", "session_volume"),
+    [
+        ("VOLUME=50", False),
+        (
+            "STREAM_VOLUME_GENERATION=1\nSTREAM_VOLUME_ORDINAL=1\n"
+            "STREAM_VOLUME_LEVEL=50\nACTION=STREAM_VOLUME_APPLY",
+            True,
+        ),
+    ],
+)
+async def test_private_queued_fifo_command_is_dropped_when_receipt_revoked(
+    fixed_asset: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    session_volume: bool,
+    revocation: str,
+) -> None:
+    """A queued private command rechecks its receipt at the actual FIFO write boundary."""
+    children = install_host_spawn(
+        monkeypatch, "natural" if revocation == "child_exit" else "duplicate"
+    )
+    player = _make_player()
+    stream = AirPlayStream(player)
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream.commands_pipe = writer
+    stream.session_volume_requested = session_volume
+    proc = await trial.create_private_process([str(fixed_asset)], stdin=True, stdout=True)
+    assert isinstance(proc, trial.TrialAsyncProcess)
+    stream._cli_proc = proc
+    try:
+        await proc.start()
+        if session_volume:
+            assert stream.session_volume.handle_stdout("[STATUS] session_volume version=1")
+        async with writer._write_lock:
+            queued = asyncio.create_task(stream._write_cli_command(command))
+            await asyncio.sleep(0)
+            assert not queued.done()
+            if revocation == "child_exit":
+                await proc.write(b"x")
+                assert proc._exit_watcher is not None
+                await asyncio.wait_for(asyncio.shield(proc._exit_watcher), 3)
+            else:
+                with pytest.raises(trial.TrialBinaryError, match="repeated"):
+                    await proc.read_stdout()
+        assert await queued is False
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 4096)
+
+        assert await stream._write_cli_command(command) is False
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 4096)
+    finally:
+        os.close(reader)
+        await writer.remove()
+        await proc.kill()
     assert children
     assert all(child.returncode is not None for child in children)
 
