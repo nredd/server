@@ -56,11 +56,15 @@ exception logs. Legitimate DACP actions remain unchanged.
 
 The private `airplay/private_native_volume_capture/get` command requires `SYSTEM_MANAGE`
 and returns only `{"records": [...]}` from the bounded history, including after the player
-stream is cleared. It is registered only on the private target, rejects direct calls
-outside that target and unregisters on provider unload. Its fixed name deliberately fails
-closed if another AirPlay instance already owns it. The coordinator must use this narrow
-command, never broad `diagnostics/get`, which includes unrelated sections and exceptions
-when log-tail collection is disabled.
+stream is cleared. The separately fixed
+`airplay/private_native_volume_capture/readiness/get` command has the same scope and returns
+only installer provenance, encoded expected/startup asset receipts, and live owned `ptp`/`stream`
+attestation receipts. It excludes diagnostics, logs, paths, arguments, identities, pairing state,
+publication and command data. Both commands are registered only on the private target, reject
+direct calls outside that target and unregister on provider unload. Their fixed names deliberately
+fail closed if another AirPlay instance already owns one. The coordinator must use these narrow
+commands, never broad `diagnostics/get`, which includes unrelated sections and exceptions when
+log-tail collection is disabled.
 
 A valid final record is historical observation from the exact acknowledged child, not
 current identity, readiness or command authority. Natural exit preserves that history;

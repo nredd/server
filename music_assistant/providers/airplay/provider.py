@@ -137,6 +137,7 @@ class AirPlayProvider(PlayerProvider):
     _ptp_daemon_warns_in_window: int = 0
     _ptp_daemon_warns_suppressed: int = 0
     _unregister_private_capture_api: Callable[[], None] | None = None
+    _unregister_private_capture_readiness_api: Callable[[], None] | None = None
 
     @property
     def bridge_manager(self) -> SendspinBridgeManager:
@@ -301,6 +302,7 @@ class AirPlayProvider(PlayerProvider):
         self._announce_plans: dict[tuple[str, str], int] = {}
         self._private_capture_history: deque[PrivateVolumeCapture] = deque(maxlen=16)
         self._unregister_private_capture_api = None
+        self._unregister_private_capture_readiness_api = None
 
         # Initialize Sendspin bridge manager for protocol linking
         self._bridge_manager = SendspinBridgeManager(self)
@@ -344,6 +346,11 @@ class AirPlayProvider(PlayerProvider):
             self._unregister_private_capture_api = self.mass.register_api_command(
                 "airplay/private_native_volume_capture/get",
                 self.get_private_native_volume_capture,
+                required_scope=Scope.SYSTEM_MANAGE,
+            )
+            self._unregister_private_capture_readiness_api = self.mass.register_api_command(
+                "airplay/private_native_volume_capture/readiness/get",
+                self.get_private_native_volume_capture_readiness,
                 required_scope=Scope.SYSTEM_MANAGE,
             )
 
@@ -409,6 +416,9 @@ class AirPlayProvider(PlayerProvider):
         if unregister := getattr(self, "_unregister_private_capture_api", None):
             unregister()
             self._unregister_private_capture_api = None
+        if unregister := getattr(self, "_unregister_private_capture_readiness_api", None):
+            unregister()
+            self._unregister_private_capture_readiness_api = None
         # Unregister all dashboard endpoints
         dashboards = getattr(self, "dashboards", None)
         if dashboards:
@@ -498,6 +508,26 @@ class AirPlayProvider(PlayerProvider):
             raise RuntimeError(msg)
         history = getattr(self, "_private_capture_history", ())
         return {"records": deepcopy([capture.diagnostics() for capture in history])}
+
+    async def get_private_native_volume_capture_readiness(self) -> dict[str, SerializableType]:
+        """Return only the private readiness receipts needed before capture starts."""
+        if not is_trial_target():
+            msg = "Private native-volume capture is unavailable outside the trial target"
+            raise RuntimeError(msg)
+        children: list[SerializableType] = []
+        if self._ptp_daemon is not None:
+            children.append(await trial_binary.attest_owned_child(self._ptp_daemon, "ptp"))
+        for player in self.get_players():
+            if player.stream and player.stream._cli_proc is not None:
+                children.append(
+                    await trial_binary.attest_owned_child(player.stream._cli_proc, "stream")
+                )
+        return {
+            "installer_provenance": await asyncio.to_thread(installer_provenance),
+            "expected_sha256": encode_public_digest(trial_binary.EXPECTED_SHA),
+            "startup_validation": deepcopy(self._trial_identity),
+            "owned_children": children,
+        }
 
     def record_private_capture(self, capture: PrivateVolumeCapture) -> None:
         """Retain one bounded detached historical record without stream identity."""
