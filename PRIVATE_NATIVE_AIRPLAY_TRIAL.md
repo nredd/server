@@ -58,13 +58,57 @@ The private `airplay/private_native_volume_capture/get` command requires `SYSTEM
 and returns only `{"records": [...]}` from the bounded history, including after the player
 stream is cleared. The separately fixed
 `airplay/private_native_volume_capture/readiness/get` command has the same scope and returns
-only installer provenance, encoded expected/startup asset receipts, and live owned `ptp`/`stream`
-attestation receipts. It excludes diagnostics, logs, paths, arguments, identities, pairing state,
-publication and command data. Both commands are registered only on the private target, reject
-direct calls outside that target and unregister on provider unload. Their fixed names deliberately
-fail closed if another AirPlay instance already owns one. The coordinator must use these narrow
-commands, never broad `diagnostics/get`, which includes unrelated sections and exceptions when
-log-tail collection is disabled.
+installer provenance, encoded expected/startup asset receipts, live owned `ptp`/`stream`
+attestation receipts and the finite readiness facts below. It excludes diagnostics, logs, paths,
+arguments, identities, pairing state, publication and command data. Both commands are registered
+only on the private target, reject direct calls outside that target and unregister on provider
+unload. Registration is transactional during async initialization, not the core's exception-swallowing
+post-load hook: a second-name collision releases the first claim, retains the incumbent, cleans up
+provider resources and fails loading. The coordinator must use these narrow commands, never broad
+`diagnostics/get`, which includes unrelated sections and exceptions when log-tail collection is disabled.
+
+Readiness schema version `1` has exactly these top-level fields:
+
+- `schema_version`: `1`.
+- `installer_provenance`, `expected_sha256`, `startup_validation`, `owned_children`: the existing
+  finite provenance/asset/child receipt schemas, with only `ptp` and `stream` roles.
+- `snapshot_current`: boolean. Provenance is collected first, then exact PTP/event and
+  player/stream/child/request/capture references are snapshotted. After ALL awaits, the same
+  references, stream roster and each `TrialAsyncProcess.has_current_receipt()` are checked
+  synchronously. Replacement, exit or revocation invalidates the snapshot and downgrades every
+  child receipt to `unverified` / `child-changed-during-attestation`.
+- `ptp_ready`: boolean, requiring a current snapshot, live acknowledged PTP child and its
+  readiness event set. An alive process alone does not qualify.
+- `prestream_ready`: boolean, requiring `ptp_ready` and no streams. It does NOT promise the
+  future stream's flags or actual route.
+- `playing_ready`: boolean, requiring `ptp_ready`, at least one stream and every stream `ready`.
+- `streams`: list of the following finite rows, with no player IDs or role bindings:
+  - `generation`: positive capture-generation integer or null; the same process-local generation
+    appears in historical capture records. It is not a stable device identity or cross-restart key.
+  - `current`, `connected`, `playing`, `ready`: booleans. `playing` additionally requires a playing
+    report from this launch, not a previous child's retained player state.
+  - `capture_enabled`, `homepod_remote_requested`, `session_volume_requested`: booleans or null
+    if there is no exact-child request snapshot. These are retained from the actual launch
+    environment, not later provider configuration.
+  - `homepod_remote_admission`: boolean or null if unreported, from this child's PRE-SETUP
+    status. This is policy admission only, not native UI success.
+  - `protocol`: `airplay2`, `raop` or `unknown`; `flow`: `realtime`, `buffered` or `unknown`;
+    `timing`: `ptp`, `ntp` or `unknown`. These are allowlisted CLI route reports, reset per
+    launch, never raw route strings or inferred configured modes. The CLI reports `flow=native`;
+    the API normalizes that with `buffered=0` to `realtime` and with `buffered=1` to `buffered`.
+    Legacy/compatibility flows, malformed markers and unknown values fail closed. The marker
+    reports the resolved PRE-CONNECT choice, not proof of receiver clock lock or absence of a
+    later fallback; `ptp_ready` separately describes the acknowledged daemon only.
+
+A ready row requires current ownership/acknowledgement, an active exact-child capture generation,
+`capture_enabled=true`, requested and reported HomePod admission true,
+`session_volume_requested=false`, actual `airplay2/realtime/ptp`, connected and playing.
+Unknown or unsupported facts fail closed. The operator must additionally compare provenance and
+asset receipts with its external receipt, enforce the expected stream count and retain the exact
+capture generations for final-record matching. All readiness claims are point-in-time only: they
+provide neither continuous authority nor interval coverage, native UI acceptance or verified output
+identity. No subscription, logical-volume publication, role binding or production availability is
+activated by this API.
 
 A valid final record is historical observation from the exact acknowledged child, not
 current identity, readiness or command authority. Natural exit preserves that history;
@@ -436,3 +480,10 @@ after detachment. The FFmpeg test doubles now model optional stderr and use rest
 monkeypatches instead of assignment waivers. These are private collector tests, not native
 output-role binding, interval coverage or hardware feature acceptance. No new HAOS source
 or asset is authorized by these local results.
+
+The readiness hardening gate passes canonical pre-commit/mypy, changed-file `ty`, and
+22,570 tests with 23 existing skips and 76 snapshots. An earlier full run hit one
+player-grouping lock-order timeout; the unchanged 13-test class and the subsequent full
+suite passed. The earlier 600-second interrupted run is not a pass. Receipt privacy tests
+compare exact structures rather than rejecting arbitrary PID digit substrings that can
+legitimately appear in public digest words. Exact-commit Linux CI remains required.

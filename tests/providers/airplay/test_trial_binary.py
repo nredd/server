@@ -516,6 +516,6 @@ async def test_diagnostics_attest_all_owned_roles(
             {"role": role, "outcome": "match", "actual_sha256": expected_digest}
             for role in ("ptp", "stream", "pairing")
         ]
-        encoded = json.dumps(identity)
-        assert str(child.proc.pid) not in encoded
-        assert str(host_executable) not in encoded
+        # Exact receipt dictionaries above exclude PID fields structurally:
+        # decimal PID digits can legitimately occur inside encoded digest words.
+        assert str(host_executable) not in json.dumps(identity)

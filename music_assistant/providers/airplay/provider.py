@@ -91,6 +91,7 @@ from .helpers import (
 from .player import AirPlayPlayer, GenericAirPlayPlayer
 from .private_volume_capture import PrivateVolumeCapture, classify_dacp
 from .sendspin_bridge import SendspinBridgeManager
+from .stream import AirPlayStream, PrivateCaptureRequest
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -111,6 +112,61 @@ DACP_RECLAIM_DELAY: Final[float] = 1.0
 # Opt-in for pyatv's own debug logging. Set to any non-empty value to trace the
 # pyatv protocol traffic itself.
 ENV_PYATV_DEBUG: Final[str] = "MASS_PYATV_DEBUG"
+
+
+def _has_current_private_receipt(child: AsyncProcess) -> bool:
+    """Require the exact private child acknowledgement, not a legacy procfs match."""
+    return isinstance(child, trial_binary.TrialAsyncProcess) and child.has_current_receipt()
+
+
+def _private_stream_readiness(
+    player: AirPlayPlayer,
+    stream: AirPlayStream,
+    request: PrivateCaptureRequest | None,
+    capture: PrivateVolumeCapture | None,
+    current: bool,
+) -> dict[str, SerializableType]:
+    """Return finite facts for this child and capture generation, without identifiers."""
+    bound = isinstance(request, PrivateCaptureRequest) and request.child is stream._cli_proc
+    capture_current = (
+        isinstance(capture, PrivateVolumeCapture)
+        and capture.owns(stream._cli_proc)
+        and capture.diagnostics().get("incomplete") is None
+    )
+    protocol, flow, timing = stream.private_capture_route
+    admission = stream.homepod_remote_admission
+    facts: dict[str, SerializableType] = {
+        "generation": capture.generation if isinstance(capture, PrivateVolumeCapture) else None,
+        "current": current,
+        "capture_enabled": request.capture_enabled if bound and request else None,
+        "homepod_remote_requested": request.homepod_remote_requested if bound and request else None,
+        "homepod_remote_admission": admission if type(admission) is bool else None,
+        "session_volume_requested": request.session_volume_requested if bound and request else None,
+        "protocol": protocol if protocol in ("airplay2", "raop") else "unknown",
+        "flow": flow if flow in ("realtime", "buffered") else "unknown",
+        "timing": timing if timing in ("ptp", "ntp") else "unknown",
+        "connected": stream.connected is True,
+        "playing": (
+            stream.private_capture_playing
+            and not stream.superseded
+            and player.playback_state == PlaybackState.PLAYING
+            and stream.running is True
+        ),
+    }
+    facts["ready"] = (
+        current
+        and capture_current
+        and facts["capture_enabled"] is True
+        and facts["homepod_remote_requested"] is True
+        and admission is True
+        and facts["session_volume_requested"] is False
+        and facts["protocol"] == "airplay2"
+        and facts["flow"] == "realtime"
+        and facts["timing"] == "ptp"
+        and facts["connected"] is True
+        and facts["playing"] is True
+    )
+    return facts
 
 
 class AirPlayProvider(PlayerProvider):
@@ -338,21 +394,13 @@ class AirPlayProvider(PlayerProvider):
         # AirPlay 2 streams attach to it (--ptp-shared) so multi-room sync groups
         # lock to a single grandmaster while UDP 319/320 is bound only once.
         await self._start_ptp_daemon()
-
-    async def loaded_in_mass(self) -> None:
-        """Register private trial API commands after the provider has loaded."""
-        await super().loaded_in_mass()
-        if is_trial_target():
-            self._unregister_private_capture_api = self.mass.register_api_command(
-                "airplay/private_native_volume_capture/get",
-                self.get_private_native_volume_capture,
-                required_scope=Scope.SYSTEM_MANAGE,
-            )
-            self._unregister_private_capture_readiness_api = self.mass.register_api_command(
-                "airplay/private_native_volume_capture/readiness/get",
-                self.get_private_native_volume_capture_readiness,
-                required_scope=Scope.SYSTEM_MANAGE,
-            )
+        # Post-load exceptions are swallowed by core. A route collision must instead
+        # fail initialization, after releasing the resources already started here.
+        try:
+            self._register_private_capture_api()
+        except BaseException:
+            await self.unload()
+            raise
 
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Handle logic when the config is updated."""
@@ -514,19 +562,77 @@ class AirPlayProvider(PlayerProvider):
         if not is_trial_target():
             msg = "Private native-volume capture is unavailable outside the trial target"
             raise RuntimeError(msg)
-        children: list[SerializableType] = []
-        if self._ptp_daemon is not None:
-            children.append(await trial_binary.attest_owned_child(self._ptp_daemon, "ptp"))
-        for player in self.get_players():
-            if player.stream and player.stream._cli_proc is not None:
-                children.append(
-                    await trial_binary.attest_owned_child(player.stream._cli_proc, "stream")
-                )
+        provenance = await asyncio.to_thread(installer_provenance)
+        daemon, ptp_event = self._ptp_daemon, self._ptp_daemon_ready
+        streams = [
+            (
+                player,
+                stream,
+                stream._cli_proc,
+                stream.private_capture_request,
+                stream.native_volume_capture,
+            )
+            for player in self.get_players()
+            if (stream := player.stream) is not None
+        ]
+        children: list[dict[str, SerializableType]] = []
+        if daemon is not None:
+            children.append(await trial_binary.attest_owned_child(daemon, "ptp"))
+        for _, _, child, _, _ in streams:
+            if child is not None:
+                children.append(await trial_binary.attest_owned_child(child, "stream"))
+
+        # No awaits after this point: earlier receipts cannot outlive replacement,
+        # exit or revocation while another child's attestation was suspended.
+        current_streams = [
+            (player, player.stream) for player in self.get_players() if player.stream is not None
+        ]
+        snapshot_current = (
+            self._ptp_daemon is daemon
+            and self._ptp_daemon_ready is ptp_event
+            and len(current_streams) == len(streams)
+            and all(
+                any(player is p and stream is s for p, s in current_streams)
+                for player, stream, _, _, _ in streams
+            )
+        )
+        ptp_current = daemon is not None and _has_current_private_receipt(daemon)
+        snapshot_current = snapshot_current and (daemon is None or ptp_current)
+        rows: list[dict[str, SerializableType]] = []
+        for player, stream, child, request, capture in streams:
+            current = (
+                player.stream is stream
+                and stream._cli_proc is child
+                and stream.private_capture_request is request
+                and stream.native_volume_capture is capture
+                and child is not None
+                and _has_current_private_receipt(child)
+            )
+            snapshot_current = snapshot_current and current
+            rows.append(_private_stream_readiness(player, stream, request, capture, current))
+        if not snapshot_current:
+            children = [
+                {
+                    "role": child["role"],
+                    "outcome": "unverified",
+                    "reason": "child-changed-during-attestation",
+                }
+                for child in children
+            ]
+            for row in rows:
+                row["current"] = row["ready"] = False
+        ptp_ready = bool(snapshot_current and ptp_current and ptp_event and ptp_event.is_set())
         return {
-            "installer_provenance": await asyncio.to_thread(installer_provenance),
+            "schema_version": 1,
+            "installer_provenance": provenance,
             "expected_sha256": encode_public_digest(trial_binary.EXPECTED_SHA),
             "startup_validation": deepcopy(self._trial_identity),
             "owned_children": children,
+            "snapshot_current": snapshot_current,
+            "ptp_ready": ptp_ready,
+            "prestream_ready": ptp_ready and not rows,
+            "playing_ready": ptp_ready and bool(rows) and all(row["ready"] is True for row in rows),
+            "streams": rows,
         }
 
     def record_private_capture(self, capture: PrivateVolumeCapture) -> None:
@@ -563,6 +669,26 @@ class AirPlayProvider(PlayerProvider):
         ):
             raise MediaNotFoundError("AirPlay artwork is unavailable")
         return await player.async_get_external_artwork(artwork_id)
+
+    def _register_private_capture_api(self) -> None:
+        """Atomically claim both private routes within the load-failing lifecycle."""
+        if not is_trial_target():
+            return
+        self._unregister_private_capture_api = self.mass.register_api_command(
+            "airplay/private_native_volume_capture/get",
+            self.get_private_native_volume_capture,
+            required_scope=Scope.SYSTEM_MANAGE,
+        )
+        try:
+            self._unregister_private_capture_readiness_api = self.mass.register_api_command(
+                "airplay/private_native_volume_capture/readiness/get",
+                self.get_private_native_volume_capture_readiness,
+                required_scope=Scope.SYSTEM_MANAGE,
+            )
+        except BaseException:
+            self._unregister_private_capture_api()
+            self._unregister_private_capture_api = None
+            raise
 
     def _set_pyatv_log_level(self) -> None:
         """Keep pyatv's (very chatty) logging quiet unless it is explicitly asked for."""

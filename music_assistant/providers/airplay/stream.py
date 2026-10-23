@@ -112,6 +112,16 @@ _STDIN_DRAIN_TIMEOUT: Final[float] = 2.0
 _CAPTURE_STDOUT_TIMEOUT: Final[float] = 2.0
 
 
+@dataclass(frozen=True)
+class PrivateCaptureRequest:
+    """Finite launch facts bound to the exact child, never configuration intent."""
+
+    child: AsyncProcess
+    capture_enabled: bool
+    homepod_remote_requested: bool
+    session_volume_requested: bool
+
+
 @dataclass
 class CliError:
     """Structured failure as reported by the cliairplay binary."""
@@ -298,6 +308,9 @@ class AirPlayStream:
         self.superseded: bool = False
         self.session_volume_requested = False
         self.native_volume_capture: PrivateVolumeCapture | None = None
+        self.private_capture_request: PrivateCaptureRequest | None = None
+        self.private_capture_playing = False
+        self.private_capture_route = ("unknown", "unknown", "unknown")
         self.session_volume = SessionVolumeBackend(self)
 
     @property
@@ -342,6 +355,9 @@ class AirPlayStream:
             passes the same value to every member so a group never mixes PTP and
             NTP timing. None lets the stream decide from the daemon's readiness.
         """
+        self.private_capture_request = None
+        self.private_capture_playing = False
+        self.private_capture_route = ("unknown", "unknown", "unknown")
         self.homepod_remote_admission = None
         self._homepod_remote_admission_reported = False
         self._homepod_remote_admission_requested = (
@@ -383,6 +399,12 @@ class AirPlayStream:
             self._cli_proc = AsyncProcess(
                 args, stdin=True, stdout=True, stderr=True, name="cliairplay", env=cli_env
             )
+        self.private_capture_request = PrivateCaptureRequest(
+            child=self._cli_proc,
+            capture_enabled=cli_env["CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE"] == "1",
+            homepod_remote_requested=cli_env["CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE"] == "1",
+            session_volume_requested=cli_env["CLIAIRPLAY_SESSION_VOLUME"] != "off",
+        )
         if capture_eligible:
             self.native_volume_capture = PrivateVolumeCapture()
             self.native_volume_capture.require_stdout_validation()
@@ -1591,6 +1613,22 @@ class AirPlayStream:
         """Parse the [STATUS] route line and log which route this stream took."""
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
         protocol = fields.get("protocol", "")
+        # Only closed, reported facts reach the private API; unknown route values
+        # must not inherit a previous qualifying route or leak raw status fields.
+        tokens = line.split()
+        valid = (
+            tokens[:2] == ["[STATUS]", "route"]
+            and len(tokens) == 6
+            and set(fields) == {"protocol", "flow", "timing", "buffered"}
+            and all(token.count("=") == 1 for token in tokens[2:])
+        )
+        self.private_capture_route = (
+            protocol if valid and protocol in ("airplay2", "raop") else "unknown",
+            ("buffered" if fields["buffered"] == "1" else "realtime")
+            if valid and fields["flow"] == "native" and fields["buffered"] in ("0", "1")
+            else "unknown",
+            fields["timing"] if valid and fields["timing"] in ("ptp", "ntp") else "unknown",
+        )
         if protocol == "airplay2":
             flow = fields.get("flow", "")
             timing = fields.get("timing", "")
@@ -1916,6 +1954,7 @@ class AirPlayStream:
         elapsed_time += self._start_position
         # The binary only emits this status while actually playing, so it is
         # also the signal that drives the player into the PLAYING state.
+        self.private_capture_playing = True
         self.player.set_state_from_stream(
             state=PlaybackState.PLAYING, elapsed_time=elapsed_time, stream=self
         )
