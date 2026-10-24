@@ -148,6 +148,9 @@ class SessionVolumeBackend:
         self._balance: dict[str, int] | None = None
         self._ordinal = 0
         self._last_request = 0
+        self._transaction_token = object()
+        self._pending_snapshot: OwnerSnapshot | None = None
+        self._pending_token: object | None = None
         self._pending: tuple[int, asyncio.Future[VolumeReceipt]] | None = None
         self._actuator_lock = asyncio.Lock()
         self._runner: asyncio.Task[None] | None = None
@@ -326,11 +329,16 @@ class SessionVolumeBackend:
         if not self.enabled or not 0 <= level <= 100:
             raise PlayerCommandFailed("Checked stream volume is unavailable")
         generation = self.generation
+        transaction_token = self._transaction_token
         snapshot = self._checked_snapshot()
 
         def check() -> None:
             """Keep ordinary checked commands bound to the same logical source too."""
             self._checked_snapshot(snapshot, validate)
+
+        def transaction_current() -> bool:
+            """Allow FIFO delivery only while this checked transaction remains current."""
+            return self.generation == generation and self._transaction_token is transaction_token
 
         check()
         async with self._actuator_lock:
@@ -346,13 +354,16 @@ class SessionVolumeBackend:
             self._ordinal += 1
             ordinal = self._ordinal
             future: asyncio.Future[VolumeReceipt] = asyncio.get_running_loop().create_future()
+            self._pending_snapshot = snapshot
+            self._pending_token = transaction_token
             self._pending = ordinal, future
             accepted = False
             try:
                 async with asyncio.timeout(_DEADLINE):
                     if not await self.stream.send_cli_command(
                         f"STREAM_VOLUME_GENERATION={generation}\nSTREAM_VOLUME_ORDINAL={ordinal}\n"
-                        f"STREAM_VOLUME_LEVEL={level}\nACTION=STREAM_VOLUME_APPLY"
+                        f"STREAM_VOLUME_LEVEL={level}\nACTION=STREAM_VOLUME_APPLY",
+                        guard=transaction_current,
                     ):
                         raise PlayerCommandFailed("Checked stream volume delivery failed")
                     receipt = await future
@@ -379,10 +390,7 @@ class SessionVolumeBackend:
                 accepted = True
                 return receipt.level
             finally:
-                if not accepted and self.generation == generation:
-                    self._discard_receipt()
-                self._pending = None
-                future.cancel()
+                self._finish_transaction(generation, transaction_token, future, accepted)
 
     def request(self, request: VolumeRequest) -> None:
         """Admit at most one executing request and one replaceable trailing request."""
@@ -405,7 +413,7 @@ class SessionVolumeBackend:
 
     async def publish_state(self) -> None:
         """Publish receipts only; feedback never invokes a volume command."""
-        if self.binding is None:
+        if self.binding is None or self.binding.generation != self.generation:
             return
         try:
             self._validate()
@@ -421,12 +429,9 @@ class SessionVolumeBackend:
 
     async def invalidate(self) -> None:
         """Unbind, cancel local work and discard receipts on ownership or process loss."""
-        binding, self.binding = self.binding, None
+        binding = self._detach_binding()
+        self._transaction_token = object()
         self._discard_receipt()
-        if binding is not None:
-            for _, backend, _, _ in binding.snapshot.actuators:
-                backend._dependents.discard(self)
-                backend._discard_receipt()
         self.generation = next(_GENERATIONS)
         self._trailing = None
         self._balance = None
@@ -436,19 +441,13 @@ class SessionVolumeBackend:
             self._pending[1].cancel()
         if self._feedback_task is not None and self._feedback_task is not asyncio.current_task():
             self._feedback_task.cancel()
-        if (
-            binding is not None
-            and self.supported
-            and self.stream.session_volume_requested
-            and self.stream.running
-            and self.stream.session_volume is self
-        ):
-            await self.stream.send_cli_command(
-                f"SESSION_VOLUME_GENERATION={binding.generation}\nACTION=SESSION_VOLUME_UNBIND"
-            )
+        if binding is not None:
+            await self._send_unbind(binding)
 
     def owner_changed(self) -> None:
         """Retire pending work synchronously before a bridge source can be replaced."""
+        binding = self._detach_binding()
+        self._transaction_token = object()
         self._discard_receipt()
         self.generation = next(_GENERATIONS)
         self._balance = None
@@ -457,7 +456,8 @@ class SessionVolumeBackend:
             self._pending[1].cancel()
         if self._runner is not None and self._runner is not asyncio.current_task():
             self._runner.cancel()
-        self._queue_feedback()
+        if binding is not None:
+            self.stream.mass.create_task(self._send_unbind(binding))
 
     async def close(self) -> None:
         """Detach the state subscription before stream teardown or reconnect."""
@@ -468,6 +468,43 @@ class SessionVolumeBackend:
             if task is not None and task is not asyncio.current_task():
                 with suppress(asyncio.CancelledError):
                     await task
+
+    def _detach_binding(self) -> VolumeBinding | None:
+        """Detach an installed binding and every dependent before its asynchronous cleanup."""
+        binding, self.binding = self.binding, None
+        if binding is not None:
+            for _, backend, _, _ in binding.snapshot.actuators:
+                backend._dependents.discard(self)
+                backend._discard_receipt()
+        return binding
+
+    async def _send_unbind(self, binding: VolumeBinding) -> None:
+        """Deliver a retired binding's captured-generation UNBIND without touching new state."""
+        if (
+            self.supported
+            and self.stream.session_volume_requested
+            and self.stream.running
+            and self.stream.session_volume is self
+        ):
+            await self.stream.send_cli_command(
+                f"SESSION_VOLUME_GENERATION={binding.generation}\nACTION=SESSION_VOLUME_UNBIND"
+            )
+
+    def _finish_transaction(
+        self,
+        generation: int,
+        transaction_token: object,
+        future: asyncio.Future[VolumeReceipt],
+        accepted: bool,
+    ) -> None:
+        """Clear only the pending state that belongs to this completed transaction."""
+        if not accepted and self.generation == generation:
+            self._discard_receipt()
+        if self._pending_token is transaction_token:
+            self._pending = None
+            self._pending_snapshot = None
+            self._pending_token = None
+        future.cancel()
 
     def _checked_snapshot(
         self, expected: OwnerSnapshot | None = None, validate: Callable[[], None] | None = None
@@ -715,7 +752,7 @@ class SessionVolumeBackend:
 
     def _queue_feedback(self) -> None:
         """Coalesce feedback without losing receipt changes during an in-flight write."""
-        if self.binding is None:
+        if self.binding is None or self.binding.generation != self.generation:
             return
         self._feedback_dirty = True
         if self._feedback_task is None or self._feedback_task.done():
@@ -723,22 +760,43 @@ class SessionVolumeBackend:
 
     async def _publish_feedback(self, binding: VolumeBinding) -> None:
         """Drain state-only updates for the exact binding that scheduled this task."""
-        while self._feedback_dirty and self.binding is binding:
+        while (
+            self._feedback_dirty
+            and self.binding is binding
+            and binding.generation == self.generation
+        ):
             self._feedback_dirty = False
             await self.publish_state()
 
     def _state_changed(self, player: Player, changes: dict[str, tuple[object, object]]) -> None:
         """Invalidate topology changes; receiver volume reports never initialize state."""
-        snapshot = self.binding.snapshot if self.binding else self._receipt_snapshot
-        if snapshot is None or player.player_id not in {item[0] for item in snapshot.topology}:
+        snapshots = tuple(
+            snapshot
+            for snapshot in (
+                (
+                    self.binding.snapshot
+                    if self.binding is not None and self.binding.generation == self.generation
+                    else None
+                ),
+                self._receipt_snapshot,
+                (
+                    self._pending_snapshot
+                    if self._pending_token is self._transaction_token
+                    else None
+                ),
+            )
+            if snapshot is not None
+        )
+        if not snapshots or not any(
+            player.player_id in {item[0] for item in snapshot.topology} for snapshot in snapshots
+        ):
             return
-        if self._receipt_snapshot is not None:
-            try:
-                unchanged = self._receipt_snapshot == self.snapshot()
-            except PlayerCommandFailed:
-                unchanged = False
-            if not unchanged:
-                self.owner_changed()
+        try:
+            current = self.snapshot()
+        except PlayerCommandFailed:
+            current = None
+        if any(snapshot != current for snapshot in snapshots):
+            self.owner_changed()
         if self.binding is None:
             return
         if changes.keys() & {"volume_level", "volume_control", "volume_muted"} and (

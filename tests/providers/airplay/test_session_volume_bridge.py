@@ -8,8 +8,11 @@ References:
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +23,7 @@ from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.constants import CONF_MAX_VOLUME, CONF_MIN_VOLUME, CONF_VOLUME_CONTROL
 from music_assistant.controllers.players.constants import PlayerLockPurpose
+from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.providers.airplay.provider import AirPlayProvider
 from music_assistant.providers.airplay.sendspin_bridge import (
     SendspinAirPlayBridge,
@@ -184,6 +188,64 @@ async def test_bridge_unavailable_preflight_has_zero_actions(change: str) -> Non
             await rig.bind()
         assert rig.commands == []
     finally:
+        await rig.close()
+
+
+async def test_warm_bridge_source_replacement_drops_queued_checked_fifo_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actual warm Sendspin replacement callbacks retire a queued transaction."""
+    fixture = await make_bridge_rig(1)
+    rig = fixture.rig
+    bridge = fixture.bridges[0]
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream = rig.streams[0]
+    stream.commands_pipe = writer
+    stream._connected.set()
+    bridge._started = True
+    process = stream._cli_proc
+    fixture.roles[0]._on_stream_start_cb = bridge._on_bridge_stream_start
+    queued = asyncio.Event()
+    delivered = asyncio.Event()
+    send = stream.send_cli_command
+    write_atomic = writer.write_atomic
+
+    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
+        queued.set()
+        return await send(command, guard=guard)
+
+    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+        result = await write_atomic(data, guard=guard)
+        delivered.set()
+        return result
+
+    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+    monkeypatch.setattr(writer, "write_atomic", record_delivery)
+    try:
+        async with writer._write_lock:
+            command = asyncio.create_task(
+                rig.controller.cmd_volume_set(fixture.players[0].player_id, 80)
+            )
+            await asyncio.wait_for(queued.wait(), 1)
+            bridge._on_stream_start(MagicMock(connection_reason="replacement"))
+            fixture.roles[0].on_stream_start()
+            assert bridge._airplay_stream is stream
+            assert stream._cli_proc is process
+        await asyncio.wait_for(delivered.wait(), 1)
+        with pytest.raises(PlayerCommandFailed, match="delivery failed"):
+            await command
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 4096)
+        assert stream.session_volume.confirmed_level is None
+    finally:
+        if "command" in locals() and not command.done():
+            command.cancel()
+            with suppress(asyncio.CancelledError):
+                await command
+        os.close(reader)
+        await writer.remove()
         await rig.close()
 
 

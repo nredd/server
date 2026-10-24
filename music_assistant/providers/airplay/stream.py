@@ -560,17 +560,22 @@ class AirPlayStream:
             return
         await self._cli_proc.write_eof()
 
-    async def send_cli_command(self, command: str) -> bool:
+    async def send_cli_command(
+        self, command: str, *, guard: Callable[[], bool] | None = None
+    ) -> bool:
         """
         Send an interactive command to the running CLI binary.
 
         :param command: Command to send.
+        :param guard: Optional predicate rechecked by the FIFO writer before delivery.
         :return: True when the complete command is delivered, False when the
             command is ignored, the CLI is unavailable, or the write is dropped.
         """
         if self._stopped or self._stopping:
             return False
-        return await self._write_cli_command(command)
+        if guard is None:
+            return await self._write_cli_command(command)
+        return await self._write_cli_command(command, guard=guard)
 
     async def flush(self, timeout: float = 2.0) -> bool:
         """
@@ -2134,12 +2139,14 @@ class AirPlayStream:
         self._announce_error = None
         self._announce_done_cancelled = False
 
-    async def _write_cli_command(self, command: str) -> bool:
+    async def _write_cli_command(
+        self, command: str, *, guard: Callable[[], bool] | None = None
+    ) -> bool:
         """Write an interactive command regardless of stream teardown state."""
         process = self._cli_proc
         if not process or process.closed:
             return False
-        write_guard: Callable[[], bool] | None = None
+        write_guard = guard
         if trial_binary.is_trial_target():
             if (
                 not isinstance(process, trial_binary.TrialAsyncProcess)
@@ -2150,7 +2157,15 @@ class AirPlayStream:
             def current_receipt_guard() -> bool:
                 return self._cli_proc is process and process.has_current_receipt()
 
-            write_guard = current_receipt_guard
+            if write_guard is None:
+                write_guard = current_receipt_guard
+            else:
+                caller_guard = write_guard
+
+                def combined_guard() -> bool:
+                    return caller_guard() and current_receipt_guard()
+
+                write_guard = combined_guard
 
         if not command.endswith("\n"):
             command += "\n"

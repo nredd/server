@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Self, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +41,26 @@ from tests.providers.airplay.test_homepod_remote_admission import _consume_task
 from tests.providers.airplay.test_stream import _make_player
 
 
+class ObservedLock:
+    """Expose when a second task is waiting on the private actuator lock."""
+
+    def __init__(self) -> None:
+        """Create an unlocked gate and its deterministic waiting signal."""
+        self._lock = asyncio.Lock()
+        self.waiting = asyncio.Event()
+
+    async def __aenter__(self) -> Self:
+        """Acquire the gate, recording contention before waiting."""
+        if self._lock.locked():
+            self.waiting.set()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        """Release the gate after the protected operation settles."""
+        self._lock.release()
+
+
 @dataclass
 class VolumeRig:
     """Real controller/players with explicitly synthetic, receipt-producing device seams."""
@@ -51,8 +73,12 @@ class VolumeRig:
     delay: asyncio.Event | None = None
     reached: asyncio.Event = field(default_factory=asyncio.Event)
 
-    async def write(self, index: int, data: bytes) -> bool:
-        """Act as a CLI pipe reader, accepting only checked actuator transactions."""
+    async def write(
+        self, index: int, data: bytes, *, guard: Callable[[], bool] | None = None
+    ) -> bool:
+        """Act as a CLI pipe reader, accepting only current checked transactions."""
+        if guard is not None and not guard():
+            return False
         command = data.decode()
         self.commands.append(command)
         if "ACTION=STREAM_VOLUME_APPLY" not in command:
@@ -528,6 +554,231 @@ async def test_fifo_delivery_is_not_actuator_acceptance() -> None:
         )
         assert await task == 61
     finally:
+        await rig.close()
+
+
+@pytest.mark.parametrize("retirement", ["owner_changed", "invalidate"])
+async def test_retired_pending_snapshot_cannot_poison_successor_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retirement: str
+) -> None:
+    """A stale event cannot retire the successor waiting behind an old FIFO write."""
+    rig = make_rig(1)
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream = rig.streams[0]
+    backend = stream.session_volume
+    lock = ObservedLock()
+    monkeypatch.setattr(backend, "_actuator_lock", lock)
+    stream.commands_pipe = writer
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    write_atomic = writer.write_atomic
+    writes = 0
+
+    async def write_with_delayed_old_transaction(
+        data: bytes, *, guard: Callable[[], bool] | None = None
+    ) -> bool:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            reached.set()
+            await release.wait()
+        delivered = await write_atomic(data, guard=guard)
+        if delivered:
+            fields = dict(
+                line.split("=", 1) for line in os.read(reader, 4096).decode().splitlines()
+            )
+            backend.handle_stdout(
+                f"[EVENT] stream_volume_result generation={fields['STREAM_VOLUME_GENERATION']} "
+                f"ordinal={fields['STREAM_VOLUME_ORDINAL']} status=committed level=80"
+            )
+        return delivered
+
+    monkeypatch.setattr(writer, "write_atomic", write_with_delayed_old_transaction)
+    try:
+        old = asyncio.create_task(backend.apply(80))
+        await asyncio.wait_for(reached.wait(), 1)
+        if retirement == "owner_changed":
+            backend.owner_changed()
+        else:
+            await backend.invalidate()
+        successor = asyncio.create_task(backend.apply(80))
+        await asyncio.wait_for(lock.waiting.wait(), 1)
+        backend._state_changed(stream.player, {"volume_level": (60, 61)})
+        release.set()
+        with pytest.raises(PlayerCommandFailed, match="delivery failed"):
+            await old
+        assert await successor == 80
+        assert (backend._pending, backend._pending_snapshot) == (None, None)
+    finally:
+        for task_name in ("old", "successor"):
+            task = locals().get(task_name)
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        os.close(reader)
+        await writer.remove()
+        await rig.close()
+
+
+async def test_unknown_startup_state_retires_queued_transaction_on_membership_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown startup state still binds a queued checked write to its membership."""
+    rig = make_rig()
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream = rig.streams[0]
+    backend = stream.session_volume
+    backend._discard_receipt()
+    stream.commands_pipe = writer
+    queued = asyncio.Event()
+    delivered = asyncio.Event()
+    send = stream.send_cli_command
+    write_atomic = writer.write_atomic
+
+    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
+        queued.set()
+        return await send(command, guard=guard)
+
+    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+        result = await write_atomic(data, guard=guard)
+        delivered.set()
+        return result
+
+    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+    monkeypatch.setattr(writer, "write_atomic", record_delivery)
+    try:
+        async with writer._write_lock:
+            transaction = asyncio.create_task(backend.apply(80))
+            await asyncio.wait_for(queued.wait(), 1)
+            assert stream.session is not None
+            stream.session.sync_clients.pop()
+            backend._state_changed(stream.player, {})
+        await asyncio.wait_for(delivered.wait(), 1)
+        with pytest.raises(PlayerCommandFailed, match="delivery failed"):
+            await transaction
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 4096)
+        assert backend.confirmed_level is None
+    finally:
+        if "transaction" in locals() and not transaction.done():
+            transaction.cancel()
+            with suppress(asyncio.CancelledError):
+                await transaction
+        os.close(reader)
+        await writer.remove()
+        await rig.close()
+
+
+async def test_current_checked_transaction_delivers_to_real_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A current checked transaction still reaches the FIFO after lock contention."""
+    rig = make_rig(1)
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream = rig.streams[0]
+    stream.commands_pipe = writer
+    queued = asyncio.Event()
+    delivered = asyncio.Event()
+    send = stream.send_cli_command
+    write_atomic = writer.write_atomic
+
+    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
+        queued.set()
+        return await send(command, guard=guard)
+
+    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+        result = await write_atomic(data, guard=guard)
+        delivered.set()
+        return result
+
+    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+    monkeypatch.setattr(writer, "write_atomic", record_delivery)
+    try:
+        async with writer._write_lock:
+            transaction = asyncio.create_task(stream.session_volume.apply(80))
+            await asyncio.wait_for(queued.wait(), 1)
+        await asyncio.wait_for(delivered.wait(), 1)
+        assert b"ACTION=STREAM_VOLUME_APPLY" in os.read(reader, 4096)
+        transaction.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await transaction
+        assert stream.session_volume._pending is None
+        assert stream.session_volume._pending_snapshot is None
+    finally:
+        if "transaction" in locals() and not transaction.done():
+            transaction.cancel()
+            with suppress(asyncio.CancelledError):
+                await transaction
+        os.close(reader)
+        await writer.remove()
+        await rig.close()
+
+
+async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retired owner cannot dispatch after the FIFO writer lock becomes available."""
+    rig = make_rig(1)
+    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+    await writer.create()
+    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+    stream = rig.streams[0]
+    stream.commands_pipe = writer
+    queued = asyncio.Event()
+    delivered = asyncio.Event()
+    send = stream.send_cli_command
+    write_atomic = writer.write_atomic
+
+    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
+        queued.set()
+        return await send(command, guard=guard)
+
+    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+        result = await write_atomic(data, guard=guard)
+        delivered.set()
+        return result
+
+    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+    monkeypatch.setattr(writer, "write_atomic", record_delivery)
+    try:
+        async with writer._write_lock:
+            command = asyncio.create_task(
+                rig.controller.cmd_volume_set(stream.player.player_id, 80)
+            )
+            await asyncio.wait_for(queued.wait(), 1)
+            stream.session_volume.owner_changed()
+        await asyncio.wait_for(delivered.wait(), 1)
+        with pytest.raises(PlayerCommandFailed, match="delivery failed"):
+            await command
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 4096)
+        queued.clear()
+        delivered.clear()
+        replacement = asyncio.create_task(
+            rig.controller.cmd_volume_set(stream.player.player_id, 80)
+        )
+        await asyncio.wait_for(queued.wait(), 1)
+        await asyncio.wait_for(delivered.wait(), 1)
+        assert b"ACTION=STREAM_VOLUME_APPLY" in os.read(reader, 4096)
+        replacement.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+        assert stream.session_volume._pending is None
+        assert stream.session_volume._pending_snapshot is None
+    finally:
+        if "command" in locals() and not command.done():
+            command.cancel()
+            with suppress(asyncio.CancelledError):
+                await command
+        os.close(reader)
+        await writer.remove()
         await rig.close()
 
 

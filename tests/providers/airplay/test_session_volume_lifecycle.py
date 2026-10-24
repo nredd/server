@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,7 +13,11 @@ from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.providers.airplay import session_volume
 from music_assistant.providers.airplay.provider import AirPlayProvider
-from music_assistant.providers.airplay.session_volume import SessionVolumeBackend, VolumeRequest
+from music_assistant.providers.airplay.session_volume import (
+    SessionVolumeBackend,
+    VolumeBinding,
+    VolumeRequest,
+)
 from tests.providers.airplay.dacp.helpers import build_dacp_request, replay
 from tests.providers.airplay.test_session_volume import make_rig
 
@@ -149,7 +154,11 @@ async def test_ordinary_failure_publishes_unknown_to_binding_owner(
             rig.streams[0].player.state.group_volume = 60
         if timeout:
 
-            async def missing_receipt(data: bytes) -> bool:
+            async def missing_receipt(
+                data: bytes, *, guard: Callable[[], bool] | None = None
+            ) -> bool:
+                if guard is not None and not guard():
+                    return False
                 if b"ACTION=STREAM_VOLUME_APPLY" in data:
                     rig.commands.append(data.decode())
                     return True
@@ -310,6 +319,72 @@ async def test_stale_before_scheduling_allocates_no_worker() -> None:
         assert backend.binding is None
         assert "ACTION=SESSION_VOLUME_UNBIND" in rig.commands[-1]
         assert not any("STREAM_VOLUME_APPLY" in command for command in rig.commands)
+    finally:
+        await rig.close()
+
+
+async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old exact-generation UNBIND cannot detach a replacement binding."""
+    rig = make_rig(1)
+    stream = rig.streams[0]
+    backend = stream.session_volume
+    old_unbind_reached = asyncio.Event()
+    release_old_unbind = asyncio.Event()
+    old_unbind_done = asyncio.Event()
+    send = stream.send_cli_command
+
+    async def delay_old_unbind(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
+        if "ACTION=SESSION_VOLUME_UNBIND" in command:
+            old_unbind_reached.set()
+            await release_old_unbind.wait()
+            result = await send(command, guard=guard)
+            old_unbind_done.set()
+            return result
+        return await send(command, guard=guard)
+
+    try:
+        assert await backend.bind(b"old-output", b"", verified_identity=True)
+        old_generation = backend.generation
+        rig.commands.clear()
+        monkeypatch.setattr(stream, "send_cli_command", delay_old_unbind)
+        backend.owner_changed()
+        assert backend.binding is None
+        assert backend not in backend._dependents
+
+        assert await backend.bind(b"new-output", b"", verified_identity=True)
+        replacement = cast("VolumeBinding | None", backend.binding)
+        assert replacement is not None
+        assert replacement.generation > old_generation
+        assert await backend.apply(80) == 80
+
+        await asyncio.wait_for(old_unbind_reached.wait(), 1)
+        release_old_unbind.set()
+        await asyncio.wait_for(old_unbind_done.wait(), 1)
+        assert cast("object", backend.binding) is replacement
+        assert any(
+            f"SESSION_VOLUME_GENERATION={old_generation}\nACTION=SESSION_VOLUME_UNBIND" in command
+            for command in rig.commands
+        )
+    finally:
+        release_old_unbind.set()
+        await rig.close()
+
+
+async def test_retired_binding_snapshot_ignores_repeated_neutral_updates() -> None:
+    """An invalidated binding cannot retire each later ordinary state update again."""
+    rig = make_rig(1)
+    try:
+        backend = await rig.bind()
+        backend.owner_changed()
+        generation = backend.generation
+        token = backend._transaction_token
+        for _ in range(2):
+            backend._state_changed(backend.stream.player, {"volume_level": (60, 61)})
+        await asyncio.sleep(0)
+        assert backend.generation == generation
+        assert backend._transaction_token is token
     finally:
         await rig.close()
 
