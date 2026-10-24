@@ -426,8 +426,10 @@ def _assert_official(info: dict[str, Any]) -> None:
 
 
 def _addon_started(info: dict[str, Any]) -> bool:
-    """Return whether Supervisor confirms that this app is running."""
-    return info.get("state") == "started"
+    """Require confirmed installed state; false means exactly stopped, never unknown."""
+    if info.get("installed") is not True or info.get("state") not in ("started", "stopped"):
+        raise RecoveryError("add-on state is not confirmed started or stopped")
+    return info["state"] == "started"
 
 
 def _assert_no_other_streams(transport: Transport, targets: tuple[str, ...]) -> None:

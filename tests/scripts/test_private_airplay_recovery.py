@@ -61,6 +61,24 @@ class RecordingTransport(recovery.FakeTransport):
         return result
 
 
+class DevStateTransport(RecordingTransport):
+    """Return a fixed sequence of Supervisor DEV states through the real helper."""
+
+    def __init__(self, states: list[Any]) -> None:
+        """Keep the final state stable after consuming earlier observations."""
+        super().__init__()
+        self.states = list(states)
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        """Override only DEV info; normal stop calls still return successfully."""
+        if path == f"/addons/{recovery.DEV}/info":
+            self.calls.append(path)
+            state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            return {"installed": True, "state": state, "protected": True, "version": "2.11.dev"}
+        return super().request(method, path, body)
+
+
+UNSAFE_DEV_STATES: list[Any] = ["error", "stopping", "starting", "unknown", "", None, 1, [], {}]
 OFFICIAL = recovery.OFFICIAL
 
 
@@ -260,6 +278,77 @@ def test_restore_fails_closed_when_dev_cannot_stop() -> None:
     assert f"/addons/{OFFICIAL}/start" not in transport.calls
 
 
+@pytest.mark.parametrize("state", UNSAFE_DEV_STATES)
+def test_capture_rejects_unconfirmed_dev_stop(state: Any) -> None:
+    """Only exact stopped DEV state permits a new recovery snapshot."""
+    transport = DevStateTransport([state])
+    with pytest.raises(recovery.RecoveryError):
+        recovery.capture(transport, recovery.CAPTURE_TARGETS["main"])
+    assert all("/core/" not in path and not path.endswith("/stop") for path in transport.calls)
+
+
+@pytest.mark.parametrize("state", UNSAFE_DEV_STATES)
+@pytest.mark.parametrize("after_stop", [False, True], ids=["initial", "after-stop"])
+def test_watchdog_never_verifies_unconfirmed_dev_stop(
+    tmp_path: Path, state: Any, after_stop: bool
+) -> None:
+    """Unknown DEV state cannot pass restore or write a verified receipt, even after stop."""
+    transport = DevStateTransport(["started", state] if after_stop else [state])
+    saved = replace(snapshot(), players=(snapshot().players[0],))
+    run_dir = recovery.save_snapshot(tmp_path, saved)
+    recovery._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": saved.run_id, "nonce": saved.nonce, "deadline": time.time()},
+    )
+    with pytest.raises(recovery.RecoveryError):
+        recovery.watchdog(tmp_path, saved.run_id, transport)
+    receipt = json.loads((run_dir / "receipt.json").read_text())
+    assert receipt["verified"] is False
+    assert (f"/addons/{recovery.DEV}/stop" in transport.calls) is after_stop
+    assert all(
+        f"/addons/{OFFICIAL}/" not in path and "/core/" not in path for path in transport.calls
+    )
+
+
+@pytest.mark.parametrize("operation", ["capture", "restore"])
+def test_uninstalled_catalog_is_not_a_confirmed_dev_stop(operation: str) -> None:
+    """A valid catalog shape with unknown state is not safe stopped evidence."""
+    transport = RecordingTransport()
+    transport.dev_installed = False
+    if operation == "capture":
+        with pytest.raises(recovery.RecoveryError):
+            recovery.capture(transport, recovery.CAPTURE_TARGETS["main"])
+    else:
+        saved = replace(snapshot(), players=(snapshot().players[0],))
+        with pytest.raises(recovery.RecoveryError):
+            recovery.restore(transport, saved, time.monotonic() + 1)
+    assert f"/addons/{OFFICIAL}/start" not in transport.calls
+    assert f"/addons/{recovery.DEV}/stop" not in transport.calls
+    assert all("/core/" not in path for path in transport.calls)
+
+
+@pytest.mark.parametrize("state", UNSAFE_DEV_STATES)
+def test_restore_rejects_uncertain_official_state_before_start(state: Any) -> None:
+    """The same predicate must not treat uncertain official state as safe to start."""
+
+    class UncertainOfficialTransport(RecordingTransport):
+        """Expose uncertain official state without changing the DEV stop path."""
+
+        def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+            """Override only official app info and record the observation."""
+            if path == f"/addons/{OFFICIAL}/info":
+                self.calls.append(path)
+                return {"state": state, "protected": True, "version": "2.10.7"}
+            return super().request(method, path, body)
+
+    transport = UncertainOfficialTransport()
+    saved = replace(snapshot(), players=(snapshot().players[0],))
+    with pytest.raises(recovery.RecoveryError):
+        recovery.restore(transport, saved, time.monotonic() + 1)
+    assert f"/addons/{OFFICIAL}/start" not in transport.calls
+    assert all("/core/" not in path for path in transport.calls)
+
+
 def test_restore_fails_when_official_cannot_start() -> None:
     """A stopped official app cannot be claimed restored when its start fails."""
     transport = RecordingTransport()
@@ -429,7 +518,12 @@ def test_supervisor_transport_real_wire_contract(monkeypatch: pytest.MonkeyPatch
     dev = json.dumps(
         {
             "result": "ok",
-            "data": {"installed": False, "state": "unknown", "protected": None, "version": None},
+            "data": {
+                "installed": True,
+                "state": "stopped",
+                "protected": True,
+                "version": "2.11.0.dev",
+            },
         }
     ).encode()
     target = json.dumps(

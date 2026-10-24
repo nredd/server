@@ -321,6 +321,14 @@ IDs. It never accepts an API host, endpoint, credential, media URL, queue, or ra
 configuration as an argument or stores any of those values. Never add it, its tests, or its
 runbook procedure to upstream work.
 
+Future hardware acceptance is `media_player.mainpod` ONLY. `media_player.officepod`
+(downstairs) is excluded from playback, volume, transport, grouping, power, native probes,
+and any request to interrupt TV/audio. Future office/group acceptance requirements are
+retired, not completed. Historical artifacts, pins, and offline group fixtures remain
+unchanged; they do not authorize office hardware use. Keep the existing active non-target
+stream guard: never clear office activity to enable a main trial. Safe main-only isolation
+redesign is separate task 70, not part of this offline recovery fix.
+
 Copy the reviewed helper to the SSH add-on, verify its SHA-256 against the external
 receipt, and set `RECOVERY_SCRIPT` to that verified absolute path. It supports the SSH
 app's Python 3.13 independently of the server's Python 3.14. Read-only capture has been
@@ -336,8 +344,11 @@ python3 "$RECOVERY_SCRIPT" arm --run <fresh-uuid> --timeout 120
 ```
 
 `capture --target main|office|both` permits only those fixed target scopes and defaults to
-`both`. A single-target run never snapshots or restores the other target; it still refuses an
-active non-target MA stream. `capture` rejects an unprotected official add-on or any installed version other than exact
+`both`. Capture requires confirmed official `started` and installed DEV exactly `stopped`.
+The shared add-on state predicate rejects `error`, `starting`, `stopping`, `unknown`, empty
+or malformed states, including an uninstalled catalog response; not `started` alone is NOT
+stopped evidence. A single-target run never snapshots or restores the other target; it
+still refuses an active non-target MA stream. `capture` rejects an unprotected official add-on or any installed version other than exact
 `2.10.7`, target groups containing non-target players, malformed state, unsupported play state,
 and any other active Music Assistant media player. It writes a new UUID directory only beneath
 the dedicated `recovery` subdirectory, with `0700` directory and `0600` state permissions. It
@@ -355,9 +366,16 @@ when the caller has other threads.
 It validates its UUID and nonce and invokes the same restore path at the hard deadline. Only
 arming requires a fresh snapshot; an already armed watchdog never refuses an emergency restore
 solely because its snapshot aged. On
-manual failure or deadline, restore stops DEV first, starts and checks official MA, and
-reloads its existing HA config entry only when this controller started the app. This resets
-HA's reconnect backoff without changing the entry's configuration or credentials or starting
+manual failure or deadline, restore stops DEV first, starts and checks official MA. DEV receives
+a normal stop request only from confirmed `started`; both an already-stopped DEV and the
+post-stop observation must confirm exact `stopped` before official MA or HA restoration can
+proceed. A successful stop response cannot substitute for that observation. Unknown/error
+states fail closed and produce a failed receipt, without a Supervisor restart, cached-state
+bypass, or extra recovery budget. This shared predicate also rejects uncertain official app
+state before a start request. Existing failed historical receipts remain failed; this offline
+change is not live recovery proof. Recovery reloads its existing HA config entry only when
+this controller started the app. This resets HA's reconnect backoff without changing the
+entry's configuration or credentials or starting
 any discovery flow. It waits for the selected targets, restores groups/levels/play state,
 then verifies them before writing its
 owner-only receipt. A group join accepted during startup can precede effective group
@@ -368,8 +386,9 @@ Before every group mutation and during verification it rejects groups containing
 uncaptured player or malformed membership. A matching response read after the deadline
 also remains failure. A missing or `verified: false` receipt is a failed recovery -- do not
 claim success. The one-shot reconciliation gap is reproduced offline; the precise phase
-that exhausted the original live window remains unproven, so a new grouped cold-recovery
-proof is required before another radio experiment. A process-held application-wide lease prevents overlapping watchdogs for
+that exhausted the original live window remains unproven. The former future grouped
+cold-recovery proof requirement is retired, NOT completed, under the main-only hardware
+constraint above. A process-held application-wide lease prevents overlapping watchdogs for
 different run IDs. A matching verified completion receipt prevents a delayed old watchdog
 from stopping a subsequent trial. The lease remains held until that watchdog exits.
 The watchdog is independent of the DEV app, but mock tests are not real HAOS restoration
