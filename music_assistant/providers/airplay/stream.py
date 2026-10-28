@@ -372,11 +372,14 @@ class AirPlayStream:
             self._homepod_remote_admission_requested
             and self.prov.config.get_value(CONF_EXPERIMENTAL_SESSION_VOLUME, False) is True
         )
+        # Capture is receive-only observation of an ordinary session: it is never
+        # combined with the session-volume backend, so volume mode is provably off.
         capture_eligible = (
             trial_binary.is_trial_target()
             and (self.player.protocol_override or self.player.protocol)
             == StreamingProtocol.AIRPLAY2
             and self._homepod_remote_admission_requested
+            and not self.session_volume_requested
             and self.prov.config.get_value(CONF_PRIVATE_NATIVE_VOLUME_CAPTURE, False) is True
         )
         self.native_volume_capture = None

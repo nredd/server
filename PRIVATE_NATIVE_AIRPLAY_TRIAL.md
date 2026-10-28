@@ -48,8 +48,15 @@ normal-provider option or an environment inherited by all children. The operator
 its value explicitly for each window and restore it afterward. Only a private, eligible
 AirPlay 2 stream with the existing HomePod-remote option explicitly enabled can request
 `CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE=1`; other child launches explicitly receive `0`.
-Capture does not enable logical volume, attach transports, subscribe to updates or publish
-availability.
+Capture does not enable logical volume, subscribe to updates or publish availability, and
+it is never requested together with the session-volume backend: a stream with
+`experimental_session_volume` on is not capture-eligible, so volume mode is provably off
+in every capture. The CLI (nredd/airplay-cli, from the capture-datastream change) attaches
+the type-130 MRP datastream receive-only when capture is on; the first live windows on
+2026-10-28 showed every record ending `incomplete-plane-coverage` with
+`datastream_at_cutoff=unattached` before that, and the documented
+`CLIAIRPLAY_MRP_TYPE130=1` force was rejected as the fix because it also moves
+now-playing publication onto the datastream.
 
 The existing provider diagnostics retain a bounded history of scalar CLI summaries and
 finite DACP classes, never UID values, request headers/bodies, Active-Remote values or raw

@@ -288,7 +288,8 @@ async def test_readiness_requires_finite_stream_facts(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize(
-    ("capture", "remote", "volume"), [(True, True, False), (False, True, True), (True, False, True)]
+    ("capture", "remote", "volume"),
+    [(True, True, False), (False, True, True), (True, False, True), (True, True, True)],
 )
 async def test_connect_snapshots_effective_child_flags_and_resets_reports(
     monkeypatch: pytest.MonkeyPatch,
@@ -333,7 +334,8 @@ async def test_connect_snapshots_effective_child_flags_and_resets_reports(
         env["CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE"] == "1"
     )
     assert request.session_volume_requested == (env["CLIAIRPLAY_SESSION_VOLUME"] != "off")
-    assert request.capture_enabled == (capture and remote)
+    assert request.capture_enabled == (capture and remote and not volume)
+    assert "CLIAIRPLAY_MRP_TYPE130" not in env
     values.clear()
     assert stream.private_capture_request is request
     assert stream.private_capture_route == ("unknown", "unknown", "unknown")
