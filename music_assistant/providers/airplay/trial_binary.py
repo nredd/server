@@ -36,8 +36,8 @@ from music_assistant.helpers.process import (
 if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
 
-EXPECTED_SHA = "0d069870df129136eb5c52ee41e665124c62e2b37231acee02676b1c2144de47"
-EXPECTED_BUILD = "v0531c6c"
+EXPECTED_SHA = "ee32ce3d4edd3cdf287010384ab463bb37e380843e6877bbf1f7ee271546223f"
+EXPECTED_BUILD = "vc4e7bef"
 TRIAL_ROOT = Path("/media/.native-airplay")
 ASSET_NAME = "cliairplay-linux-aarch64"
 MAX_BINARY_SIZE = 64 * 1024 * 1024
