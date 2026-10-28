@@ -169,9 +169,52 @@ mode.
 Both trial publication paths are guarded before work: `_mass._tcp` registration/update
 and Supervisor `/discovery`, including before HA system-token creation. Cold setup,
 core-state refresh and the periodic HA announcer cannot publish this trial; its periodic
-HA timer is not scheduled. Provider service browsing/callbacks, AirPlay DACP registration
-and PTP are unchanged. Never accept any trial HA integration. This is application-level
+HA timer is not scheduled. AirPlay DACP registration and PTP daemon startup are unchanged
+advertisement/listening. Never accept any trial HA integration. This is application-level
 publication suppression, not a network sandbox or proof of an actual HA flow outcome.
+
+## Main-only discovery admission
+
+The trial profile may resolve, probe and register exactly ONE device, named by the private
+advanced discovery core entry `private_trial_target` as `<12 lowercase hex MAC>@<advertised
+name>` (e.g. `aabbccddeeff@Main Pod`). The entry exists only on the trial target. While it is
+unset, blank or malformed the profile fails closed: no directed mDNS query, no related-service
+lookup, no `/info` probe and no player registration happens for ANY device, including the
+intended one. It is read live, so set it through the private API and then reload the
+`airplay` provider to replay the shared mDNS cache under the new admission.
+
+Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile change:
+
+- `DiscoveryController.admits_mdns_record` decides before every `AsyncServiceInfo.async_request`
+  in browser state changes, provider replay and `async_find_mdns_service`, including the
+  unfiltered related-service lookups. Off-target records are logged at VERBOSE and dropped;
+  even query-free `Removed` events never reach a provider. The instance label is taken in
+  front of the service type being resolved, never in front of the first dot, so
+  `Main.Office` is not `Main`; a RAOP label must also carry the target MAC prefix.
+- The global browser subscribes only to service types of providers this profile can load.
+  Type browsing is ordinary multicast PTR traffic, not a directed query; the previous
+  all-manifest subscription was still reduced to the loadable set.
+- `AirPlayProvider._setup_player` rejects any resolved `player_id` other than
+  `ap<MAC>` before the disabled check, the receiver filter, related-service lookup or
+  registration, so a same-named foreign record cannot pass on name alone.
+- `AirPlayProvider._learn_audio_formats` (direct `/info`) and the address-based cached
+  control lookup consult the same admission.
+- Every owned private CLI child (PTP daemon, stream and pair-setup) receives
+  `CLIAIRPLAY_PTP_STRICT_PEERS=1`. This is a profile request, NOT enforcement proof: the
+  pinned asset `716f894` predates the flag and ignores it. The strict-peer receive gate
+  exists in CLI commit `d286032` and takes effect only after a reviewed pin bump with a
+  new CI artifact, digest and receipts. Until then unregistered incoming PTP is still
+  answered by the daemon, which is why no launch is authorized.
+
+Admission is a per-record/per-id filter on this application's own traffic. It is not a
+network sandbox, does not stop receivers from multicasting to this host and does not prove
+by itself that no packet left for another device; that proof needs a capture on the live
+host during an approved window. Residual: a foreign `_airplay`/`_companion-link`/
+`_mediaremotetv` record with EXACTLY the target's instance label would receive one directed
+query before its resolved `deviceid` is rejected in `_setup_player`; mDNS name-conflict
+resolution keeps two live instances from sharing one label on a link, and the office pod
+does not share the main pod's name.
+
 
 ## Validation and diagnostics
 

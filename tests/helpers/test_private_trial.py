@@ -373,3 +373,67 @@ def test_provenance_unverifiable_is_safe(
         parent.rename(target)
         parent.symlink_to(target, target_is_directory=True)
     assert trial.installer_provenance() == {"status": "unverified"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        None,
+        7,
+        "Main",
+        "@Main",
+        "aabbccddeeff@",
+        "AABBCCDDEEFF@Main",
+        "aabbccddee@Main",
+        "aabbccddeeff@ Main",
+        "aabbccddeeff@Main ",
+    ],
+)
+def test_trial_target_rejects_incomplete_or_ambiguous_values(value: object) -> None:
+    """Nothing is admitted unless the target is one exact MAC plus one exact name."""
+    assert trial.parse_trial_target(value) is None
+    assert (
+        trial.admits_mdns_name(None, "aabbccddeeff@main._raop._tcp.local.", "_raop._tcp.local.")
+        is False
+    )
+    assert trial.admits_player_id(None, "apaabbccddeeff") is False
+
+
+def test_trial_target_admits_only_its_own_records() -> None:
+    """Every record kind of the target is admitted; same-name or same-MAC lookalikes are not."""
+    target = trial.parse_trial_target("aabbccddeeff@Main Pod")
+    assert target == trial.TrialTarget(mac="aabbccddeeff", name="Main Pod")
+    assert target.player_id == "apaabbccddeeff"
+    admitted = [
+        ("aabbccddeeff@main pod._raop._tcp.local.", "_raop._tcp.local."),
+        ("AABBCCDDEEFF@Main Pod._raop._tcp.local.", "_RAOP._tcp.local."),
+        ("main pod._airplay._tcp.local.", "_airplay._tcp.local."),
+        ("Main Pod._companion-link._tcp.local.", "_companion-link._tcp.local."),
+        ("main pod._mediaremotetv._tcp.local.", "_mediaremotetv._tcp.local."),
+    ]
+    rejected = [
+        ("112233445566@main pod._raop._tcp.local.", "_raop._tcp.local."),
+        ("aabbccddeeff@office pod._raop._tcp.local.", "_raop._tcp.local."),
+        ("office pod._airplay._tcp.local.", "_airplay._tcp.local."),
+        ("atv main pod._airplay._tcp.local.", "_airplay._tcp.local."),
+        ("main pod office._airplay._tcp.local.", "_airplay._tcp.local."),
+        ("office._companion-link._tcp.local.", "_companion-link._tcp.local."),
+        ("_airplay._tcp.local.", "_airplay._tcp.local."),
+        # dots are legal inside instance labels: never match on the text before the first one
+        ("main pod.office._airplay._tcp.local.", "_airplay._tcp.local."),
+        ("main pod._airplay._tcp.local.office._airplay._tcp.local.", "_airplay._tcp.local."),
+        # the record must belong to the service type being resolved
+        ("main pod._airplay._tcp.local.", "_raop._tcp.local."),
+        ("main pod._airplay._tcp.local", "_airplay._tcp.local."),
+    ]
+    assert all(trial.admits_mdns_name(target, name, kind) for name, kind in admitted)
+    assert not any(trial.admits_mdns_name(target, name, kind) for name, kind in rejected)
+    assert trial.admits_player_id(target, "apaabbccddeeff") is True
+    assert trial.admits_player_id(target, "ap112233445566") is False
+    assert trial.admits_player_id(target, "apAABBCCDDEEFF") is False
+
+
+def test_private_child_env_requests_strict_ptp_peers() -> None:
+    """Owned private children are always asked to drop unregistered PTP peers."""
+    assert trial.private_child_env() == {"CLIAIRPLAY_PTP_STRICT_PEERS": "1"}

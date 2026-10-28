@@ -683,6 +683,8 @@
   "core.dashboard.errors.remote_access_required": "Remote access, an HTTPS base URL or an HTTPS external URL is required to cast dashboards",
   "core.dashboard.manifest.description": "Casts Music Assistant dashboards to display devices.",
   "core.dashboard.manifest.name": "Dashboard",
+  "core.discovery.config_entries.private_trial_target.description": "Private trial only. The single device this profile may resolve, probe and register, as <12 hex MAC>@<advertised name>. While unset, no directed mDNS query, device probe or player registration happens at all. Reload the AirPlay provider after setting it; never use it in production.",
+  "core.discovery.config_entries.private_trial_target.label": "Private trial target device",
   "core.discovery.config_entries.upnp_network_scan.description": "Enable additional broadcast-based SSDP discovery. Use this if some UPnP/DLNA devices do not answer regular discovery.",
   "core.discovery.config_entries.upnp_network_scan.label": "Allow network scan for UPnP discovery",
   "core.discovery.manifest.description": "Handles mDNS/Zeroconf, SSDP/UPnP discovery and Music Assistant network broadcast.",

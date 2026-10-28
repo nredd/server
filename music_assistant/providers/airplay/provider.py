@@ -37,9 +37,13 @@ from music_assistant.helpers.config_entries import (
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.private_trial import (
+    CONF_PRIVATE_TRIAL_TARGET,
+    admits_player_id,
     encode_public_digest,
     installer_provenance,
     is_trial_target,
+    parse_trial_target,
+    private_child_env,
 )
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import (
@@ -706,6 +710,11 @@ class AirPlayProvider(PlayerProvider):
         self, player_id: str, display_name: str, discovery_info: AsyncServiceInfo
     ) -> None:
         """Handle setup of a new player that is discovered using mdns."""
+        # The private profile resolves, probes and registers exactly one device. Decide
+        # on the resolved identity first: a same-named record is not the target.
+        if not self._admits_private_player(player_id):
+            self.logger.log(VERBOSE_LOG_LEVEL, "Rejected off-target player %s", player_id)
+            return
         # return early if player is disabled in config
         if not self.mass.config.get_raw_player_config_value(player_id, "enabled", True):
             self.logger.debug("Ignoring %s in discovery as it is disabled.", display_name)
@@ -851,8 +860,22 @@ class AirPlayProvider(PlayerProvider):
 
     async def _learn_audio_formats(self, player: AirPlayPlayer, host: str, port: int) -> None:
         """Read the audio formats a receiver advertises, so 24-bit can be auto-enabled."""
+        # Direct /info is the only off-mDNS probe on the setup path; never send it off-target.
+        if not self._admits_private_player(player.player_id):
+            return
         if formats := await probe_audio_formats(self.mass, host, port):
             player.advertised_audio_formats = formats
+
+    def _admits_private_player(self, player_id: str) -> bool:
+        """Return whether this profile may set up, probe or register the player."""
+        if not is_trial_target():
+            return True
+        config = getattr(self.mass.discovery, "config", None)
+        if config is None:
+            return False
+        return admits_player_id(
+            parse_trial_target(config.get_value(CONF_PRIVATE_TRIAL_TARGET, "")), player_id
+        )
 
     async def _is_own_airplay_receiver(
         self, display_name: str, discovery_info: AsyncServiceInfo
@@ -1005,6 +1028,8 @@ class AirPlayProvider(PlayerProvider):
         for mdns_name in set(self.mass.discovery.aiozc.zeroconf.cache.cache):
             if service_type_lower not in mdns_name or mdns_name == service_type_lower:
                 continue
+            if not self.mass.discovery.admits_mdns_record(service_type, mdns_name):
+                continue
             discovery_info = AsyncServiceInfo(service_type, mdns_name)
             if not await discovery_info.async_request(
                 self.mass.discovery.aiozc.zeroconf,
@@ -1134,7 +1159,11 @@ class AirPlayProvider(PlayerProvider):
         self.logger.debug("Starting shared PTP clock daemon: if=%s", if_arg or "<all interfaces>")
         if trial_binary.is_trial_target():
             daemon = await trial_binary.create_private_process(
-                args, stdout=True, stderr=True, name="cliairplay-ptp-daemon"
+                args,
+                stdout=True,
+                stderr=True,
+                name="cliairplay-ptp-daemon",
+                env=private_child_env(),
             )
         else:
             daemon = AsyncProcess(args, stdout=True, stderr=True, name="cliairplay-ptp-daemon")

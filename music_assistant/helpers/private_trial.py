@@ -11,6 +11,7 @@ import importlib.metadata
 import json
 import platform
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,10 +29,72 @@ MAX_JSON = 1024 * 1024
 PRIVATE_API_PORT = 18095
 TRIAL_DEFAULT_PROVIDER_DOMAINS = frozenset({"airplay"})
 TRIAL_DISABLED_BUILTIN_PROVIDER_DOMAINS = frozenset({"sendspin", "sendspin_source"})
+# Private discovery core config entry naming the ONLY device this profile may query,
+# as "<12 lowercase hex MAC>@<advertised name>". Unset means nothing is admitted.
+CONF_PRIVATE_TRIAL_TARGET = "private_trial_target"
+# Environment the private profile hands every owned cliairplay child so unregistered
+# incoming PTP is dropped before any reply. The pinned asset must implement the flag
+# for it to have effect; requesting it is a profile fact, not enforcement proof.
+ENV_PTP_STRICT_PEERS = "CLIAIRPLAY_PTP_STRICT_PEERS"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[0-9a-f]{32}")
+_MAC = re.compile(r"[0-9a-f]{12}")
+# RAOP record names prefix the device name with its MAC, e.g. "aabbccddeeff@Kelder".
+_RAOP_MAC_PREFIX = re.compile(r"^(?P<mac>[0-9a-f]{12})@")
 _FRESH_ROOTS: set[Path] = set()
+
+
+@dataclass(frozen=True)
+class TrialTarget:
+    """The single admitted device of the private profile."""
+
+    mac: str
+    name: str
+
+    @property
+    def player_id(self) -> str:
+        """Return the MA AirPlay player id this device registers under."""
+        return f"ap{self.mac}"
+
+
+def parse_trial_target(value: object) -> TrialTarget | None:
+    """Parse the configured target, or None when nothing may be admitted."""
+    if not isinstance(value, str) or "@" not in value:
+        return None
+    mac, name = value.split("@", 1)
+    if not _MAC.fullmatch(mac) or not name or name != name.strip():
+        return None
+    return TrialTarget(mac=mac, name=name)
+
+
+def admits_mdns_name(target: TrialTarget | None, mdns_name: str, service_type: str) -> bool:
+    """
+    Return whether a directed query for this mDNS record may leave the host.
+
+    The instance label is everything before the service type suffix, never the text
+    before the first dot: dots are legal inside instance names, so "Main.Office" must
+    not pass as "Main".
+    """
+    if target is None:
+        return False
+    name, suffix = mdns_name.lower(), f".{service_type.lower()}"
+    if not name.endswith(suffix) or len(name) == len(suffix):
+        return False
+    instance = name[: -len(suffix)]
+    if match := _RAOP_MAC_PREFIX.match(instance):
+        return match.group("mac") == target.mac and instance[match.end() :] == target.name.lower()
+    return instance == target.name.lower()
+
+
+def admits_player_id(target: TrialTarget | None, player_id: str) -> bool:
+    """Return whether a resolved device may be set up, probed or registered."""
+    return target is not None and player_id == target.player_id
+
+
+def private_child_env() -> dict[str, str]:
+    """Return the environment every owned private CLI child must receive."""
+    return {ENV_PTP_STRICT_PEERS: "1"}
 
 
 class PrivateTrialError(RuntimeError):

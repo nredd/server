@@ -28,7 +28,13 @@ from music_assistant.constants import (
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.hassio import supervisor_request
-from music_assistant.helpers.private_trial import is_trial_target
+from music_assistant.helpers.private_trial import (
+    CONF_PRIVATE_TRIAL_TARGET,
+    admits_mdns_name,
+    is_trial_target,
+    parse_trial_target,
+    should_load_provider,
+)
 from music_assistant.helpers.util import get_ip_pton, get_zeroconf_args
 from music_assistant.models.core_controller import CoreController
 
@@ -119,6 +125,20 @@ class DiscoveryController(CoreController):
                 default_value=False,
                 requires_reload=False,
             ),
+            *(
+                (
+                    ConfigEntry(
+                        key=CONF_PRIVATE_TRIAL_TARGET,
+                        type=ConfigEntryType.STRING,
+                        default_value="",
+                        required=False,
+                        advanced=True,
+                        requires_reload=False,
+                    ),
+                )
+                if is_trial_target()
+                else ()
+            ),
         )
 
     async def close(self) -> None:
@@ -157,6 +177,26 @@ class DiscoveryController(CoreController):
         self._upnp_locks.pop(instance_id, None)
         self._schedule_periodic_upnp_discovery()
 
+    def admits_mdns_record(self, service_type: str, mdns_name: str) -> bool:
+        """
+        Return whether a directed query for this record may be sent in this profile.
+
+        Ordinary profiles admit every record. The private trial profile admits only the
+        single configured target and fails closed while no target is configured.
+        """
+        if not is_trial_target():
+            return True
+        config = getattr(self, "config", None)
+        target = (
+            None
+            if config is None
+            else parse_trial_target(config.get_value(CONF_PRIVATE_TRIAL_TARGET, ""))
+        )
+        if admits_mdns_name(target, mdns_name, service_type):
+            return True
+        self.logger.log(VERBOSE_LOG_LEVEL, "Rejected off-target record %s", mdns_name)
+        return False
+
     async def async_find_mdns_service(
         self, service_type: str, name_filter: str | None = None, timeout: float = 3.0
     ) -> AsyncServiceInfo | None:
@@ -182,6 +222,8 @@ class DiscoveryController(CoreController):
                 candidates: list[str] = []
                 for mdns_name in set(self.aiozc.zeroconf.cache.cache):
                     if service_type_lower not in mdns_name or mdns_name == service_type_lower:
+                        continue
+                    if not self.admits_mdns_record(service_type, mdns_name):
                         continue
                     if name_filter_lower is not None:
                         # Use exact matching on the device name portion to prevent a device named
@@ -247,8 +289,12 @@ class DiscoveryController(CoreController):
 
         all_types: set[str] = set()
         for manifest in self.mass.get_provider_manifests():
-            if manifest.mdns_discovery:
-                all_types.update(manifest.mdns_discovery)
+            if not manifest.mdns_discovery:
+                continue
+            # The private profile never loads most providers, so never browse for them.
+            if not should_load_provider(manifest.domain, manifest.builtin):
+                continue
+            all_types.update(manifest.mdns_discovery)
 
         if not all_types:
             return
@@ -339,6 +385,9 @@ class DiscoveryController(CoreController):
         # Notify any waiters that a new mDNS event arrived
         for waiter in self._mdns_waiters:
             waiter.set()
+        # Resolving a record sends a directed query, so decide admission before any task.
+        if not self.admits_mdns_record(service_type, name):
+            return
         for provider in list(self.mass.providers):
             if not provider.available or not provider.manifest.mdns_discovery:
                 continue
@@ -355,6 +404,8 @@ class DiscoveryController(CoreController):
             for mdns_type in provider.manifest.mdns_discovery or []:
                 for mdns_name in set(self.aiozc.zeroconf.cache.cache):
                     if mdns_type not in mdns_name or mdns_type == mdns_name:
+                        continue
+                    if not self.admits_mdns_record(mdns_type, mdns_name):
                         continue
                     info = AsyncServiceInfo(mdns_type, mdns_name)
                     if await info.async_request(self.aiozc.zeroconf, 3000):
