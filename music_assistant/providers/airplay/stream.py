@@ -491,10 +491,21 @@ class AirPlayStream:
         Stop playback and cleanup.
 
         :param force: If True, immediately kill the process without graceful shutdown.
+            Demoted to a graceful, bounded stop while a private capture is live on the
+            current child: every ordinary stop path forces, and a forced kill can never
+            yield a valid capture record. The graceful path is bounded by the capture's
+            stdout tail and the process close escalation, so it cannot hang a teardown.
         """
         async with self._stop_lock:
             if self._cleanup_complete:
                 return
+            if (
+                force
+                and self.native_volume_capture is not None
+                and self._cli_proc is not None
+                and not self._cli_proc.closed
+            ):
+                force = False
             await self.session_volume.close()
             self._stopping = True
             self._teardown_started.set()

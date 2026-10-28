@@ -398,10 +398,64 @@ async def test_real_stop_invalidates_force_killed_capture(
     await stream.stop(force=force)
     assert capture.diagnostics()["record_valid"] is False
     assert capture.diagnostics()["incomplete"] == "force-killed"
-    if force:
-        child.kill.assert_awaited_once()
-    else:
-        child.close.assert_awaited_once()
+    # A live capture demotes a forced stop to the graceful path; only the close
+    # escalation itself may still kill, and that still invalidates the record.
+    child.kill.assert_not_awaited()
+    child.close.assert_awaited_once()
+    child.write_eof.assert_awaited()
+
+
+async def test_forced_stop_with_live_capture_keeps_a_clean_exit_valid(
+    airplay_provider: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary (forced) stop path must still produce a valid record when the child exits."""
+    stream = _make_stream(airplay_provider)
+    child = MagicMock(closed=False, returncode=None, write_eof=AsyncMock())
+
+    async def exit_cleanly() -> None:
+        child.closed = True
+        child.returncode = 0
+
+    child.kill = AsyncMock()
+    child.close = AsyncMock(side_effect=exit_cleanly)
+    stream._cli_proc = child
+    capture = stream.native_volume_capture = PrivateVolumeCapture()
+    capture.trust(child)
+    assert capture.consume_stderr(child, _SUMMARY)
+    capture.end(child, "missing-summary")
+    monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
+    written: list[str] = []
+    monkeypatch.setattr(
+        stream, "_write_cli_command", AsyncMock(side_effect=lambda c: written.append(c) or True)
+    )
+    await stream.stop(force=True)
+    assert written == ["ACTION=STOP"]
+    child.kill.assert_not_awaited()
+    child.close.assert_awaited_once()
+    assert capture.diagnostics()["record_valid"] is True
+    assert "incomplete" not in capture.diagnostics()
+
+
+async def test_forced_stop_without_capture_still_kills(
+    airplay_provider: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside a capture the ordinary stop path is unchanged: immediate kill."""
+    stream = _make_stream(airplay_provider)
+    child = MagicMock(closed=False, returncode=None, write_eof=AsyncMock())
+
+    async def killed() -> None:
+        child.closed = True
+        child.returncode = -9
+
+    child.kill = AsyncMock(side_effect=killed)
+    child.close = AsyncMock()
+    stream._cli_proc = child
+    stream.native_volume_capture = None
+    monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
+    monkeypatch.setattr(stream, "_write_cli_command", AsyncMock(return_value=True))
+    await stream.stop(force=True)
+    child.kill.assert_awaited_once()
+    child.close.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
