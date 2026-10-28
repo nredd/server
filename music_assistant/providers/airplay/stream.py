@@ -26,6 +26,7 @@ from music_assistant_models.media_items import Radio
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
+from music_assistant.helpers.private_trial import private_child_env
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import sanitize_http_header_value
 from music_assistant.providers.airplay import trial_binary
@@ -393,7 +394,12 @@ class AirPlayStream:
         }
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(
-                args, stdin=True, stdout=True, stderr=True, name="cliairplay", env=cli_env
+                args,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                name="cliairplay",
+                env={**cli_env, **private_child_env()},
             )
         else:
             self._cli_proc = AsyncProcess(

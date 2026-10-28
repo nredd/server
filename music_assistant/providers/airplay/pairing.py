@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from music_assistant_models.errors import PlayerCommandFailed
 
+from music_assistant.helpers.private_trial import private_child_env
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import format_ip_for_url
 
@@ -217,7 +218,12 @@ class AirPlayPairing:
         self._pair_proc_stderr = []
         if trial_binary.is_trial_target():
             self._pair_proc = await trial_binary.create_private_process(
-                args, stdin=True, stdout=True, stderr=True, name="cliairplay-pair-setup"
+                args,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                name="cliairplay-pair-setup",
+                env=private_child_env(),
             )
         else:
             self._pair_proc = AsyncProcess(

@@ -10,6 +10,7 @@ import pytest
 from zeroconf import ServiceStateChange
 
 from music_assistant.controllers.discovery.controller import HA_ANNOUNCE_TIMER_ID
+from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
 from music_assistant.mass import MusicAssistant
 
 
@@ -80,18 +81,22 @@ async def test_cold_setup_and_periodic_publication(
 
 
 async def test_trial_provider_browser_and_callback_unchanged(mass_minimal: MusicAssistant) -> None:
-    """RAOP browsing and provider callbacks still operate in the suppressed profile."""
+    """RAOP browsing and provider callbacks still operate for the configured target."""
     mass = mass_minimal
     discovery = mass.discovery
     discovery._aiozc = MagicMock()
     provider = MagicMock(
         instance_id="private-airplay",
         available=True,
-        manifest=MagicMock(mdns_discovery=["_raop._tcp.local."]),
+        manifest=MagicMock(domain="airplay", builtin=False, mdns_discovery=["_raop._tcp.local."]),
         on_mdns_service_state_change=AsyncMock(),
     )
     mass._providers[provider.instance_id] = provider
     tasks: list[Coroutine[Any, Any, None]] = []
+    config = MagicMock()
+    config.get_value = lambda key, default=None: (
+        "aabbccddeeff@test" if key == CONF_PRIVATE_TRIAL_TARGET else default
+    )
     with (
         patch(
             "music_assistant.controllers.discovery.controller.is_trial_target", return_value=True
@@ -99,19 +104,20 @@ async def test_trial_provider_browser_and_callback_unchanged(mass_minimal: Music
         patch("music_assistant.controllers.discovery.controller.AsyncServiceBrowser") as browser,
         patch.object(mass, "get_provider_manifests", return_value=[provider.manifest]),
         patch.object(mass, "create_task", side_effect=lambda coro, **_kwargs: tasks.append(coro)),
+        patch.object(discovery, "config", config, create=True),
     ):
         await discovery._setup_mdns_browser()
         assert browser.call_args.args[1] == ["_raop._tcp.local."]
         discovery._on_mdns_service_state_change(
             MagicMock(),
             "_raop._tcp.local.",
-            "test._raop._tcp.local.",
+            "aabbccddeeff@test._raop._tcp.local.",
             ServiceStateChange.Removed,
         )
         for task in tasks:
             await task
         provider.on_mdns_service_state_change.assert_awaited_once_with(
-            "test._raop._tcp.local.",
+            "aabbccddeeff@test._raop._tcp.local.",
             ServiceStateChange.Removed,
             None,
         )

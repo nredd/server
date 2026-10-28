@@ -3,6 +3,10 @@
     "upnp_network_scan": {
       "label": "Allow network scan for UPnP discovery",
       "description": "Enable additional broadcast-based SSDP discovery. Use this if some UPnP/DLNA devices do not answer regular discovery."
+    },
+    "private_trial_target": {
+      "label": "Private trial target device",
+      "description": "Private trial only. The single device this profile may resolve, probe and register, as <12 hex MAC>@<advertised name>. While unset, no directed mDNS query, device probe or player registration happens at all. Reload the AirPlay provider after setting it; never use it in production."
     }
   },
   "manifest": {
