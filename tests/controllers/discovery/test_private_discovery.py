@@ -21,6 +21,12 @@ OFFICE_AIRPLAY = "office pod._airplay._tcp.local."
 OFFICE_COMPANION = "office pod._companion-link._tcp.local."
 
 
+@pytest.fixture(autouse=True)
+def _ordinary_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the ordinary profile so results do not depend on the host; trial tests opt in."""
+    monkeypatch.setattr(discovery_module, "is_trial_target", lambda: False)
+
+
 class StubAirPlayProvider:
     """Minimal mDNS-subscribed provider stub."""
 

@@ -23,6 +23,13 @@ TARGET_PLAYER_ID = "apaabbccddeeff"
 OFFICE_PLAYER_ID = "ap112233445566"
 
 
+@pytest.fixture(autouse=True)
+def _ordinary_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the ordinary profile so results do not depend on the host; trial tests opt in."""
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: False)
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: False)
+
+
 def _provider(
     monkeypatch: pytest.MonkeyPatch, target: object, private: bool = True
 ) -> AirPlayProvider:

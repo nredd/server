@@ -208,6 +208,10 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
   ready ONLY when its `[PTP] daemon up` line attests `strict-peers=on`. The pinned asset
   `716f894` predates the flag, ignores it and cannot attest it, so on that pin `ptp_ready`,
   `prestream_ready` and `playing_ready` stay false and the readiness receipt fails closed.
+  On that pin every trial AirPlay 2 session start also waits the full
+  `PTP_DAEMON_READY_TIMEOUT` (3 s) and then runs without the shared clock, so a group
+  would not share one grandmaster; that is the intended consequence of refusing an
+  unattested gate, not a regression to work around.
   The receive gate exists in CLI commit `d286032`; its ready-line attestation is a
   separate CLI change, and both take effect only after a reviewed pin bump with a new CI
   artifact, digest and receipts.

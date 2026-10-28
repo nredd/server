@@ -12,6 +12,8 @@ from music_assistant_models.enums import PlaybackState
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.controllers.players import PlayerController
+from music_assistant.providers.airplay import provider as provider_module
+from music_assistant.providers.airplay import trial_binary
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_COLD_GROUP_START_LEAD_MS,
     AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS,
@@ -36,6 +38,14 @@ from tests.providers.airplay.test_stream import _make_player
 
 INSTANCE_ID = "airplay"
 START_UNIX_MS = 1_750_000_000_000
+
+
+@pytest.fixture(autouse=True)
+def _ordinary_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the ordinary profile so results do not depend on the host; trial tests opt in."""
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: False)
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: False)
+
 
 # A representative readiness line emitted by `cliairplay --ptp-daemon` on the
 # real device (from a live DEBUG log) once it has bound 319/320 and opened its
