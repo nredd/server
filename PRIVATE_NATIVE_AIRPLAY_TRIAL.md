@@ -15,11 +15,13 @@ commit's own hash in its tracked contents. No launch is authorized by this templ
 Use `server_repo: nredd/server@FULLSHA`,
 never a floating branch. Keep `frontend_repo: ""` to use the bundled frontend.
 
-The official DEV app contract cached at
-`/Users/redd/code/airplay-cli/build/upstream-app-contract` is revision
-`869d9ebd37a09c2a8e1aef4d90bd8c34ba65b683`. Fresh verification found only the
-config version changed to `2.11.0.dev2026102103`; the Dockerfile and entrypoint
-are byte-identical to cached `56e9d912d977d5fdf45daa0266f19d311f76dd47`.
+The official DEV app contract was re-verified on 2026-10-28 at add-on repository revision
+`c57fd7e` (`2.11.0.dev2026102804`, the version the store installed after the DEV app was
+reinstalled): against the previously cached `869d9ebd37a09c2a8e1aef4d90bd8c34ba65b683`
+(`2.11.0.dev2026102103`) only `config.yaml`'s version changed; `Dockerfile`,
+`entrypoint.sh` and `apparmor.txt` are byte-identical. The earlier cache at
+`/Users/redd/code/airplay-cli/build/upstream-app-contract` on the originating machine
+compared `869d9eb` the same way against `56e9d912d977d5fdf45daa0266f19d311f76dd47`.
 It source-installs at startup, shares the
 production app's ports and supplies its own internal official secrets. Do not read,
 extract or copy `app_secrets`, credentials or original databases. Do not redistribute
