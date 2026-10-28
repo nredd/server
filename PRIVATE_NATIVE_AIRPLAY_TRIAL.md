@@ -26,15 +26,17 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
-The private CLI observation branch is pinned to `716f89457fc24cff37aa6f9470bcf572e887c094`.
-Canonical CLI Build `39843845256` passed Linux platform and sanitizer jobs; Linux tests exercise
-the real inherited-FD/self-image entrypoint. Its AArch64 artifact has ELF SHA256
-`c5e397d3a2b67e46c610140758ee79867d75bc6459b5b30208c2f6e2bcf7f792` (6173544 bytes).
-The earlier `f41334b` run failed GCC's SHA256 buffer-extent check; that failure was fixed,
-not waived. The new observation asset is verified locally only: it has NOT been staged,
-executed or substituted into stock MA. The earlier `5c4901f` asset's SSH-addon `--check`
-passed and its self-image probe failed closed; those historical results do not apply to
-this new asset or prove protected target execution.
+The private CLI observation branch is pinned to `0531c6cc17627125ff73f18640a1f8621cf75b3c`
+(merge of nredd/airplay-cli#4, strict-peer attestation on the daemon ready line, on top of
+`d286032` strict-peer receive gate and `716f894` passive capture). Canonical CLI Build
+`40749913557` passed the Linux aarch64/x86_64 platform jobs and the sanitizer job; the
+macOS jobs stalled in GitHub's hosted-runner queue and the identical `build-macos (arm64)`
+recipe (`make STATIC=1`, `make test`, `--check`) was run locally on an arm64 Mac instead,
+all green, before the merge. The aarch64 artifact has ELF SHA256
+`0d069870df129136eb5c52ee41e665124c62e2b37231acee02676b1c2144de47` (6173544 bytes) and
+build label `v0531c6c`. The previous `716f894` asset (`c5e397d3…f792`) stays staged on the
+host as history; it cannot attest strict peers and is no longer the pin. The new asset is
+verified locally only until the SSH-addon `--check` and self-image probe are rerun on it.
 
 ## Private aggregate volume capture
 
@@ -206,15 +208,26 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
 - Every owned private CLI child (PTP daemon, stream and pair-setup) receives
   `CLIAIRPLAY_PTP_STRICT_PEERS=1`, and on the trial target the shared daemon counts as
   ready ONLY when its `[PTP] daemon up` line attests `strict-peers=on`. The pinned asset
-  `716f894` predates the flag, ignores it and cannot attest it, so on that pin `ptp_ready`,
-  `prestream_ready` and `playing_ready` stay false and the readiness receipt fails closed.
-  On that pin every trial AirPlay 2 session start also waits the full
-  `PTP_DAEMON_READY_TIMEOUT` (3 s) and then runs without the shared clock, so a group
-  would not share one grandmaster; that is the intended consequence of refusing an
+  `0531c6c` implements the receive gate (`d286032`) and the attestation (#4). An older
+  asset that cannot attest it (e.g. the retired `716f894`) leaves `ptp_ready`,
+  `prestream_ready` and `playing_ready` false, fails the readiness receipt closed, and
+  makes every trial AirPlay 2 session start wait the full `PTP_DAEMON_READY_TIMEOUT` (3 s)
+  and run without the shared clock; that is the intended consequence of refusing an
   unattested gate, not a regression to work around.
-  The receive gate exists in CLI commit `d286032`; its ready-line attestation is a
-  separate CLI change, and both take effect only after a reviewed pin bump with a new CI
-  artifact, digest and receipts.
+
+`scripts/private_trial_window.sh` is the operator wizard for one live window. The CLI pin
+is hardcoded in it and compared mechanically against the asset on the host plus its
+`--check` label; a stale `.env` can never select another asset. It then: requires the
+by-hand sibling stop via `preflight`; starts `tcpdump` on `end0` keyed on the office pod
+and office TV MACs (`ether host`, so IPv4, IPv6 and link-local alike), unicast only, and
+proves the filter can see office traffic with a two-ping control probe before the window
+epoch; runs lifecycle capture/arm/start; has the operator set the target on the private
+port and reload AirPlay; collects the readiness receipt; stops DEV; and prints the
+verdict as every frame after the window epoch. A failed isolation or readiness answer
+skips playback and goes straight to stop. An `EXIT` trap stops DEV (receipted,
+idempotent) and the capture on any abort. The acceptance criterion is `COUNT 0`; any
+frame is not a clean pass, though its source port/process must be read before calling
+it a DEV violation.
 
 Admission is a per-record/per-id filter on this application's own traffic. It is not a
 network sandbox, does not stop receivers from multicasting to this host and does not prove
@@ -237,7 +250,7 @@ executable must match SHA256 and ELF64 little-endian AArch64 headers before `--c
 The build check executes a retained validated descriptor too, never a pathname which can
 be swapped and restored between pre/post validation. It has a five-second deadline,
 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `v716f894` with exit zero.
+second of cleanup, and must report `cliairplay`, `check` and `v0531c6c` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.
