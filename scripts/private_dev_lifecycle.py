@@ -307,7 +307,10 @@ def start(transport: Transport, snapshot: Snapshot, deadline: float) -> None:
 
 def restore(transport: Transport, snapshot: Snapshot, deadline: float) -> None:
     """
-    Stop DEV, confirm by observation, then re-verify stock absence. Nothing else.
+    Stop DEV, confirm by observation, then re-verify the captured facts. Nothing else.
+
+    The re-verification is the full preflight: stock absent, DEV facts and no sibling
+    MA app running, so a sibling started mid-window turns the run into a failed receipt.
 
     :param transport: The fixed Supervisor transport.
     :param snapshot: The run's captured facts to re-verify after the stop.

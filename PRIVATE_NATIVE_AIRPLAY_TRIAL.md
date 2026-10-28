@@ -393,7 +393,9 @@ local `2.10.6-cliairplay0.5.7` dev build, the `2.11.0b2` beta) may stay installe
 must read `stopped` in the catalog: a running sibling owns the shared host ports
 (`8095`, DACP, PTP 319/320) and the speakers, and this controller can never stop it. The
 operator stops it by hand before the window, ideally with `boot: manual` so an HA restart
-cannot resurrect it mid-window. The per-app `info` fallback for an uninstalled app is never consulted
+cannot resurrect it mid-window. The controller checks only the catalog state, not the
+sibling's `boot` mode; a sibling that comes back mid-window is detected at stop time and
+turns the run into a failed receipt (DEV is still stopped first). The per-app `info` fallback for an uninstalled app is never consulted
 or modelled for absence. DEV's own `info` must then report a confirmed `started`/`stopped`
 state, `protected: true`, `boot: manual` and `watchdog: false`; `startup`, `error`,
 `unknown` or missing values fail closed.

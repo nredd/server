@@ -311,6 +311,27 @@ def test_restore_stops_dev_first_even_if_stock_reappeared() -> None:
     assert transport.calls.index(f"POST /addons/{DEV}/stop") < transport.calls.index("GET /addons")
 
 
+def test_sibling_started_mid_window_still_stops_dev_but_never_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sibling that comes back during the window cannot leave DEV running or verify."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    state = snapshot(installed_slugs=("core_ssh", DEV, "local_music_assistant_dev"))
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    transport = ScriptedTransport(
+        dev_started=True, slugs=(DEV, "core_ssh", "local_music_assistant_dev")
+    )
+    transport.sibling_state = "started"
+    with pytest.raises(lifecycle.LifecycleError, match="another Music Assistant app"):
+        lifecycle.settle(tmp_path, run_dir, state, transport)
+    assert transport.dev_started is False
+    assert transport.calls.index(f"POST /addons/{DEV}/stop") < transport.calls.index("GET /addons")
+    assert json.loads((run_dir / "receipt.json").read_text())["verified"] is False
+    transport.sibling_state = "stopped"
+    lifecycle.settle(tmp_path, run_dir, state, transport)
+    assert lifecycle._has_verified_receipt(run_dir, state) is True
+
+
 def test_restore_is_idempotent_and_touches_nothing_else() -> None:
     """A stopped DEV is left alone; the only mutation ever issued is DEV stop."""
     transport = ScriptedTransport(dev_started=True)
