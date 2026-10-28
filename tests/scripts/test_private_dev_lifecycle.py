@@ -110,8 +110,13 @@ def test_facts_reject_stock_present_or_dev_absent() -> None:
         lifecycle.read_facts(ScriptedTransport(slugs=(DEV, STOCK)))
     with pytest.raises(lifecycle.LifecycleError, match="DEV app is not installed"):
         lifecycle.read_facts(ScriptedTransport(slugs=("core_ssh",)))
-    with pytest.raises(lifecycle.LifecycleError, match="unexpected Music Assistant"):
-        lifecycle.read_facts(ScriptedTransport(slugs=(DEV, "local_music_assistant")))
+    # a sibling MA app is tolerated only while the catalog shows it stopped
+    sibling = ScriptedTransport(slugs=(DEV, "local_music_assistant_dev"))
+    assert lifecycle.read_facts(sibling).installed_slugs == (DEV, "local_music_assistant_dev")
+    for state in ("started", "startup", "error", "unknown"):
+        sibling.sibling_state = state
+        with pytest.raises(lifecycle.LifecycleError, match="another Music Assistant app"):
+            lifecycle.read_facts(sibling)
 
 
 @pytest.mark.parametrize(

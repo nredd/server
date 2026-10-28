@@ -223,6 +223,7 @@ def read_facts(transport: Transport) -> Facts:
     if not isinstance(entries, list) or not entries:
         raise LifecycleError("installed-app catalog is malformed")
     slugs: list[str] = []
+    states: dict[str, str] = {}
     for entry in entries:
         if (
             not isinstance(entry, dict)
@@ -233,6 +234,7 @@ def read_facts(transport: Transport) -> Facts:
         ):
             raise LifecycleError("installed-app catalog entry is incomplete")
         slugs.append(entry["slug"])
+        states[entry["slug"]] = entry["state"]
     if len(set(slugs)) != len(slugs):
         raise LifecycleError("installed-app catalog contains duplicate slugs")
     if STOCK in slugs:
@@ -241,8 +243,13 @@ def read_facts(transport: Transport) -> Facts:
         )
     if DEV not in slugs:
         raise LifecycleError("DEV app is not installed")
-    if any(slug != DEV and "music_assistant" in slug for slug in slugs):
-        raise LifecycleError("an unexpected Music Assistant app is installed")
+    # Sibling MA apps (a local dev build, a beta) may stay installed, but a running one
+    # owns the shared host ports and speakers, and the operator must stop it by hand:
+    # this controller can never issue a stop to any other app.
+    if any(
+        slug != DEV and "music_assistant" in slug and states[slug] != "stopped" for slug in slugs
+    ):
+        raise LifecycleError("another Music Assistant app is not stopped")
     info = _dev_info(transport)
     if info.protected is not True:
         raise LifecycleError("DEV app protection mode is off")
@@ -620,6 +627,7 @@ class FakeTransport:
         self.protected = True
         self.boot = "manual"
         self.watchdog = False
+        self.sibling_state = "stopped"
         self.calls: list[str] = []
 
     def request(self, method: str, path: str) -> Any:
@@ -630,7 +638,7 @@ class FakeTransport:
                 "addons": [
                     {
                         "slug": slug,
-                        "state": self._dev_state() if slug == DEV else "started",
+                        "state": self._catalog_state(slug),
                         "version": self.dev_version if slug == DEV else "1.0.0",
                     }
                     for slug in self.slugs
@@ -655,6 +663,11 @@ class FakeTransport:
 
     def _dev_state(self) -> str:
         return "started" if self.dev_started else "stopped"
+
+    def _catalog_state(self, slug: str) -> str:
+        if slug == DEV:
+            return self._dev_state()
+        return self.sibling_state if "music_assistant" in slug else "started"
 
 
 def _token() -> str:
