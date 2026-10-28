@@ -215,11 +215,19 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
   and run without the shared clock; that is the intended consequence of refusing an
   unattested gate, not a regression to work around.
 
-`scripts/private_trial_window.sh` is the operator wizard for one live window: artifact
-SHA verification, by-hand sibling stop, `tcpdump` on `end0` filtered to unicast between
-the HAOS host and the office pod/TV, lifecycle capture/arm/start, target configuration on
-the private port, readiness receipt, stop, and the capture verdict. The acceptance
-criterion for isolation is a packet count of exactly zero in that capture.
+`scripts/private_trial_window.sh` is the operator wizard for one live window. The CLI pin
+is hardcoded in it and compared mechanically against the asset on the host plus its
+`--check` label; a stale `.env` can never select another asset. It then: requires the
+by-hand sibling stop via `preflight`; starts `tcpdump` on `end0` keyed on the office pod
+and office TV MACs (`ether host`, so IPv4, IPv6 and link-local alike), unicast only, and
+proves the filter can see office traffic with a two-ping control probe before the window
+epoch; runs lifecycle capture/arm/start; has the operator set the target on the private
+port and reload AirPlay; collects the readiness receipt; stops DEV; and prints the
+verdict as every frame after the window epoch. A failed isolation or readiness answer
+skips playback and goes straight to stop. An `EXIT` trap stops DEV (receipted,
+idempotent) and the capture on any abort. The acceptance criterion is `COUNT 0`; any
+frame is not a clean pass, though its source port/process must be read before calling
+it a DEV violation.
 
 Admission is a per-record/per-id filter on this application's own traffic. It is not a
 network sandbox, does not stop receivers from multicasting to this host and does not prove

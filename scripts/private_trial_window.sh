@@ -185,39 +185,58 @@ finish() {
 # action is a plain `ssh home` the operator can read before it runs.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=9
+TOTAL_STAGES=10
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
 mkdir -p "$(dirname "$ENV_FILE")"
 
 HOST=home
+# Pins are hardcoded on purpose: a stale .env value can never select another asset.
+PINNED_CLI_SHA=0d069870df129136eb5c52ee41e665124c62e2b37231acee02676b1c2144de47
+PINNED_CLI_LABEL=v0531c6c
 MAIN_POD_TARGET="323e659fe4e1@main-pod"
 MAIN_POD_IP=192.168.40.99
-OFFICE_POD_IP=192.168.40.24
-OFFICE_TV_IPS="192.168.40.252 or 192.168.1.131"
+OFFICE_POD_MAC=fa:38:11:2b:21:1f
+OFFICE_TV_MAC=42:af:ee:02:fc:bb
 HAOS_IP=192.168.40.180
 TRIAL_API="http://${HAOS_IP}:18095"
 PROBE_DIR=/data/airplay-native-probe
 ASSET_ROOT=/media/.native-airplay
-SIBLINGS="local_music_assistant_dev d5369777_music_assistant_beta"
+# Capture is keyed on the office devices' MACs (IPv4, IPv6 and link-local alike),
+# unicast only. Multicast mDNS/PTP is advertisement, not a directed packet.
+CAP_FILTER="(ether host $OFFICE_POD_MAC or ether host $OFFICE_TV_MAC) and not multicast and not broadcast"
 
 remote() { ssh "$HOST" "$@"; }
+CAP=""
+RUN_ID=""
+ABORTED=0
+
+# Whatever happens to this shell: stop DEV (idempotent, receipted) and stop tcpdump.
+cleanup() {
+  [[ -n "$RUN_ID" ]] && remote "python3 $LIFECYCLE_SCRIPT stop --run $RUN_ID" || true
+  [[ -n "$CAP" ]] && remote "kill \$(cat $CAP.pid 2>/dev/null) 2>/dev/null" || true
+}
+trap cleanup EXIT
+
+fail() { warn "$1"; exit 1; }
 
 # ── 1 ─────────────────────────────────────────────────────────────────────
-stage "Pins and receipts you must have in hand"
-say "This window needs the reviewed, SHA-bound artifacts. Nothing here downloads or builds."
+stage "Verify the pinned artifacts on HAOS"
+say "CLI pin: $PINNED_CLI_SHA ($PINNED_CLI_LABEL). Nothing here downloads or builds."
 ask LIFECYCLE_SHA "SHA-256 of the reviewed private_dev_lifecycle.py (from its receipt):"
-ask CLI_SHA "SHA-256 of the pinned cliairplay-linux-aarch64 (trial_binary.EXPECTED_SHA):"
 ask WINDOW_SECONDS "Window length in seconds (watchdog timeout, max 3600):"
 write_env LIFECYCLE_SHA "$LIFECYCLE_SHA"
-write_env CLI_SHA "$CLI_SHA"
 write_env WINDOW_SECONDS "$WINDOW_SECONDS"
-step "Verifying both artifacts on HAOS against those SHAs (read-only)."
-remote "cd $PROBE_DIR && sha256sum private-dev-lifecycle-*.py; sha256sum $ASSET_ROOT/$CLI_SHA/cliairplay-linux-aarch64"
-confirm "Do the printed SHAs match LIFECYCLE_SHA and CLI_SHA exactly?" || { warn "Stop. Fix the artifacts first."; exit 1; }
 LIFECYCLE_SCRIPT=$(remote "cd $PROBE_DIR && sha256sum private-dev-lifecycle-*.py | awk '\$1==\"$LIFECYCLE_SHA\"{print \$2}'")
-[[ -n "$LIFECYCLE_SCRIPT" ]] || { warn "No lifecycle script with that SHA on the box."; exit 1; }
+[[ -n "$LIFECYCLE_SCRIPT" ]] || fail "No lifecycle script with SHA $LIFECYCLE_SHA on the box."
 LIFECYCLE_SCRIPT="$PROBE_DIR/$LIFECYCLE_SCRIPT"
 write_env LIFECYCLE_SCRIPT "$LIFECYCLE_SCRIPT"
+CLI_ON_HOST=$(remote "sha256sum $ASSET_ROOT/$PINNED_CLI_SHA/cliairplay-linux-aarch64 2>/dev/null | awk '{print \$1}'")
+[[ "$CLI_ON_HOST" == "$PINNED_CLI_SHA" ]] || fail "Pinned CLI asset missing or SHA mismatch on the box ($CLI_ON_HOST)."
+CHECK=$(remote "$ASSET_ROOT/$PINNED_CLI_SHA/cliairplay-linux-aarch64 --check 2>&1")
+[[ "$CHECK" == *"cliairplay $PINNED_CLI_LABEL check"* ]] || fail "--check did not report $PINNED_CLI_LABEL: $CHECK"
+say "lifecycle: $LIFECYCLE_SCRIPT"
+say "cli: $CHECK"
+pause
 
 # ── 2 ─────────────────────────────────────────────────────────────────────
 stage "Stop the sibling Music Assistant apps BY HAND"
@@ -227,36 +246,43 @@ step "Settings -> Add-ons -> Music Assistant (local dev 2.10.6) -> STOP, and set
 step "Leave the beta stopped. Do not touch stock: it is absent and stays absent."
 open_url "https://home.meep.net/hassio/dashboard"
 pause "Press Enter once both siblings are stopped"
-remote "python3 $LIFECYCLE_SCRIPT preflight"
-confirm "preflight printed the facts (exit 0) with dev_state=stopped?" || { warn "Stop. The catalog is not in the stock-absent, siblings-stopped state."; exit 1; }
+remote "python3 $LIFECYCLE_SCRIPT preflight" || fail "preflight refused: the catalog is not stock-absent with siblings stopped."
 
 # ── 3 ─────────────────────────────────────────────────────────────────────
-stage "Start the packet capture (the office-exclusion proof)"
-say "tcpdump on the HAOS host records every packet between this host and the office pod/TV."
-say "Zero unicast packets from $HAOS_IP to $OFFICE_POD_IP is the acceptance criterion."
-note "Multicast mDNS (224.0.0.251) and PTP multicast are NOT directed and are excluded by the filter."
+stage "Start the packet capture and prove it can see the office devices"
 CAP="$PROBE_DIR/window-$(date +%Y%m%dT%H%M%S).pcap"
-write_env CAPTURE_FILE "$CAP"
-remote "nohup tcpdump -i end0 -nn -w $CAP 'host $HAOS_IP and (host $OFFICE_POD_IP or host 192.168.40.252 or host 192.168.1.131) and not multicast and not broadcast' >$CAP.log 2>&1 & echo \$! > $CAP.pid; sleep 1; cat $CAP.log"
-step "You should see 'listening on end0'."
-pause
+CAP_FILE="$CAP"
+write_env CAPTURE_FILE "$CAP_FILE"
+remote "nohup tcpdump -i end0 -nn -U -w $CAP '$CAP_FILTER' >$CAP.log 2>&1 & echo \$! > $CAP.pid; sleep 2; cat $CAP.log; kill -0 \$(cat $CAP.pid)" \
+  || fail "tcpdump did not start or died; see $CAP.log"
+remote "grep -q 'listening on end0' $CAP.log" || fail "tcpdump is not listening on end0."
+say "Control probe: ONE ICMP echo from the HAOS host to each office device, so a later count of"
+say "zero is a measured zero. These two probes are the only intentional office packets and are"
+say "recorded in the control capture, not the window capture."
+confirm "Send the control probe (2 pings) now?" || fail "No control probe, no verdict. Aborting."
+CONTROL="$CAP.control"
+remote "tcpdump -i end0 -nn -U -w $CONTROL '$CAP_FILTER' >/dev/null 2>&1 & p=\$!; sleep 1; ping -c1 -W2 192.168.40.24 >/dev/null; ping -c1 -W2 192.168.40.252 >/dev/null; sleep 1; kill \$p; sleep 1; tcpdump -nn -r $CONTROL 2>/dev/null | wc -l"
+say "The control count above must be >= 2 (the filter sees office unicast). The window capture"
+say "in the background also saw them; the verdict subtracts nothing, so note the time: $(date +%T)."
+confirm "Control count >= 2?" || fail "The filter cannot see office traffic; a zero would be meaningless."
+WINDOW_START_EPOCH=$(date +%s)
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
 stage "Capture and arm the lifecycle run"
-RUN_DIR=$(remote "python3 $LIFECYCLE_SCRIPT capture")
+RUN_DIR=$(remote "python3 $LIFECYCLE_SCRIPT capture") || fail "capture refused."
 RUN_ID=$(basename "$RUN_DIR")
 write_env RUN_ID "$RUN_ID"
 say "Run: $RUN_ID"
-remote "python3 $LIFECYCLE_SCRIPT arm --run $RUN_ID --timeout $WINDOW_SECONDS"
+remote "python3 $LIFECYCLE_SCRIPT arm --run $RUN_ID --timeout $WINDOW_SECONDS" || fail "arm refused."
 say "A detached watchdog will stop DEV in $WINDOW_SECONDS s no matter what happens to this shell."
 pause
 
 # ── 5 ─────────────────────────────────────────────────────────────────────
 stage "Start the DEV app"
-confirm "Start d5369777_music_assistant_dev now (inside the armed run)?" || { warn "Aborting: stopping the run."; remote "python3 $LIFECYCLE_SCRIPT stop --run $RUN_ID"; exit 1; }
-remote "python3 $LIFECYCLE_SCRIPT start --run $RUN_ID"
-say "DEV is started. First boot creates the private namespace; the AirPlay provider loads with NO target"
-say "and must resolve, probe and register nothing until stage 6."
+confirm "Start d5369777_music_assistant_dev now (inside the armed run)?" || fail "Not started; settling the run."
+remote "python3 $LIFECYCLE_SCRIPT start --run $RUN_ID" || fail "start refused or unconfirmed; settling the run."
+say "DEV is started. The AirPlay provider loads with NO target and must resolve, probe and"
+say "register nothing until stage 6."
 
 # ── 6 ─────────────────────────────────────────────────────────────────────
 stage "Set the single admitted target, then reload AirPlay"
@@ -264,33 +290,51 @@ open_url "$TRIAL_API/setup"
 step "Complete the owner setup on the private port (fresh namespace, new owner user), then log in."
 step "Settings -> Core -> Discovery -> advanced -> 'Private trial target device' = $MAIN_POD_TARGET -> Save."
 step "Settings -> Providers -> AirPlay -> Reload."
-say "Alternatively, with a token: POST $TRIAL_API/api"
+note "Or with a token: POST $TRIAL_API/api"
 note '  {"command":"config/core/save","args":{"domain":"discovery","values":{"private_trial_target":"'"$MAIN_POD_TARGET"'"}}}'
 note '  {"command":"config/providers/reload","args":{"instance_id":"airplay"}}'
 pause "Press Enter once AirPlay is reloaded"
 step "Expected: exactly one player, main-pod ($MAIN_POD_IP). office-pod must NOT appear."
-confirm "Is main-pod the ONLY AirPlay player listed?" || warn "Record this as a FAILED isolation result; continue to stop."
+if ! confirm "Is main-pod the ONLY AirPlay player listed?"; then
+  warn "FAILED isolation. Skipping playback; going straight to stop and verdict."
+  ABORTED=1
+fi
 
 # ── 7 ─────────────────────────────────────────────────────────────────────
 stage "Readiness receipt and (optional) playback"
-step "Settings -> Providers -> AirPlay -> run the private readiness command, or POST"
-note '  {"command":"airplay/private_native_volume_capture/readiness/get"}'
-say "ptp_ready must be true. If it is false with the reason 'did not attest strict peers', the pin is wrong: stop."
-confirm "ptp_ready is true?" || warn "Record as not ready; do not play."
-say "Playback to main-pod only, from the trial UI, is your call. Nothing here starts it."
-pause "Press Enter when you are done observing"
+if (( ABORTED )); then
+  say "Skipped."
+else
+  step "POST {\"command\":\"airplay/private_native_volume_capture/readiness/get\"} on $TRIAL_API/api"
+  say "ptp_ready must be true. False with 'did not attest strict peers' means the wrong asset ran."
+  if confirm "ptp_ready is true?"; then
+    say "Playback to main-pod only, from the trial UI, is your call. Nothing here starts it."
+    pause "Press Enter when you are done observing"
+  else
+    warn "Not ready. Skipping playback; going to stop."
+  fi
+fi
 
 # ── 8 ─────────────────────────────────────────────────────────────────────
 stage "Stop DEV and settle the run"
-remote "python3 $LIFECYCLE_SCRIPT stop --run $RUN_ID"
+remote "python3 $LIFECYCLE_SCRIPT stop --run $RUN_ID" || warn "stop returned non-zero: read the receipt."
 remote "cat $PROBE_DIR/dev-lifecycle/$RUN_ID/receipt.json; echo"
-confirm "Receipt says verified: true?" || warn "Failed receipt: DEV state must be checked by hand before anything else."
+confirm "Receipt says verified: true?" || warn "Failed receipt: check DEV state by hand before anything else."
+RUN_ID=""
 
 # ── 9 ─────────────────────────────────────────────────────────────────────
-stage "Stop the capture and read the verdict"
-remote "kill \$(cat $CAP.pid) 2>/dev/null; sleep 1; tcpdump -nn -r $CAP 2>/dev/null | wc -l; tcpdump -nn -r $CAP 2>/dev/null | head -20"
-say "Acceptance: the count is 0. Any line here is a directed packet to the office pod or TV and FAILS isolation."
-say "Keep $CAP, the receipt and the readiness output together as this window's evidence."
+stage "Stop the capture"
+remote "kill -0 \$(cat $CAP.pid) && kill \$(cat $CAP.pid) && sleep 1" || warn "tcpdump was not alive at the end: the capture may be truncated."
+remote "test -s $CAP_FILE && tcpdump -nn -r $CAP_FILE >/dev/null" || fail "Capture file missing or unreadable: no verdict."
+CAP=""
+
+# ── 10 ────────────────────────────────────────────────────────────────────
+stage "Verdict"
+say "Window packets after the control probe (epoch $WINDOW_START_EPOCH), unicast to/from office devices:"
+remote "tcpdump -nn -tt -e -r $CAP_FILE 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict; tail -30 $CAP_FILE.verdict; echo; echo COUNT \$(wc -l < $CAP_FILE.verdict)"
+say "Acceptance: COUNT 0. Any line is a unicast frame between this host and the office pod/TV"
+say "during the window: investigate the source port/process before calling it a DEV violation,"
+say "but it is NOT a clean pass."
 warn "Restart local_music_assistant_dev yourself if you want it back. The trial never does."
 
 finish
