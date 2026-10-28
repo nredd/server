@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -207,30 +208,73 @@ def test_capture_requires_dev_stopped_and_records_catalog() -> None:
 def test_start_only_from_matching_stopped_facts() -> None:
     """Start refuses drifted catalogs, drifted images and an already running DEV."""
     transport = ScriptedTransport()
-    lifecycle.start(transport, snapshot())
+    lifecycle.start(transport, snapshot(), time.monotonic() + 5)
     assert transport.dev_started is True
     assert f"POST /addons/{DEV}/start" in transport.calls
     with pytest.raises(lifecycle.LifecycleError, match="requires DEV stopped"):
-        lifecycle.start(transport, snapshot())
+        lifecycle.start(transport, snapshot(), time.monotonic() + 5)
 
     drifted = ScriptedTransport(slugs=(DEV, "core_ssh", "core_samba"))
     with pytest.raises(lifecycle.LifecycleError, match="catalog changed"):
-        lifecycle.start(drifted, snapshot())
+        lifecycle.start(drifted, snapshot(), time.monotonic() + 5)
     assert f"POST /addons/{DEV}/start" not in drifted.calls
 
     other_image = ScriptedTransport()
     other_image.dev_version = "2.11.0.dev2"
     with pytest.raises(lifecycle.LifecycleError, match="version changed"):
-        lifecycle.start(other_image, snapshot())
+        lifecycle.start(other_image, snapshot(), time.monotonic() + 5)
     assert f"POST /addons/{DEV}/start" not in other_image.calls
 
 
-def test_start_fails_closed_when_dev_does_not_report_started() -> None:
-    """A start request that is not confirmed by observation is a failure."""
+def test_start_fails_closed_when_dev_does_not_report_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start request that is not confirmed by observation within the budget is a failure."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
     transport = ScriptedTransport()
     transport.overrides[f"/addons/{DEV}/start"] = None
     with pytest.raises(lifecycle.LifecycleError, match="did not start"):
-        lifecycle.start(transport, snapshot())
+        lifecycle.start(transport, snapshot(), time.monotonic() + 0.2)
+
+
+def _info(state: str) -> dict[str, Any]:
+    """Build one DEV info payload with the given state."""
+    return {
+        "slug": DEV,
+        "state": state,
+        "version": "2.11.0.dev",
+        "protected": True,
+        "boot": "manual",
+        "watchdog": False,
+    }
+
+
+def test_start_waits_through_startup_and_rejects_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`startup` is pending, `started` confirms, `error` fails at once."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    transport = ScriptedTransport()
+    observations = ["startup", "startup", "started"]
+
+    def info(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info" and f"POST /addons/{DEV}/start" in transport.calls:
+            transport.calls.append(f"{method} {path}")
+            return _info(observations.pop(0) if observations else "started")
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", info)
+    lifecycle.start(transport, snapshot(), time.monotonic() + 5)
+    assert observations == []
+
+    failing = ScriptedTransport()
+
+    def error_after_start(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info" and f"POST /addons/{DEV}/start" in failing.calls:
+            return _info("error")
+        return ScriptedTransport.request(failing, method, path)
+
+    monkeypatch.setattr(failing, "request", error_after_start)
+    with pytest.raises(lifecycle.LifecycleError, match="did not start"):
+        lifecycle.start(failing, snapshot(), time.monotonic() + 5)
 
 
 def test_restore_stops_dev_first_even_if_stock_reappeared() -> None:
@@ -252,13 +296,64 @@ def test_restore_is_idempotent_and_touches_nothing_else() -> None:
 
 
 def test_restore_never_verifies_an_unconfirmed_stop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stop response is not stop evidence; the observation must say `stopped`."""
-    monkeypatch.setattr(lifecycle, "STOP_POLL_INTERVAL", 0.01)
+    """A stop response is not stop evidence; the stop is re-sent until the budget ends."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "STOP_RESEND_INTERVAL", 0.05)
     transport = ScriptedTransport(dev_started=True)
     transport.stop_works = False
     with pytest.raises(lifecycle.LifecycleError, match="did not stop"):
         lifecycle.restore(transport, snapshot(), time.monotonic() + 0.3)
-    assert transport.calls.count(f"POST /addons/{DEV}/stop") == 1
+    assert transport.calls.count(f"POST /addons/{DEV}/stop") >= 2
+
+
+def test_stop_is_resent_after_a_failed_stop_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One failed or refused stop request never ends the attempt."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "STOP_RESEND_INTERVAL", 0.02)
+    transport = ScriptedTransport(dev_started=True)
+    failures = [lifecycle.TransientAvailabilityError("x"), lifecycle.LifecycleError("409")]
+
+    def flaky_stop(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/stop" and failures:
+            transport.calls.append(f"{method} {path}")
+            raise failures.pop(0)
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", flaky_stop)
+    lifecycle.restore(transport, snapshot(), time.monotonic() + 5)
+    assert transport.dev_started is False
+    assert transport.calls.count(f"POST /addons/{DEV}/stop") == 3
+
+
+def test_stop_is_sent_even_when_observations_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unreadable state is not a reason to withhold the stop."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "STOP_RESEND_INTERVAL", 0.02)
+    transport = ScriptedTransport(dev_started=True)
+    failures = [3]
+
+    def broken_reads(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info" and failures[0]:
+            failures[0] -= 1
+            raise lifecycle.LifecycleError("Supervisor returned an unsuccessful HTTP status")
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", broken_reads)
+    lifecycle.restore(transport, snapshot(), time.monotonic() + 5)
+    assert transport.calls.index(f"POST /addons/{DEV}/stop") == 0
+    assert transport.dev_started is False
+
+
+def test_restore_fails_after_stop_when_captured_facts_drifted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drifted catalog or image still stops DEV but can never verify."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    transport = ScriptedTransport(dev_started=True)
+    transport.dev_version = "2.11.0.dev9"
+    with pytest.raises(lifecycle.LifecycleError, match="version changed"):
+        lifecycle.restore(transport, snapshot(), time.monotonic() + 5)
+    assert transport.dev_started is False
 
 
 @pytest.mark.parametrize("state", ["startup", "error", "unknown"])
@@ -266,7 +361,7 @@ def test_restore_sends_stop_from_any_non_stopped_state(
     monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
     """`startup`/`error`/`unknown` within the window still get a stop, then an observation."""
-    monkeypatch.setattr(lifecycle, "STOP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
     transport = ScriptedTransport(dev_started=True)
     observations = [state, state, "stopped"]
 
@@ -291,7 +386,7 @@ def test_restore_sends_stop_from_any_non_stopped_state(
 
 def test_restore_retries_transient_reads_until_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
     """A transient Supervisor failure is retried inside the budget, not treated as stopped."""
-    monkeypatch.setattr(lifecycle, "STOP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
     transport = ScriptedTransport(dev_started=True)
     failures = [2]
 
@@ -317,20 +412,44 @@ def test_watchdog_records_an_unavailable_lock_as_failure(
         run_dir / "watchdog.json",
         {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time()},
     )
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
     transport = ScriptedTransport(dev_started=True)
     with (
         lifecycle._mutation_lock(tmp_path, time.monotonic() + 5),
-        pytest.raises(lifecycle.LifecycleError, match="deadline expired"),
+        pytest.raises(lifecycle.LifecycleError, match="mutation lock unavailable"),
     ):
         lifecycle.watchdog(tmp_path, state.run_id, transport)
     receipt = json.loads((run_dir / "receipt.json").read_text())
     assert receipt["verified"] is False
     assert receipt["status"].startswith("mutation lock unavailable")
-    assert transport.calls == []
-    # once the lock frees, the same run still stops DEV and promotes its receipt
-    lifecycle.watchdog(tmp_path, state.run_id, transport)
+    # safety over serialization: DEV was still stopped, unlocked
     assert transport.dev_started is False
+    assert f"POST /addons/{DEV}/stop" in transport.calls
+    # once the lock frees, the same run verifies and promotes its receipt
+    lifecycle.watchdog(tmp_path, state.run_id, transport)
     assert lifecycle._has_verified_receipt(run_dir, state) is True
+
+
+def test_unsafe_lock_file_is_a_lock_failure_that_still_stops_dev(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group-readable or redirected lock cannot be trusted, but DEV is still stopped."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    lifecycle._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time()},
+    )
+    (tmp_path / "mutation.lock").touch(mode=0o644)
+    transport = ScriptedTransport(dev_started=True)
+    with pytest.raises(lifecycle.LifecycleError, match="mutation lock unavailable"):
+        lifecycle.watchdog(tmp_path, state.run_id, transport)
+    assert transport.dev_started is False
+    (tmp_path / "mutation.lock").unlink()
+    (tmp_path / "watchdog.lock").symlink_to(tmp_path / "snapshot.json")
+    with pytest.raises(lifecycle.LockUnavailableError):
+        lifecycle._acquire_watchdog_lease(tmp_path)
 
 
 def test_stop_gets_a_full_budget_after_the_lock(
@@ -344,15 +463,23 @@ def test_stop_gets_a_full_budget_after_the_lock(
         {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time()},
     )
     transport = ScriptedTransport(dev_started=True)
-    lock = lifecycle._mutation_lock(tmp_path, time.monotonic() + 5)
-    lock.__enter__()
-    release = threading.Timer(0.5, lambda: lock.__exit__(None, None, None))
-    release.start()
+    released = threading.Event()
+
+    def hold_lock() -> None:
+        with lifecycle._mutation_lock(tmp_path, time.monotonic() + 5):
+            time.sleep(0.5)
+        released.set()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    time.sleep(0.05)
     try:
         monkeypatch.setattr(lifecycle, "RESTORE_TIMEOUT", 0.2)
+        monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
         lifecycle.watchdog(tmp_path, state.run_id, transport)
     finally:
-        release.join()
+        holder.join()
+    assert released.is_set()
     assert transport.dev_started is False
     assert lifecycle._has_verified_receipt(run_dir, state) is True
 
@@ -374,26 +501,30 @@ def test_restore_rejects_expired_deadline_before_any_request() -> None:
     assert transport.calls == []
 
 
-def test_path_allowlist_has_no_stock_store_or_core_paths() -> None:
+def test_request_allowlist_has_no_stock_store_or_core_requests() -> None:
     """Structural office/stock exclusion: the transport cannot address anything else."""
     transport = lifecycle.SupervisorTransport("private-token", time.monotonic() + 5)
-    for path in (
-        f"/addons/{STOCK}/info",
-        f"/addons/{STOCK}/start",
-        f"/addons/{DEV}/install",
-        f"/addons/{DEV}/restart",
-        f"/addons/{DEV}/options",
-        "/store/addons",
-        f"/store/addons/{STOCK}/install",
-        "/core/api/states/media_player.officepod",
-        "/core/api/services/media_player/join",
-        "/addons/",
-        "/addons/x",
+    for method, path in (
+        ("GET", f"/addons/{STOCK}/info"),
+        ("POST", f"/addons/{STOCK}/start"),
+        ("POST", f"/addons/{DEV}/install"),
+        ("POST", f"/addons/{DEV}/restart"),
+        ("POST", f"/addons/{DEV}/options"),
+        ("GET", "/store/addons"),
+        ("POST", f"/store/addons/{STOCK}/install"),
+        ("GET", "/core/api/states/media_player.officepod"),
+        ("POST", "/core/api/services/media_player/join"),
+        ("GET", "/addons/"),
+        ("GET", "/addons/x"),
+        ("DELETE", "/addons"),
+        # the pairing matters: no GET on a mutation, no POST on a read
+        ("POST", "/addons"),
+        ("POST", f"/addons/{DEV}/info"),
+        ("GET", f"/addons/{DEV}/start"),
+        ("GET", f"/addons/{DEV}/stop"),
     ):
-        with pytest.raises(lifecycle.LifecycleError, match="invalid fixed API path"):
-            transport.request("GET", path)
-    with pytest.raises(lifecycle.LifecycleError, match="invalid fixed API path"):
-        transport.request("DELETE", "/addons")
+        with pytest.raises(lifecycle.LifecycleError, match="invalid fixed API request"):
+            transport.request(method, path)
 
 
 # --- Persistence, arming and receipts -----------------------------------------------------
@@ -473,15 +604,80 @@ def test_arm_rejects_stale_snapshot_bad_timeout_and_completed_run(
     assert not (run_dir / "watchdog.json").exists()
 
 
-def test_arm_requires_token_outside_self_test(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("token", [None, "", "a\nb"])
+def test_arm_requires_a_usable_token_outside_self_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str | None
 ) -> None:
-    """A live watchdog cannot be armed without the Supervisor token."""
-    monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+    """A live watchdog cannot be armed with a token the transport would later reject."""
+    if token is None:
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("SUPERVISOR_TOKEN", token)
     state = snapshot()
-    lifecycle.save_snapshot(tmp_path, state)
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
     with pytest.raises(lifecycle.LifecycleError, match="SUPERVISOR_TOKEN"):
         lifecycle.arm_watchdog(tmp_path, state.run_id, 10)
+    assert not (run_dir / "watchdog.json").exists()
+
+
+def test_arm_rejects_future_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snapshot from the future is as untrustworthy as a stale one."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "private-token")
+    state = snapshot(created_at=time.time() + 30)
+    lifecycle.save_snapshot(tmp_path, state)
+    with pytest.raises(lifecycle.LifecycleError, match="too old"):
+        lifecycle.arm_watchdog(tmp_path, state.run_id, 10)
+
+
+def test_arm_holds_the_mutation_lock_through_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`start` cannot observe the parent's lease before the child exists."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "private-token")
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    observed: list[bool] = []
+
+    def spawn_probe(*_args: Any, **_kwargs: Any) -> int:
+        lock = lifecycle._open_lock(tmp_path, "mutation.lock")
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                observed.append(True)
+            else:
+                observed.append(False)
+        finally:
+            os.close(lock)
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(os, "posix_spawn", spawn_probe)
+    with pytest.raises(OSError, match="spawn failed"):
+        lifecycle.arm_watchdog(tmp_path, state.run_id, 10)
+    assert observed == [True]
+    # the lease was released with the failed spawn, so start is refused
+    with pytest.raises(lifecycle.LifecycleError, match="no live watchdog"):
+        lifecycle._require_armed(tmp_path, run_dir, state)
+
+
+def test_watchdog_wakes_early_after_a_manual_verified_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual stop settles the run; the sleeping child exits instead of holding the lease."""
+    monkeypatch.setattr(lifecycle, "WATCHDOG_WAKE_INTERVAL", 0.02)
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    lifecycle._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time() + 5},
+    )
+    transport = ScriptedTransport(dev_started=True)
+    threading.Timer(0.1, lambda: lifecycle.settle(tmp_path, run_dir, state, transport)).start()
+    started = time.monotonic()
+    lifecycle.watchdog(tmp_path, state.run_id, ScriptedTransport(dev_started=True))
+    assert time.monotonic() - started < 2
+    assert transport.dev_started is False
 
 
 @contextmanager
@@ -583,6 +779,37 @@ def test_main_start_is_gated_before_any_request(
     assert transport.dev_started is True
 
 
+def test_main_start_is_serialized_by_the_mutation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held mutation lock blocks `start` until its budget ends, with no request sent."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "private-token")
+    monkeypatch.setattr(lifecycle, "RESTORE_TIMEOUT", 0.2)
+    transport = ScriptedTransport()
+    monkeypatch.setattr(lifecycle, "SupervisorTransport", lambda *_args: transport)
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    lifecycle._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time() + 60},
+    )
+    with (
+        _held_lease(tmp_path, {"run_id": state.run_id, "nonce": state.nonce}),
+        lifecycle._mutation_lock(tmp_path, time.monotonic() + 5),
+    ):
+        assert lifecycle.main(["start", "--root", str(tmp_path), "--run", state.run_id]) == 1
+    assert transport.calls == []
+
+
+def test_supervisor_transport_treats_5xx_as_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A busy Supervisor is retried by the stop loop, not recorded as a hard failure."""
+    with _fixed_http_server({"/addons": (503, b'{"result":"error"}')}) as (base_url, _calls):
+        monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
+        transport = lifecycle.SupervisorTransport("private-token", time.monotonic() + 5)
+        with pytest.raises(lifecycle.TransientAvailabilityError):
+            transport.request("GET", "/addons")
+
+
 def test_watchdog_deadline_is_bounded(tmp_path: Path) -> None:
     """A hand-edited far-future deadline cannot stretch the sleep or the start window."""
     state = snapshot()
@@ -604,7 +831,7 @@ def test_watchdog_rejects_wrong_owner_and_writes_failure_receipt(
 ) -> None:
     """A foreign nonce never runs; a failed stop leaves a failed receipt that stays failed."""
     monkeypatch.setattr(lifecycle, "RESTORE_TIMEOUT", 0.3)
-    monkeypatch.setattr(lifecycle, "STOP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
     state = snapshot()
     run_dir = lifecycle.save_snapshot(tmp_path, state)
     lifecycle._write_json_exclusive(

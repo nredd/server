@@ -376,11 +376,15 @@ standalone on the SSH app's Python 3.13 with stdlib plus native `/usr/bin/curl`,
 never imports or calls the historical helper, whose bundles, receipts and failures stay as
 they are.
 
-What it can and cannot do is fixed by its path allowlist: `GET /addons`,
-`GET/POST /addons/<DEV>/info|start|stop`. There is no stock path, no `/store` path and no
-Core API path, so it cannot install or start stock, reload an HA entry, or group, play,
-stop or set volume on ANY player. Office and historical-group exclusion are therefore
-structural, not runtime checks.
+What it can and cannot do is fixed by its method/path allowlist: `GET /addons`,
+`GET /addons/<DEV>/info`, `POST /addons/<DEV>/start`, `POST /addons/<DEV>/stop`. There is
+no stock path, no `/store` path and no Core API path, so it cannot install or start stock,
+reload an HA entry, or group, play, stop or set volume on ANY player. Office and
+historical-group exclusion are therefore structural, not runtime checks.
+
+Copy the reviewed script to the SSH add-on, verify its SHA-256 against the external
+receipt for the reviewed commit, and set `LIFECYCLE_SCRIPT` to that verified absolute
+path, exactly as for the historical helper. The receipt binding lives outside this repo.
 
 Stock absence is a fact about the COMPLETE installed-app catalog (`GET /addons`), validated
 as a non-empty list of entries with string `slug`/`state`/`version` and unique slugs. The
@@ -402,22 +406,28 @@ python3 "$LIFECYCLE_SCRIPT" self-test            # fake transport only, no HAOS 
 `capture` stores only the sorted installed slugs and DEV version under a fresh UUID with
 `0700`/`0600` permissions. `arm` detaches the same `posix_spawn` watchdog as before (only
 `SUPERVISOR_TOKEN` in its environment, one application-wide lease, timeout bounded to one
-hour). The held lease is written with the run's id and nonce. `start` requires that exact
-run to be armed and unexpired, receipt-free and not a self-test run, AND proves a child
-still holds the lease for this run (a `watchdog.json` left by a failed spawn or a dead
-child is refused). It then re-reads the facts, refuses any catalog or DEV version drift,
-requires DEV `stopped`, and only then requests the start, which must be confirmed by
-observation.
+hour). `arm` holds the mutation lock from the lease write through the spawn, and the
+held lease is written with the run's id and nonce. `start` runs under the same mutation
+lock and requires that exact run to be armed and unexpired, receipt-free and not a
+self-test run, AND proves a child still holds the lease for this run (a `watchdog.json`
+left by a failed spawn or a dead child is refused). It then re-reads the facts, refuses
+any catalog or DEV version drift, requires DEV `stopped`, and only then requests the
+start. `startup` is pending; only an observed `started` within the 90-second budget
+confirms it, and `error` or anything else fails.
 
 The watchdog/`stop` path stops DEV FIRST, before any catalog check, so a drifted catalog
-(even stock reappearing) can never leave DEV running. Any observed state other than
-exact `stopped` (`started`, `startup`, `error`, `unknown`) gets a stop request and is then
-re-observed; transient Supervisor failures are retried inside the budget. A stop response
-is not stop evidence: an observation must read exactly `stopped`. Waiting for the
-mutation lock has its own ten-minute budget and the stop gets a full 90-second budget only
-after the lock is held, so a slow `start` cannot starve it; a lock that never frees is
-recorded as a failed receipt. Only after the stop is stock absence re-verified against
-the captured facts. The receipt is `verified: true` with the fixed status
+(even stock reappearing) can never leave DEV running. Every observation that is not
+exactly `stopped` (`started`, `startup`, `error`, `unknown`, or a failed read) gets a
+stop request, re-sent every five seconds until the budget ends; HTTP 5xx/429 and curl
+transport failures are transient and retried, a refused stop is simply re-sent. A stop
+response is not stop evidence: an observation must read exactly `stopped`. Waiting for
+the mutation lock has its own ten-minute budget and the stop gets a full 90-second budget
+only after the lock is held, so a slow `start` cannot starve it. If the lock cannot be
+opened, validated or acquired in time, the stop is still attempted UNLOCKED (it is
+idempotent and safety wins over serialization) and the lock failure is the recorded
+failed receipt. A sleeping watchdog wakes every five seconds and exits early once a
+manual `stop` has verified its run, releasing the lease. Only after the stop is stock
+absence re-verified against the captured facts. The receipt is `verified: true` with the fixed status
 `DEV stopped and stock absence re-verified; nothing else touched` only when both hold;
 any other outcome writes a failed receipt. The first failure stays the evidence of
 record (a repeat failure neither replaces it nor raises a conflict); it is archived as
@@ -428,12 +438,14 @@ capture a fresh UUID.
 None of this authorizes a launch. `launch_authorized` in the pin stays false, main-only
 isolation is unproven on hardware, and the owner must approve a fresh window.
 
-## Historical recovery controller (stock-present, retired)
+## Private recovery controller
 
-`scripts/private_airplay_recovery.py` is private HAOS recovery tooling for the EARLIER
-stock-installed state. Do not arm it while stock is absent: its capture preflight fails
-closed on the missing stock app, and its restore path would start stock and restore HA
-groups, both of which are now forbidden. It uses the Python
+RETIRED for the stock-absent state: this controller belongs to the EARLIER stock-installed
+state. Do not arm it while stock is absent: its capture preflight fails closed on the
+missing stock app, and its restore path would start stock and restore HA groups, both of
+which are now forbidden. The text below is kept as it was.
+
+`scripts/private_airplay_recovery.py` is private HAOS recovery tooling. It uses the Python
 stdlib and installed native `/usr/bin/curl`, only the SSH add-on's `SUPERVISOR_TOKEN`,
 and fixed add-on slugs and target entity
 IDs. It never accepts an API host, endpoint, credential, media URL, queue, or raw add-on
