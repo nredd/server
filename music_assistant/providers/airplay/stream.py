@@ -111,6 +111,10 @@ _STDIN_DRAIN_TIMEOUT: Final[float] = 2.0
 # Keep the private ACK validator on stdout through graceful EOF before raw process
 # cleanup takes over. Never wait from stderr: rejection cleanup itself joins stderr.
 _CAPTURE_STDOUT_TIMEOUT: Final[float] = 2.0
+# One deadline for the whole demoted (forced -> graceful) stop while a capture is live:
+# STOP, stdin EOF, the stdout tail and the normal close. Past it the child is killed, so
+# a paused transport that never drains cannot hold the player lock.
+_CAPTURE_GRACEFUL_STOP_TIMEOUT: Final[float] = 6.0
 
 
 @dataclass(frozen=True)
@@ -491,10 +495,22 @@ class AirPlayStream:
         Stop playback and cleanup.
 
         :param force: If True, immediately kill the process without graceful shutdown.
+            Demoted to a graceful stop while a private capture is live on the current
+            child: every ordinary stop path forces, and a forced kill can never yield a
+            valid capture record. The demoted path runs under one deadline
+            (`_CAPTURE_GRACEFUL_STOP_TIMEOUT`) and falls back to the kill past it.
         """
         async with self._stop_lock:
             if self._cleanup_complete:
                 return
+            demoted = (
+                force
+                and self.native_volume_capture is not None
+                and self._cli_proc is not None
+                and not self._cli_proc.closed
+            )
+            if demoted:
+                force = False
             await self.session_volume.close()
             self._stopping = True
             self._teardown_started.set()
@@ -510,32 +526,31 @@ class AirPlayStream:
                         # Private capture must validate the stdout tail before process
                         # close can drain it raw, including ACKs queued during STOP.
                         stdout_reader_task = self._stdout_reader_task
-                        if force and self.native_volume_capture:
+                        # A kill is only evidence of a kill when one is actually sent; a
+                        # child that already exited keeps whatever record it earned.
+                        if (
+                            force
+                            and self.native_volume_capture
+                            and self._cli_proc
+                            and not self._cli_proc.closed
+                        ):
                             self.native_volume_capture.mark_force_killed()
                             self.native_volume_capture.end(self._cli_proc, "force-killed")
-                        if (
-                            self.native_volume_capture
-                            and not force
-                            and self._cli_proc
-                            and stdout_reader_task
-                        ):
-                            await self._cli_proc.write_eof()
-                            await asyncio.wait(
-                                (stdout_reader_task,), timeout=_CAPTURE_STDOUT_TIMEOUT
-                            )
-                        if stdout_reader_task and not stdout_reader_task.done():
-                            stdout_reader_task.cancel()
-                            with suppress(asyncio.CancelledError):
-                                await stdout_reader_task
                         try:
                             if force:
-                                if self._cli_proc and not self._cli_proc.closed:
-                                    await self._cli_proc.kill()
+                                await self._kill_child(stdout_reader_task)
+                            elif demoted:
+                                try:
+                                    async with asyncio.timeout(_CAPTURE_GRACEFUL_STOP_TIMEOUT):
+                                        await self._graceful_close(stdout_reader_task)
+                                except TimeoutError:
+                                    self.player.logger.warning(
+                                        "Graceful capture stop timed out on %s; killing",
+                                        self.player.player_id,
+                                    )
+                                    await self._kill_child(stdout_reader_task)
                             else:
-                                if self._cli_proc:
-                                    await self._cli_proc.write_eof()
-                                if self._cli_proc and not self._cli_proc.closed:
-                                    await self._cli_proc.close()
+                                await self._graceful_close(stdout_reader_task)
                         finally:
                             if (
                                 self.native_volume_capture
@@ -1049,6 +1064,31 @@ class AirPlayStream:
                 await self._render_and_send_artwork(
                     artwork_url, metadata_generation, artwork_render
                 )
+
+    async def _kill_child(self, stdout_reader_task: asyncio.Task[None] | None) -> None:
+        """Cancel the stdout reader and kill the child immediately."""
+        if stdout_reader_task and not stdout_reader_task.done():
+            stdout_reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stdout_reader_task
+        if self._cli_proc and not self._cli_proc.closed:
+            await self._cli_proc.kill()
+
+    async def _graceful_close(self, stdout_reader_task: asyncio.Task[None] | None) -> None:
+        """Send stdin EOF, let a live capture validate the stdout tail, then close the child."""
+        # Private capture must validate the stdout tail before process close can drain it
+        # raw, including ACKs queued during STOP.
+        if self.native_volume_capture and self._cli_proc and stdout_reader_task:
+            await self._cli_proc.write_eof()
+            await asyncio.wait((stdout_reader_task,), timeout=_CAPTURE_STDOUT_TIMEOUT)
+        if stdout_reader_task and not stdout_reader_task.done():
+            stdout_reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stdout_reader_task
+        if self._cli_proc:
+            await self._cli_proc.write_eof()
+        if self._cli_proc and not self._cli_proc.closed:
+            await self._cli_proc.close()
 
     def _radio_station_title(self, metadata: PlayerMedia) -> str | None:
         """Return the active radio station name only for this queue item and session."""
