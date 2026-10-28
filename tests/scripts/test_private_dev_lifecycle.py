@@ -110,8 +110,13 @@ def test_facts_reject_stock_present_or_dev_absent() -> None:
         lifecycle.read_facts(ScriptedTransport(slugs=(DEV, STOCK)))
     with pytest.raises(lifecycle.LifecycleError, match="DEV app is not installed"):
         lifecycle.read_facts(ScriptedTransport(slugs=("core_ssh",)))
-    with pytest.raises(lifecycle.LifecycleError, match="unexpected Music Assistant"):
-        lifecycle.read_facts(ScriptedTransport(slugs=(DEV, "local_music_assistant")))
+    # a sibling MA app is tolerated only while the catalog shows it stopped
+    sibling = ScriptedTransport(slugs=(DEV, "local_music_assistant_dev"))
+    assert lifecycle.read_facts(sibling).installed_slugs == (DEV, "local_music_assistant_dev")
+    for state in ("started", "startup", "error", "unknown"):
+        sibling.sibling_state = state
+        with pytest.raises(lifecycle.LifecycleError, match="another Music Assistant app"):
+            lifecycle.read_facts(sibling)
 
 
 @pytest.mark.parametrize(
@@ -304,6 +309,27 @@ def test_restore_stops_dev_first_even_if_stock_reappeared() -> None:
         lifecycle.restore(transport, snapshot(), time.monotonic() + 5)
     assert transport.dev_started is False
     assert transport.calls.index(f"POST /addons/{DEV}/stop") < transport.calls.index("GET /addons")
+
+
+def test_sibling_started_mid_window_still_stops_dev_but_never_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sibling that comes back during the window cannot leave DEV running or verify."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    state = snapshot(installed_slugs=("core_ssh", DEV, "local_music_assistant_dev"))
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    transport = ScriptedTransport(
+        dev_started=True, slugs=(DEV, "core_ssh", "local_music_assistant_dev")
+    )
+    transport.sibling_state = "started"
+    with pytest.raises(lifecycle.LifecycleError, match="another Music Assistant app"):
+        lifecycle.settle(tmp_path, run_dir, state, transport)
+    assert transport.dev_started is False
+    assert transport.calls.index(f"POST /addons/{DEV}/stop") < transport.calls.index("GET /addons")
+    assert json.loads((run_dir / "receipt.json").read_text())["verified"] is False
+    transport.sibling_state = "stopped"
+    lifecycle.settle(tmp_path, run_dir, state, transport)
+    assert lifecycle._has_verified_receipt(run_dir, state) is True
 
 
 def test_restore_is_idempotent_and_touches_nothing_else() -> None:
