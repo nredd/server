@@ -20,6 +20,7 @@ from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.providers.airplay import provider as provider_module
+from music_assistant.providers.airplay import stream as stream_module
 from music_assistant.providers.airplay import trial_binary as trial
 from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
@@ -437,6 +438,60 @@ async def test_forced_stop_with_live_capture_keeps_a_clean_exit_valid(
     child.close.assert_awaited_once()
     assert capture.diagnostics()["record_valid"] is True
     assert "incomplete" not in capture.diagnostics()
+
+
+async def test_forced_stop_on_an_exited_child_keeps_its_record(
+    airplay_provider: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that already exited is not relabelled force-killed by a later forced stop."""
+    stream = _make_stream(airplay_provider)
+    child = MagicMock(closed=True, returncode=0, write_eof=AsyncMock(), kill=AsyncMock())
+    child.close = AsyncMock()
+    stream._cli_proc = child
+    capture = stream.native_volume_capture = PrivateVolumeCapture()
+    capture.trust(child)
+    assert capture.consume_stderr(child, _SUMMARY)
+    capture.end(child, "missing-summary")
+    assert capture.diagnostics()["record_valid"] is True
+    monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
+    monkeypatch.setattr(stream, "_write_cli_command", AsyncMock(return_value=True))
+    await stream.stop(force=True)
+    child.kill.assert_not_awaited()
+    assert capture.diagnostics()["record_valid"] is True
+    assert "incomplete" not in capture.diagnostics()
+
+
+async def test_demoted_stop_falls_back_to_kill_when_eof_never_drains(
+    airplay_provider: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused transport that never drains cannot hang the teardown past the deadline."""
+    monkeypatch.setattr(stream_module, "_CAPTURE_GRACEFUL_STOP_TIMEOUT", 0.2)
+    stream = _make_stream(airplay_provider)
+    child = MagicMock(closed=False, returncode=None)
+    child.write_eof = AsyncMock(side_effect=lambda: asyncio.Event().wait())
+
+    async def killed() -> None:
+        child.closed = True
+        child.returncode = -9
+
+    child.kill = AsyncMock(side_effect=killed)
+    child.close = AsyncMock()
+    stream._cli_proc = child
+
+    async def never() -> None:
+        await asyncio.Event().wait()
+
+    stream._stdout_reader_task = asyncio.create_task(never())
+    capture = stream.native_volume_capture = PrivateVolumeCapture()
+    capture.trust(child)
+    assert capture.consume_stderr(child, _SUMMARY)
+    monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
+    monkeypatch.setattr(stream, "_write_cli_command", AsyncMock(return_value=True))
+    await asyncio.wait_for(stream.stop(force=True), 3)
+    child.kill.assert_awaited_once()
+    child.close.assert_not_awaited()
+    assert capture.diagnostics()["record_valid"] is False
+    assert capture.diagnostics()["incomplete"] == "force-killed"
 
 
 async def test_forced_stop_without_capture_still_kills(

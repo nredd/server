@@ -117,8 +117,12 @@ fallback, the Sendspin bridge) calls `AirPlayStream.stop(force=True)`, and the l
 capture window on 2026-10-28 proved that a forced kill therefore made EVERY record
 `incomplete: force-killed`. `stop` now demotes `force` to the graceful path while a
 private capture is live on the current child: `ACTION=STOP`, stdin EOF, the bounded
-stdout tail, then the normal close with its own escalation. Outside a capture the forced
-path is unchanged. The close escalation can still SIGKILL a stuck child, and that still
+stdout tail, then the normal close, all under one six-second deadline
+(`_CAPTURE_GRACEFUL_STOP_TIMEOUT`) after which the child is killed, so a paused
+transport that never drains its EOF cannot hold the player lock. Outside a capture the
+forced path is unchanged. A `force-killed` label is written only when a kill is actually
+sent to a live child; a child that already exited keeps the record it earned. The close
+escalation and the deadline fallback can still SIGKILL a stuck child, and that still
 invalidates the record, so this is a bounded preference, not a guarantee.
 
 A valid final record is historical observation from the exact acknowledged child, not
