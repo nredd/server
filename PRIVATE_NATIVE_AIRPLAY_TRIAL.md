@@ -215,19 +215,34 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
   and run without the shared clock; that is the intended consequence of refusing an
   unattested gate, not a regression to work around.
 
-`scripts/private_trial_window.sh` is the operator wizard for one live window. The CLI pin
-is hardcoded in it and compared mechanically against the asset on the host plus its
-`--check` label; a stale `.env` can never select another asset. It then: requires the
-by-hand sibling stop via `preflight`; starts `tcpdump` on `end0` keyed on the office pod
-and office TV MACs (`ether host`, so IPv4, IPv6 and link-local alike), unicast only, and
-proves the filter can see office traffic with a two-ping control probe before the window
-epoch; runs lifecycle capture/arm/start; has the operator set the target on the private
-port and reload AirPlay; collects the readiness receipt; stops DEV; and prints the
-verdict as every frame after the window epoch. A failed isolation or readiness answer
-skips playback and goes straight to stop. An `EXIT` trap stops DEV (receipted,
-idempotent) and the capture on any abort. The acceptance criterion is `COUNT 0`; any
-frame is not a clean pass, though its source port/process must be read before calling
-it a DEV violation.
+`scripts/private_trial_window.sh` is the operator wizard for one live window, shaped by
+the first live runs on 2026-10-28. It verifies the CLI pin (hardcoded) against the asset
+on the host and its `--check` label, and requires the DEV add-on's `server_repo` option to
+equal the running checkout's `HEAD` with `boot: manual`, watchdog off and protection on:
+the add-on source-installs that option at startup, and a stale pin once ran a build
+without the admission seams against the office pod. It requires the by-hand sibling stop
+via `preflight`; resolves the office pod's Ethernet MAC from the kernel neighbour table
+(the mDNS device id `fa:38:…` is NOT the link MAC `40:ed:…`, which a control probe
+exposed); records a DEV-stopped baseline because HA Core itself talks HomeKit to the pod
+over IPv6 continuously; starts `tcpdump` on `end0` keyed on that MAC plus the office IPs,
+unicast only; proves the filter with a one-ping control probe before the window epoch;
+runs lifecycle capture/arm/start; waits for the private API; checks that no AirPlay
+player registered without a target; onboards or logs in; saves `private_trial_target`
+and reloads AirPlay through the API; requires `players/all` to list exactly
+`ap323e659fe4e1`; prints the readiness receipt; optionally plays a stream to main-pod;
+stops DEV; and prints the verdict as baseline-subtracted flows after the epoch with
+explicit `HOST_TO_OFFICE_IPV4` and `AIRPLAY_PORTS` counts. A failed fail-closed, isolation
+or readiness check skips playback and goes straight to stop. An `EXIT` trap stops DEV
+(receipted, idempotent) and the capture on any abort. Acceptance: both counts zero and no
+non-baseline flow from the host except the control-probe ARP in the first second.
+
+Live results 2026-10-28 (evidence `/data/airplay-native-probe/WINDOW_EVIDENCE_20261028.json`
+on the host, pcaps 0600): the old `13df592bf` source registered office-pod and hit it on
+tcp/7000 and 49153 (295 frames); `9b6639899` with no target registered no AirPlay player
+and sent nothing; `9b6639899` with the target registered exactly main-pod, attested
+`v0531c6c` with `ptp_ready` true, played AirPlay 2 realtime/PTP audio to main-pod for
+about 75 s, and sent zero frames to the office devices beyond the control ARP. The
+capture flag and HomePod-remote admission were off, so `playing_ready` stayed false.
 
 Admission is a per-record/per-id filter on this application's own traffic. It is not a
 network sandbox, does not stop receivers from multicasting to this host and does not prove

@@ -182,33 +182,34 @@ finish() {
 # ──────────────────────────────────────────────────────────────────────────
 # STAGES: private native AirPlay trial live window (main pod ONLY).
 # Private trial tooling, never upstream. Runs on the operator's Mac; every HAOS
-# action is a plain `ssh home` the operator can read before it runs.
+# action is a plain `ssh home` the operator can read before it runs. The trial
+# API calls go to the private port with a token this wizard obtains itself.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=10
+TOTAL_STAGES=12
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
-mkdir -p "$(dirname "$ENV_FILE")"
+mkdir -p "$(dirname "$ENV_FILE")"; chmod 700 "$(dirname "$ENV_FILE")"
 
 HOST=home
-# Pins are hardcoded on purpose: a stale .env value can never select another asset.
+# Pins are hardcoded or derived from this checkout on purpose: a stale .env value
+# can never select another asset or source.
 PINNED_CLI_SHA=0d069870df129136eb5c52ee41e665124c62e2b37231acee02676b1c2144de47
 PINNED_CLI_LABEL=v0531c6c
+SERVER_SHA=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
+DEV=d5369777_music_assistant_dev
 MAIN_POD_TARGET="323e659fe4e1@main-pod"
-MAIN_POD_IP=192.168.40.99
-OFFICE_POD_MAC=fa:38:11:2b:21:1f
-OFFICE_TV_MAC=42:af:ee:02:fc:bb
+MAIN_POD_PLAYER="ap323e659fe4e1"
+OFFICE_POD_IP=192.168.40.24
+OFFICE_TV_IPS="192.168.40.252 192.168.1.131"
 HAOS_IP=192.168.40.180
 TRIAL_API="http://${HAOS_IP}:18095"
 PROBE_DIR=/data/airplay-native-probe
 ASSET_ROOT=/media/.native-airplay
-# Capture is keyed on the office devices' MACs (IPv4, IPv6 and link-local alike),
-# unicast only. Multicast mDNS/PTP is advertisement, not a directed packet.
-CAP_FILTER="(ether host $OFFICE_POD_MAC or ether host $OFFICE_TV_MAC) and not multicast and not broadcast"
+BASELINE_SECONDS=60
 
 remote() { ssh "$HOST" "$@"; }
-CAP=""
-RUN_ID=""
-ABORTED=0
+sup() { remote "curl -s -H 'Authorization: Bearer \$SUPERVISOR_TOKEN' $*"; }
+CAP=""; CAP_FILE=""; RUN_ID=""; ABORTED=0; TRIAL_TOKEN=""
 
 # Whatever happens to this shell: stop DEV (idempotent, receipted) and stop tcpdump.
 cleanup() {
@@ -216,12 +217,15 @@ cleanup() {
   [[ -n "$CAP" ]] && remote "kill \$(cat $CAP.pid 2>/dev/null) 2>/dev/null" || true
 }
 trap cleanup EXIT
-
 fail() { warn "$1"; exit 1; }
+api() {
+  curl -s -m 30 -X POST "$TRIAL_API/api" -H "Authorization: Bearer $TRIAL_TOKEN" \
+    -H 'Content-Type: application/json' -d "$1"
+}
 
 # ── 1 ─────────────────────────────────────────────────────────────────────
-stage "Verify the pinned artifacts on HAOS"
-say "CLI pin: $PINNED_CLI_SHA ($PINNED_CLI_LABEL). Nothing here downloads or builds."
+stage "Verify the pinned artifacts and the add-on source"
+say "CLI pin: $PINNED_CLI_SHA ($PINNED_CLI_LABEL). Server source: this checkout, $SERVER_SHA."
 ask LIFECYCLE_SHA "SHA-256 of the reviewed private_dev_lifecycle.py (from its receipt):"
 ask WINDOW_SECONDS "Window length in seconds (watchdog timeout, max 3600):"
 write_env LIFECYCLE_SHA "$LIFECYCLE_SHA"
@@ -234,8 +238,14 @@ CLI_ON_HOST=$(remote "sha256sum $ASSET_ROOT/$PINNED_CLI_SHA/cliairplay-linux-aar
 [[ "$CLI_ON_HOST" == "$PINNED_CLI_SHA" ]] || fail "Pinned CLI asset missing or SHA mismatch on the box ($CLI_ON_HOST)."
 CHECK=$(remote "$ASSET_ROOT/$PINNED_CLI_SHA/cliairplay-linux-aarch64 --check 2>&1")
 [[ "$CHECK" == *"cliairplay $PINNED_CLI_LABEL check"* ]] || fail "--check did not report $PINNED_CLI_LABEL: $CHECK"
+# The add-on source-installs whatever server_repo says at startup. A stale pin here
+# runs code without the admission seams (this is exactly what happened once).
+ADDON_REPO=$(sup "http://supervisor/addons/$DEV/info" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["options"].get("server_repo",""), d["boot"], d["watchdog"], d["protected"])')
+[[ "$ADDON_REPO" == "nredd/server@$SERVER_SHA manual False True" ]] \
+  || fail "DEV add-on is not pinned to this checkout with boot manual/watchdog off/protected: $ADDON_REPO"
 say "lifecycle: $LIFECYCLE_SCRIPT"
 say "cli: $CHECK"
+say "add-on: nredd/server@$SERVER_SHA, boot manual, watchdog off, protected"
 pause
 
 # ── 2 ─────────────────────────────────────────────────────────────────────
@@ -249,25 +259,40 @@ pause "Press Enter once both siblings are stopped"
 remote "python3 $LIFECYCLE_SCRIPT preflight" || fail "preflight refused: the catalog is not stock-absent with siblings stopped."
 
 # ── 3 ─────────────────────────────────────────────────────────────────────
-stage "Start the packet capture and prove it can see the office devices"
-CAP="$PROBE_DIR/window-$(date +%Y%m%dT%H%M%S).pcap"
-CAP_FILE="$CAP"
-write_env CAPTURE_FILE "$CAP_FILE"
-remote "nohup tcpdump -i end0 -nn -U -w $CAP '$CAP_FILTER' >$CAP.log 2>&1 & echo \$! > $CAP.pid; sleep 2; cat $CAP.log; kill -0 \$(cat $CAP.pid)" \
-  || fail "tcpdump did not start or died; see $CAP.log"
-remote "grep -q 'listening on end0' $CAP.log" || fail "tcpdump is not listening on end0."
-say "Control probe: ONE ICMP echo from the HAOS host to each office device, so a later count of"
-say "zero is a measured zero. These two probes are the only intentional office packets and are"
-say "recorded in the control capture, not the window capture."
-confirm "Send the control probe (2 pings) now?" || fail "No control probe, no verdict. Aborting."
-CONTROL="$CAP.control"
-remote "tcpdump -i end0 -nn -U -w $CONTROL '$CAP_FILTER' >/dev/null 2>&1 & p=\$!; sleep 1; ping -c1 -W2 192.168.40.24 >/dev/null; ping -c1 -W2 192.168.40.252 >/dev/null; sleep 1; kill \$p; sleep 1; tcpdump -nn -r $CONTROL 2>/dev/null | wc -l"
-say "The control count above must be >= 2 (the filter sees office unicast). The window capture"
-say "in the background also saw them; the verdict subtracts nothing, so note the time: $(date +%T)."
-confirm "Control count >= 2?" || fail "The filter cannot see office traffic; a zero would be meaningless."
-WINDOW_START_EPOCH=$(date +%s)
+stage "Resolve the office devices' link-layer addresses"
+say "The AirPlay device id in mDNS (fa:38:11:2b:21:1f) is NOT the pod's Ethernet MAC. The filter"
+say "keys on the MAC the kernel actually resolves, so IPv4, IPv6 and link-local are all caught."
+OFFICE_POD_MAC=$(remote "ping -c1 -W2 $OFFICE_POD_IP >/dev/null; ip neigh show $OFFICE_POD_IP | awk '/lladdr/{print \$5}'")
+[[ "$OFFICE_POD_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || fail "Could not resolve office-pod MAC via ARP ($OFFICE_POD_MAC)."
+write_env OFFICE_POD_MAC "$OFFICE_POD_MAC"
+HOSTS="host $OFFICE_POD_IP"; for ip in $OFFICE_TV_IPS; do HOSTS="$HOSTS or host $ip"; done
+CAP_FILTER="(ether host $OFFICE_POD_MAC or $HOSTS) and not multicast and not broadcast"
+say "filter: $CAP_FILTER"
+pause
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
+stage "Record the DEV-stopped baseline"
+say "HA Core itself talks HomeKit to the pod over IPv6 all the time. $BASELINE_SECONDS s with DEV"
+say "stopped records those flows so the verdict can subtract them and judge only new flows."
+BASE="$PROBE_DIR/baseline-$(date +%Y%m%dT%H%M%S).pcap"
+remote "timeout $((BASELINE_SECONDS+2)) tcpdump -i end0 -nn -w $BASE '$CAP_FILTER' >/dev/null 2>&1; tcpdump -nn -r $BASE 2>/dev/null | awk '{print \$3\" > \"\$5}' | sort -u > $BASE.flows; wc -l < $BASE.flows"
+write_env BASELINE_FILE "$BASE"
+
+# ── 5 ─────────────────────────────────────────────────────────────────────
+stage "Start the packet capture and prove it can see the office pod"
+CAP="$PROBE_DIR/window-$(date +%Y%m%dT%H%M%S).pcap"; CAP_FILE="$CAP"
+write_env CAPTURE_FILE "$CAP_FILE"
+remote "printf '%s\n' '$CAP_FILTER' > $CAP.filter; nohup tcpdump -i end0 -nn -U -w $CAP '$CAP_FILTER' >$CAP.log 2>&1 & echo \$! > $CAP.pid; sleep 2; grep -q 'listening on end0' $CAP.log && kill -0 \$(cat $CAP.pid)" \
+  || fail "tcpdump did not start or died; see $CAP.log"
+say "Control probe: one ICMP echo to the office pod, recorded in a side capture. A later zero is"
+say "then a measured zero. The ARP refresh it causes lands in the first second of the window."
+CONTROL=$(remote "tcpdump -i end0 -nn -U -w $CAP.control '$CAP_FILTER' >/dev/null 2>&1 & p=\$!; sleep 1; ping -c1 -W2 $OFFICE_POD_IP >/dev/null; sleep 1; kill \$p; sleep 1; tcpdump -nn -r $CAP.control 2>/dev/null | wc -l")
+(( CONTROL >= 2 )) || fail "Control count $CONTROL: the filter cannot see office traffic; a zero would be meaningless."
+say "control count: $CONTROL"
+sleep 3
+WINDOW_START_EPOCH=$(remote "date +%s | tee $CAP.epoch")
+
+# ── 6 ─────────────────────────────────────────────────────────────────────
 stage "Capture and arm the lifecycle run"
 RUN_DIR=$(remote "python3 $LIFECYCLE_SCRIPT capture") || fail "capture refused."
 RUN_ID=$(basename "$RUN_DIR")
@@ -275,66 +300,97 @@ write_env RUN_ID "$RUN_ID"
 say "Run: $RUN_ID"
 remote "python3 $LIFECYCLE_SCRIPT arm --run $RUN_ID --timeout $WINDOW_SECONDS" || fail "arm refused."
 say "A detached watchdog will stop DEV in $WINDOW_SECONDS s no matter what happens to this shell."
-pause
-
-# ── 5 ─────────────────────────────────────────────────────────────────────
-stage "Start the DEV app"
-confirm "Start d5369777_music_assistant_dev now (inside the armed run)?" || fail "Not started; settling the run."
-remote "python3 $LIFECYCLE_SCRIPT start --run $RUN_ID" || fail "start refused or unconfirmed; settling the run."
-say "DEV is started. The AirPlay provider loads with NO target and must resolve, probe and"
-say "register nothing until stage 6."
-
-# ── 6 ─────────────────────────────────────────────────────────────────────
-stage "Set the single admitted target, then reload AirPlay"
-open_url "$TRIAL_API/setup"
-step "Complete the owner setup on the private port (fresh namespace, new owner user), then log in."
-step "Settings -> Core -> Discovery -> advanced -> 'Private trial target device' = $MAIN_POD_TARGET -> Save."
-step "Settings -> Providers -> AirPlay -> Reload."
-note "Or with a token: POST $TRIAL_API/api"
-note '  {"command":"config/core/save","args":{"domain":"discovery","values":{"private_trial_target":"'"$MAIN_POD_TARGET"'"}}}'
-note '  {"command":"config/providers/reload","args":{"instance_id":"airplay"}}'
-pause "Press Enter once AirPlay is reloaded"
-step "Expected: exactly one player, main-pod ($MAIN_POD_IP). office-pod must NOT appear."
-if ! confirm "Is main-pod the ONLY AirPlay player listed?"; then
-  warn "FAILED isolation. Skipping playback; going straight to stop and verdict."
-  ABORTED=1
-fi
 
 # ── 7 ─────────────────────────────────────────────────────────────────────
-stage "Readiness receipt and (optional) playback"
-if (( ABORTED )); then
-  say "Skipped."
+stage "Start the DEV app and wait for the AirPlay provider"
+confirm "Start $DEV now (inside the armed run)?" || fail "Not started; settling the run."
+remote "python3 $LIFECYCLE_SCRIPT start --run $RUN_ID" || fail "start refused or unconfirmed; settling the run."
+say "DEV source-installs nredd/server@$SERVER_SHA at startup (a few minutes)."
+for _ in $(seq 1 60); do
+  sleep 10
+  if curl -s -m 5 "$TRIAL_API/info" >/dev/null 2>&1; then break; fi
+done
+curl -s -m 5 "$TRIAL_API/info" >/dev/null || fail "Trial API never came up on $TRIAL_API."
+ONBOARDED=$(curl -s -m 5 "$TRIAL_API/info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["onboard_done"])')
+sleep 15
+say "Trial API up; onboard_done=$ONBOARDED. No target is set yet, so no AirPlay player may exist."
+PLAYERS_BEFORE=$(sup "http://supervisor/addons/$DEV/logs" | sed 's/\x1b\[[0-9;]*m//g' | grep -c "registered: ap" || true)
+(( PLAYERS_BEFORE == 0 )) || { warn "FAILED fail-closed: $PLAYERS_BEFORE AirPlay players registered with no target."; ABORTED=1; }
+
+# ── 8 ─────────────────────────────────────────────────────────────────────
+stage "Log in to the private API"
+ask TRIAL_USER "Trial owner username:"
+ask_secret TRIAL_PASSWORD "Trial owner password (new namespace: this creates the owner):"
+write_env TRIAL_USER "$TRIAL_USER"
+write_env TRIAL_PASSWORD "$TRIAL_PASSWORD"
+if [[ "$ONBOARDED" == "False" ]]; then
+  TRIAL_TOKEN=$(curl -s -m 10 -X POST "$TRIAL_API/setup" -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$TRIAL_USER\",\"password\":\"$TRIAL_PASSWORD\",\"display_name\":\"Trial Owner\",\"device_name\":\"wizard\"}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
 else
-  step "POST {\"command\":\"airplay/private_native_volume_capture/readiness/get\"} on $TRIAL_API/api"
-  say "ptp_ready must be true. False with 'did not attest strict peers' means the wrong asset ran."
-  if confirm "ptp_ready is true?"; then
-    say "Playback to main-pod only, from the trial UI, is your call. Nothing here starts it."
-    pause "Press Enter when you are done observing"
-  else
-    warn "Not ready. Skipping playback; going to stop."
+  TRIAL_TOKEN=$(curl -s -m 10 -X POST "$TRIAL_API/auth/login" -H 'Content-Type: application/json' \
+    -d "{\"provider_id\":\"builtin\",\"credentials\":{\"username\":\"$TRIAL_USER\",\"password\":\"$TRIAL_PASSWORD\"}}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
+fi
+[[ -n "$TRIAL_TOKEN" ]] || fail "No token from the trial API."
+say "token obtained (kept in memory only)."
+
+# ── 9 ─────────────────────────────────────────────────────────────────────
+stage "Set the single admitted target and reload AirPlay"
+if (( ABORTED )); then say "Skipped (fail-closed already failed)."; else
+  SAVED=$(api "{\"command\":\"config/core/save\",\"args\":{\"domain\":\"discovery\",\"values\":{\"private_trial_target\":\"$MAIN_POD_TARGET\"}}}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["values"]["private_trial_target"]["value"])')
+  [[ "$SAVED" == "$MAIN_POD_TARGET" ]] || fail "Target not saved: $SAVED"
+  api '{"command":"config/providers/reload","args":{"instance_id":"airplay"}}' >/dev/null
+  sleep 25
+  PLAYERS=$(api '{"command":"players/all"}' | python3 -c 'import json,sys; print(" ".join(sorted(p["player_id"] for p in json.load(sys.stdin) if p["player_id"].startswith("ap"))))')
+  say "AirPlay players: ${PLAYERS:-<none>}"
+  if [[ "$PLAYERS" != "$MAIN_POD_PLAYER" ]]; then
+    warn "FAILED isolation: expected exactly $MAIN_POD_PLAYER. Skipping playback."
+    ABORTED=1
   fi
 fi
 
-# ── 8 ─────────────────────────────────────────────────────────────────────
+# ── 10 ────────────────────────────────────────────────────────────────────
+stage "Readiness receipt and (optional) playback"
+if (( ABORTED )); then say "Skipped."; else
+  READY=$(api '{"command":"airplay/private_native_volume_capture/readiness/get"}')
+  printf '%s\n' "$READY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("ptp_ready","prestream_ready","playing_ready")}); s=d["startup_validation"]; print("check:",s.get("check_label"),s.get("check_outcome"),"provenance:",d["installer_provenance"]["status"])'
+  PTP=$(printf '%s\n' "$READY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ptp_ready"])')
+  if [[ "$PTP" != "True" ]]; then
+    warn "ptp_ready false: the daemon did not attest strict peers. Skipping playback."
+  elif confirm "Play a short stream to $MAIN_POD_PLAYER at volume 20?"; then
+    api "{\"command\":\"players/cmd/volume_set\",\"args\":{\"player_id\":\"$MAIN_POD_PLAYER\",\"volume_level\":20}}" >/dev/null
+    api "{\"command\":\"player_queues/play_media\",\"args\":{\"queue_id\":\"$MAIN_POD_PLAYER\",\"media\":\"https://ice1.somafm.com/groovesalad-128-mp3\"}}" >/dev/null
+    pause "Playing. Press Enter to stop playback"
+    api "{\"command\":\"players/cmd/stop\",\"args\":{\"player_id\":\"$MAIN_POD_PLAYER\"}}" >/dev/null
+    api '{"command":"airplay/private_native_volume_capture/readiness/get"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after playback:",[{k:r[k] for k in ("protocol","flow","timing","playing","ready")} for r in d["streams"]])'
+  fi
+fi
+
+# ── 11 ────────────────────────────────────────────────────────────────────
 stage "Stop DEV and settle the run"
 remote "python3 $LIFECYCLE_SCRIPT stop --run $RUN_ID" || warn "stop returned non-zero: read the receipt."
 remote "cat $PROBE_DIR/dev-lifecycle/$RUN_ID/receipt.json; echo"
 confirm "Receipt says verified: true?" || warn "Failed receipt: check DEV state by hand before anything else."
 RUN_ID=""
-
-# ── 9 ─────────────────────────────────────────────────────────────────────
-stage "Stop the capture"
 remote "kill -0 \$(cat $CAP.pid) && kill \$(cat $CAP.pid) && sleep 1" || warn "tcpdump was not alive at the end: the capture may be truncated."
 remote "test -s $CAP_FILE && tcpdump -nn -r $CAP_FILE >/dev/null" || fail "Capture file missing or unreadable: no verdict."
 CAP=""
 
-# ── 10 ────────────────────────────────────────────────────────────────────
+# ── 12 ────────────────────────────────────────────────────────────────────
 stage "Verdict"
-say "Window packets after the control probe (epoch $WINDOW_START_EPOCH), unicast to/from office devices:"
-remote "tcpdump -nn -tt -e -r $CAP_FILE 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict; tail -30 $CAP_FILE.verdict; echo; echo COUNT \$(wc -l < $CAP_FILE.verdict)"
-say "Acceptance: COUNT 0. Any line is a unicast frame between this host and the office pod/TV"
-say "during the window: investigate the source port/process before calling it a DEV violation,"
-say "but it is NOT a clean pass."
+remote "tcpdump -nn -tt -r $CAP_FILE 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict
+awk '{print \$3\" > \"\$5}' $CAP_FILE.verdict | sort | uniq -c | sort -rn > $CAP_FILE.flows
+echo RAW \$(wc -l < $CAP_FILE.verdict)
+echo HOST_TO_OFFICE_IPV4 \$(grep -c '$HAOS_IP >' $CAP_FILE.verdict)
+echo AIRPLAY_PORTS \$(grep -cE '\.(7000|7100|319|320|6[0-9]{3}):? ' $CAP_FILE.verdict)
+echo '--- non-baseline flows (count, flow):'
+awk '{c=\$1; \$1=\"\"; sub(/^ /,\"\"); print c\"\t\"\$0}' $CAP_FILE.flows | grep -vFf $BASE.flows || true
+echo '--- ARP from host (expect only the control refresh at +0..1s):'
+grep 'tell $HAOS_IP' $CAP_FILE.verdict | awk -v e=$WINDOW_START_EPOCH '{printf \"+%.1fs\\n\", \$1-e}'"
+say "Acceptance: HOST_TO_OFFICE_IPV4 0, AIRPLAY_PORTS 0, and no non-baseline flow from $HAOS_IP"
+say "other than the control-probe ARP in the first second. Inbound mDNS from the pod is not ours."
 warn "Restart local_music_assistant_dev yourself if you want it back. The trial never does."
 
 finish
