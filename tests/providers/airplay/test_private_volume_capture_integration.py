@@ -425,9 +425,12 @@ async def test_forced_stop_with_live_capture_keeps_a_clean_exit_valid(
     capture.end(child, "missing-summary")
     monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
     written: list[str] = []
-    monkeypatch.setattr(
-        stream, "_write_cli_command", AsyncMock(side_effect=lambda c: written.append(c) or True)
-    )
+
+    async def record_command(command: str) -> bool:
+        written.append(command)
+        return True
+
+    monkeypatch.setattr(stream, "_write_cli_command", record_command)
     await stream.stop(force=True)
     assert written == ["ACTION=STOP"]
     child.kill.assert_not_awaited()
