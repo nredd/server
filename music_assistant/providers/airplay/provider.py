@@ -37,12 +37,10 @@ from music_assistant.helpers.config_entries import (
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.private_trial import (
-    CONF_PRIVATE_TRIAL_TARGET,
     admits_player_id,
     encode_public_digest,
     installer_provenance,
     is_trial_target,
-    parse_trial_target,
     private_child_env,
 )
 from music_assistant.helpers.process import AsyncProcess
@@ -105,6 +103,10 @@ if TYPE_CHECKING:
 # line is seen the daemon is spawned but not yet able to serve shared-clock
 # streams, so a group start before it would race the daemon's readiness.
 PTP_DAEMON_READY_MARKER: Final[str] = "[PTP] daemon up"
+# Attestation the daemon appends to its ready line when it dropped unregistered PTP
+# peers (CLI `d286032` and later). The private trial profile requires it before the
+# daemon counts as ready; an asset that cannot attest it never becomes ready there.
+PTP_DAEMON_STRICT_PEERS_MARKER: Final[str] = "strict-peers=on"
 # Bounded wait for the daemon to report readiness before a stream session
 # decides its timing source. Once ready the check returns immediately; only a
 # session that starts while the daemon is still coming up (or never binds) pays
@@ -710,8 +712,7 @@ class AirPlayProvider(PlayerProvider):
         self, player_id: str, display_name: str, discovery_info: AsyncServiceInfo
     ) -> None:
         """Handle setup of a new player that is discovered using mdns."""
-        # The private profile resolves, probes and registers exactly one device. Decide
-        # on the resolved identity first: a same-named record is not the target.
+        # Decide on the resolved identity first: a same-named record is not the target.
         if not self._admits_private_player(player_id):
             self.logger.log(VERBOSE_LOG_LEVEL, "Rejected off-target player %s", player_id)
             return
@@ -860,22 +861,20 @@ class AirPlayProvider(PlayerProvider):
 
     async def _learn_audio_formats(self, player: AirPlayPlayer, host: str, port: int) -> None:
         """Read the audio formats a receiver advertises, so 24-bit can be auto-enabled."""
-        # Direct /info is the only off-mDNS probe on the setup path; never send it off-target.
         if not self._admits_private_player(player.player_id):
             return
         if formats := await probe_audio_formats(self.mass, host, port):
             player.advertised_audio_formats = formats
 
     def _admits_private_player(self, player_id: str) -> bool:
-        """Return whether this profile may set up, probe or register the player."""
+        """
+        Return whether this profile may set up, probe or register the player.
+
+        :param player_id: The MA player id derived from the resolved record.
+        """
         if not is_trial_target():
             return True
-        config = getattr(self.mass.discovery, "config", None)
-        if config is None:
-            return False
-        return admits_player_id(
-            parse_trial_target(config.get_value(CONF_PRIVATE_TRIAL_TARGET, "")), player_id
-        )
+        return admits_player_id(self.mass.discovery.trial_target(), player_id)
 
     async def _is_own_airplay_receiver(
         self, display_name: str, discovery_info: AsyncServiceInfo
@@ -1213,6 +1212,11 @@ class AirPlayProvider(PlayerProvider):
             and not event.is_set()
             and PTP_DAEMON_READY_MARKER in line
         ):
+            if is_trial_target() and PTP_DAEMON_STRICT_PEERS_MARKER not in line:
+                self.logger.warning(
+                    "Shared PTP clock daemon did not attest strict peers; not ready"
+                )
+                return
             self.logger.debug("Shared PTP clock daemon reported ready")
             event.set()
 

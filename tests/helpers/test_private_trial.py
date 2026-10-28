@@ -423,6 +423,8 @@ def test_trial_target_admits_only_its_own_records() -> None:
         # dots are legal inside instance labels: never match on the text before the first one
         ("main pod.office._airplay._tcp.local.", "_airplay._tcp.local."),
         ("main pod._airplay._tcp.local.office._airplay._tcp.local.", "_airplay._tcp.local."),
+        # a RAOP label without the target MAC prefix is not the target
+        ("main pod._raop._tcp.local.", "_raop._tcp.local."),
         # the record must belong to the service type being resolved
         ("main pod._airplay._tcp.local.", "_raop._tcp.local."),
         ("main pod._airplay._tcp.local", "_airplay._tcp.local."),

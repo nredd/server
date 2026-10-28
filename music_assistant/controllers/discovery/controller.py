@@ -30,6 +30,7 @@ from music_assistant.constants import (
 from music_assistant.helpers.hassio import supervisor_request
 from music_assistant.helpers.private_trial import (
     CONF_PRIVATE_TRIAL_TARGET,
+    TrialTarget,
     admits_mdns_name,
     is_trial_target,
     parse_trial_target,
@@ -177,22 +178,23 @@ class DiscoveryController(CoreController):
         self._upnp_locks.pop(instance_id, None)
         self._schedule_periodic_upnp_discovery()
 
+    def trial_target(self) -> TrialTarget | None:
+        """Return the single device the private trial profile admits, or None for nothing."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        return parse_trial_target(config.get_value(CONF_PRIVATE_TRIAL_TARGET, ""))
+
     def admits_mdns_record(self, service_type: str, mdns_name: str) -> bool:
         """
         Return whether a directed query for this record may be sent in this profile.
 
-        Ordinary profiles admit every record. The private trial profile admits only the
-        single configured target and fails closed while no target is configured.
+        :param service_type: The service type the record is resolved as.
+        :param mdns_name: The full record name.
         """
         if not is_trial_target():
             return True
-        config = getattr(self, "config", None)
-        target = (
-            None
-            if config is None
-            else parse_trial_target(config.get_value(CONF_PRIVATE_TRIAL_TARGET, ""))
-        )
-        if admits_mdns_name(target, mdns_name, service_type):
+        if admits_mdns_name(self.trial_target(), mdns_name, service_type):
             return True
         self.logger.log(VERBOSE_LOG_LEVEL, "Rejected off-target record %s", mdns_name)
         return False
@@ -291,7 +293,6 @@ class DiscoveryController(CoreController):
         for manifest in self.mass.get_provider_manifests():
             if not manifest.mdns_discovery:
                 continue
-            # The private profile never loads most providers, so never browse for them.
             if not should_load_provider(manifest.domain, manifest.builtin):
                 continue
             all_types.update(manifest.mdns_discovery)
@@ -385,7 +386,6 @@ class DiscoveryController(CoreController):
         # Notify any waiters that a new mDNS event arrived
         for waiter in self._mdns_waiters:
             waiter.set()
-        # Resolving a record sends a directed query, so decide admission before any task.
         if not self.admits_mdns_record(service_type, name):
             return
         for provider in list(self.mass.providers):

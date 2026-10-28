@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
+from music_assistant.helpers.private_trial import parse_trial_target
 from music_assistant.providers.airplay import pairing as pairing_module
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay import trial_binary
@@ -31,11 +31,7 @@ def _provider(
     prov = AirPlayProvider.__new__(AirPlayProvider)
     prov.mass = MagicMock()
     prov.logger = logging.getLogger("test.airplay.private_target")
-    config = MagicMock()
-    config.get_value = lambda key, default=None: (
-        target if key == CONF_PRIVATE_TRIAL_TARGET else default
-    )
-    prov.mass.discovery.config = config
+    monkeypatch.setattr(prov.mass.discovery, "trial_target", lambda: parse_trial_target(target))
     prov.mass.config.get_raw_player_config_value.return_value = True
     prov._is_own_airplay_receiver = AsyncMock(return_value=False)  # type: ignore[method-assign]
     return prov
@@ -76,10 +72,10 @@ async def test_setup_fails_closed_without_a_target(
     cast("MagicMock", prov.mass).players.register.assert_not_called()
 
 
-async def test_setup_without_discovery_config_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A provider that outruns discovery setup must not register anything."""
+async def test_setup_without_discovery_target_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider that outruns discovery setup (no target yet) must not register anything."""
     prov = _provider(monkeypatch, TARGET)
-    prov.mass.discovery = MagicMock(spec=[])
+    monkeypatch.setattr(prov.mass.discovery, "trial_target", lambda: None)
     await prov._setup_player(TARGET_PLAYER_ID, "Main Pod", _info())
     cast("MagicMock", prov.mass).players.register.assert_not_called()
 
@@ -247,3 +243,28 @@ async def test_private_pairing_child_requests_strict_peers(monkeypatch: pytest.M
     session.logger = logging.getLogger("test.airplay.private_target")
     await session._start_pair_setup_process()
     assert factory.call_args.kwargs["env"] == {"CLIAIRPLAY_PTP_STRICT_PEERS": "1"}
+
+
+@pytest.mark.parametrize(
+    ("private", "line", "ready"),
+    [
+        (True, "[PTP] daemon up: engine on 319/320, control on 127.0.0.1:9010", False),
+        (True, "[PTP] daemon up: engine on 319/320, strict-peers=off", False),
+        (True, "[PTP] daemon up: engine on 319/320, strict-peers=on", True),
+        (False, "[PTP] daemon up: engine on 319/320, control on 127.0.0.1:9010", True),
+        (False, "[PTP] daemon up: engine on 319/320, strict-peers=off", True),
+    ],
+)
+def test_private_ptp_readiness_requires_strict_peer_attestation(
+    monkeypatch: pytest.MonkeyPatch, private: bool, line: str, ready: bool
+) -> None:
+    """On the trial target the daemon is ready only once it attests strict peers."""
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: private)
+    prov = AirPlayProvider.__new__(AirPlayProvider)
+    prov.logger = logging.getLogger("test.airplay.private_target")
+    prov._ptp_daemon_ready = asyncio.Event()
+    prov._ptp_daemon_warn_window_start = None
+    prov._ptp_daemon_warns_in_window = 0
+    prov._ptp_daemon_warns_suppressed = 0
+    prov._handle_ptp_daemon_line(line)
+    assert prov._ptp_daemon_ready.is_set() is ready

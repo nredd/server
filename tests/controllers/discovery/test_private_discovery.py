@@ -97,6 +97,7 @@ async def test_trial_profile_never_queries_before_setup(
     """Admission before the controller has its config fails closed too."""
     monkeypatch.setattr(discovery_module, "is_trial_target", lambda: True)
     monkeypatch.delattr(mass.discovery, "config", raising=False)
+    assert mass.discovery.trial_target() is None
     assert mass.discovery.admits_mdns_record("_raop._tcp.local.", TARGET_RAOP) is False
 
 

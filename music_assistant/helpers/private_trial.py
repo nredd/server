@@ -42,6 +42,7 @@ _ID = re.compile(r"[0-9a-f]{32}")
 _MAC = re.compile(r"[0-9a-f]{12}")
 # RAOP record names prefix the device name with its MAC, e.g. "aabbccddeeff@Kelder".
 _RAOP_MAC_PREFIX = re.compile(r"^(?P<mac>[0-9a-f]{12})@")
+RAOP_SERVICE_TYPE = "_raop._tcp.local."
 _FRESH_ROOTS: set[Path] = set()
 
 
@@ -59,7 +60,11 @@ class TrialTarget:
 
 
 def parse_trial_target(value: object) -> TrialTarget | None:
-    """Parse the configured target, or None when nothing may be admitted."""
+    """
+    Parse the configured target, or None when nothing may be admitted.
+
+    :param value: The raw `private_trial_target` config value, `<12 hex MAC>@<name>`.
+    """
     if not isinstance(value, str) or "@" not in value:
         return None
     mac, name = value.split("@", 1)
@@ -72,23 +77,31 @@ def admits_mdns_name(target: TrialTarget | None, mdns_name: str, service_type: s
     """
     Return whether a directed query for this mDNS record may leave the host.
 
-    The instance label is everything before the service type suffix, never the text
-    before the first dot: dots are legal inside instance names, so "Main.Office" must
-    not pass as "Main".
+    :param target: The admitted device, or None to admit nothing.
+    :param mdns_name: The full record name, e.g. `aabbccddeeff@Main._raop._tcp.local.`.
+    :param service_type: The service type the record is resolved as.
     """
     if target is None:
         return False
     name, suffix = mdns_name.lower(), f".{service_type.lower()}"
     if not name.endswith(suffix) or len(name) == len(suffix):
         return False
+    # Dots are legal inside instance labels, so "Main.Office" must not read as "Main".
     instance = name[: -len(suffix)]
     if match := _RAOP_MAC_PREFIX.match(instance):
         return match.group("mac") == target.mac and instance[match.end() :] == target.name.lower()
+    if service_type.lower() == RAOP_SERVICE_TYPE:
+        return False
     return instance == target.name.lower()
 
 
 def admits_player_id(target: TrialTarget | None, player_id: str) -> bool:
-    """Return whether a resolved device may be set up, probed or registered."""
+    """
+    Return whether a resolved device may be set up, probed or registered.
+
+    :param target: The admitted device, or None to admit nothing.
+    :param player_id: The MA player id derived from the resolved record, `ap<mac>`.
+    """
     return target is not None and player_id == target.player_id
 
 

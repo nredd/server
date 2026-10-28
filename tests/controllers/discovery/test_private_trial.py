@@ -111,13 +111,13 @@ async def test_trial_provider_browser_and_callback_unchanged(mass_minimal: Music
         discovery._on_mdns_service_state_change(
             MagicMock(),
             "_raop._tcp.local.",
-            "test._raop._tcp.local.",
+            "aabbccddeeff@test._raop._tcp.local.",
             ServiceStateChange.Removed,
         )
         for task in tasks:
             await task
         provider.on_mdns_service_state_change.assert_awaited_once_with(
-            "test._raop._tcp.local.",
+            "aabbccddeeff@test._raop._tcp.local.",
             ServiceStateChange.Removed,
             None,
         )
