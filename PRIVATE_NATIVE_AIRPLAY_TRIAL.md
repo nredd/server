@@ -365,9 +365,75 @@ Control Other Speakers volume, grouping, slider routing, or this backend's ident
   restored the captured HA group. That failure remains recorded, and neither runtime
   metadata nor later recovery proves native UI/volume acceptance.
 
-## Private recovery controller
+## Private stock-absent DEV lifecycle controller
 
-`scripts/private_airplay_recovery.py` is private HAOS recovery tooling. It uses the Python
+The owner removed stock MA `2.10.7` from HAOS on purpose (Supervisor backup `23381989`,
+off-device copy and restore notes kept privately). Stock must NOT be restored automatically.
+The historical recovery controller below assumed stock installed, started stock and restored
+HA groups; it is INVALID for this state and must not be armed. `scripts/private_dev_lifecycle.py`
+(schema `2`, root `/data/airplay-native-probe/dev-lifecycle`) is the replacement. It is
+standalone on the SSH app's Python 3.13 with stdlib plus native `/usr/bin/curl`, and it
+never imports or calls the historical helper, whose bundles, receipts and failures stay as
+they are.
+
+What it can and cannot do is fixed by its path allowlist: `GET /addons`,
+`GET/POST /addons/<DEV>/info|start|stop`. There is no stock path, no `/store` path and no
+Core API path, so it cannot install or start stock, reload an HA entry, or group, play,
+stop or set volume on ANY player. Office and historical-group exclusion are therefore
+structural, not runtime checks.
+
+Stock absence is a fact about the COMPLETE installed-app catalog (`GET /addons`), validated
+as a non-empty list of entries with string `slug`/`state`/`version` and unique slugs. The
+stock slug must be absent, the DEV slug present and no other slug may contain
+`music_assistant`. The per-app `info` fallback for an uninstalled app is never consulted
+or modelled for absence. DEV's own `info` must then report a confirmed `started`/`stopped`
+state, `protected: true`, `boot: manual` and `watchdog: false`; `startup`, `error`,
+`unknown` or missing values fail closed.
+
+```sh
+python3 "$LIFECYCLE_SCRIPT" preflight            # read-only facts, no run created
+python3 "$LIFECYCLE_SCRIPT" capture              # requires DEV stopped; prints run dir
+python3 "$LIFECYCLE_SCRIPT" arm --run <uuid> --timeout 120
+python3 "$LIFECYCLE_SCRIPT" start --run <uuid>   # only inside a live armed run
+python3 "$LIFECYCLE_SCRIPT" stop --run <uuid>    # manual early stop, same path as the watchdog
+python3 "$LIFECYCLE_SCRIPT" self-test            # fake transport only, no HAOS calls
+```
+
+`capture` stores only the sorted installed slugs and DEV version under a fresh UUID with
+`0700`/`0600` permissions. `arm` detaches the same `posix_spawn` watchdog as before (only
+`SUPERVISOR_TOKEN` in its environment, one application-wide lease, timeout bounded to one
+hour). The held lease is written with the run's id and nonce. `start` requires that exact
+run to be armed and unexpired, receipt-free and not a self-test run, AND proves a child
+still holds the lease for this run (a `watchdog.json` left by a failed spawn or a dead
+child is refused). It then re-reads the facts, refuses any catalog or DEV version drift,
+requires DEV `stopped`, and only then requests the start, which must be confirmed by
+observation.
+
+The watchdog/`stop` path stops DEV FIRST, before any catalog check, so a drifted catalog
+(even stock reappearing) can never leave DEV running. Any observed state other than
+exact `stopped` (`started`, `startup`, `error`, `unknown`) gets a stop request and is then
+re-observed; transient Supervisor failures are retried inside the budget. A stop response
+is not stop evidence: an observation must read exactly `stopped`. Waiting for the
+mutation lock has its own ten-minute budget and the stop gets a full 90-second budget only
+after the lock is held, so a slow `start` cannot starve it; a lock that never frees is
+recorded as a failed receipt. Only after the stop is stock absence re-verified against
+the captured facts. The receipt is `verified: true` with the fixed status
+`DEV stopped and stock absence re-verified; nothing else touched` only when both hold;
+any other outcome writes a failed receipt. The first failure stays the evidence of
+record (a repeat failure neither replaces it nor raises a conflict); it is archived as
+`failed_receipt.json` only when the same run later verifies. Historical schema-1 receipts
+and statuses never settle a schema-2 run. Arming an already-receipted run is refused;
+capture a fresh UUID.
+
+None of this authorizes a launch. `launch_authorized` in the pin stays false, main-only
+isolation is unproven on hardware, and the owner must approve a fresh window.
+
+## Historical recovery controller (stock-present, retired)
+
+`scripts/private_airplay_recovery.py` is private HAOS recovery tooling for the EARLIER
+stock-installed state. Do not arm it while stock is absent: its capture preflight fails
+closed on the missing stock app, and its restore path would start stock and restore HA
+groups, both of which are now forbidden. It uses the Python
 stdlib and installed native `/usr/bin/curl`, only the SSH add-on's `SUPERVISOR_TOKEN`,
 and fixed add-on slugs and target entity
 IDs. It never accepts an API host, endpoint, credential, media URL, queue, or raw add-on

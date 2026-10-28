@@ -119,6 +119,7 @@ target-version = "py314"
 [tool.ruff.per-file-target-version]
 # The independent recovery controller runs in HAOS's SSH app, not MA's 3.14 venv.
 "scripts/private_airplay_recovery.py" = "py313"
+"scripts/private_dev_lifecycle.py" = "py313"
 
 [tool.ruff.lint.pydocstyle]
 # Use Sphinx-style docstrings with :param: syntax
