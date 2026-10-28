@@ -273,8 +273,28 @@ def test_start_waits_through_startup_and_rejects_error(monkeypatch: pytest.Monke
         return ScriptedTransport.request(failing, method, path)
 
     monkeypatch.setattr(failing, "request", error_after_start)
+    started_at = time.monotonic()
     with pytest.raises(lifecycle.LifecycleError, match="did not start"):
         lifecycle.start(failing, snapshot(), time.monotonic() + 5)
+    assert time.monotonic() - started_at < 0.5
+
+
+def test_start_tolerates_a_transient_read_during_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One busy Supervisor read while DEV starts does not abort a start that succeeds."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    transport = ScriptedTransport()
+    hiccups = [1]
+
+    def flaky(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info" and f"POST /addons/{DEV}/start" in transport.calls:
+            if hiccups[0]:
+                hiccups[0] -= 1
+                raise lifecycle.TransientAvailabilityError("busy")
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", flaky)
+    lifecycle.start(transport, snapshot(), time.monotonic() + 5)
+    assert hiccups == [0]
 
 
 def test_restore_stops_dev_first_even_if_stock_reappeared() -> None:
@@ -428,6 +448,44 @@ def test_watchdog_records_an_unavailable_lock_as_failure(
     # once the lock frees, the same run verifies and promotes its receipt
     lifecycle.watchdog(tmp_path, state.run_id, transport)
     assert lifecycle._has_verified_receipt(run_dir, state) is True
+    # a later unlocked attempt on the settled run reports the lock, not a receipt conflict
+    with (
+        lifecycle._mutation_lock(tmp_path, time.monotonic() + 5),
+        pytest.raises(lifecycle.LifecycleError, match="mutation lock unavailable"),
+    ):
+        lifecycle.settle(tmp_path, run_dir, state, transport)
+    assert lifecycle._has_verified_receipt(run_dir, state) is True
+
+
+def test_watchdog_wait_ignores_wall_clock_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clock stepped backwards after arming cannot extend the armed timeout."""
+    monkeypatch.setattr(lifecycle, "WATCHDOG_WAKE_INTERVAL", 0.02)
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    lifecycle._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time() + 0.2},
+    )
+    real_time = time.time
+    reads = [0]
+
+    def stepped_clock() -> float:
+        # the bound check at load and the one-time conversion read the true clock;
+        # every later read (during the sleep) is 100 s in the past
+        reads[0] += 1
+        if reads[0] <= 2:
+            return real_time()
+        return real_time() - 100
+
+    monkeypatch.setattr(time, "time", stepped_clock)
+    transport = ScriptedTransport(dev_started=True)
+    started = time.monotonic()
+    lifecycle.watchdog(tmp_path, state.run_id, transport)
+    assert time.monotonic() - started < 2
+    assert transport.dev_started is False
 
 
 def test_unsafe_lock_file_is_a_lock_failure_that_still_stops_dev(
@@ -801,9 +859,12 @@ def test_main_start_is_serialized_by_the_mutation_lock(
     assert transport.calls == []
 
 
-def test_supervisor_transport_treats_5xx_as_transient(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A busy Supervisor is retried by the stop loop, not recorded as a hard failure."""
-    with _fixed_http_server({"/addons": (503, b'{"result":"error"}')}) as (base_url, _calls):
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_supervisor_transport_treats_busy_statuses_as_transient(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A busy Supervisor is retried by the loops, not recorded as a hard failure."""
+    with _fixed_http_server({"/addons": (status, b'{"result":"error"}')}) as (base_url, _calls):
         monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
         transport = lifecycle.SupervisorTransport("private-token", time.monotonic() + 5)
         with pytest.raises(lifecycle.TransientAvailabilityError):

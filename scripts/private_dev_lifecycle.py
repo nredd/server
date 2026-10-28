@@ -470,9 +470,11 @@ def watchdog(root: Path, run_id: str, transport: Transport | None = None) -> Non
     """
     run_dir, snapshot = load_snapshot(root, run_id)
     watch = _load_watchdog(run_dir, snapshot)
+    # The wall-clock deadline is converted once so a clock step cannot stretch the wait.
     # Sleep in slices so a manual `stop` that already verified this run releases the
     # application-wide lease early instead of holding it until the deadline.
-    while (delay := watch["deadline"] - time.time()) > 0:
+    deadline = time.monotonic() + (watch["deadline"] - time.time())
+    while (delay := deadline - time.monotonic()) > 0:
         if _has_verified_receipt(run_dir, snapshot):
             return
         time.sleep(min(delay, WATCHDOG_WAKE_INTERVAL))
@@ -503,7 +505,8 @@ def settle(root: Path, run_dir: Path, snapshot: Snapshot, transport: Transport |
         stop_dev(transport or SupervisorTransport(_token(), deadline), deadline)
     except LifecycleError as err:
         status = f"{status}; unlocked stop failed: {err}"
-    _write_receipt(run_dir, snapshot, False, status)
+    if not _has_verified_receipt(run_dir, snapshot):
+        _write_receipt(run_dir, snapshot, False, status)
     raise LifecycleError(status)
 
 
