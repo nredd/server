@@ -69,6 +69,19 @@ the type-130 MRP datastream receive-only when capture is on; the first live wind
 `CLIAIRPLAY_MRP_TYPE130=1` force was rejected as the fix because it also moves
 now-playing publication onto the datastream.
 
+The separate advanced `private_now_playing_datastream` flag defaults to false and is private
+trial-only. It tests, rather than fixes, the hypothesis that DataStream now-playing publication
+on the existing rail affects the phone control. A new child gets
+`CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM=1` only when it is a trial AirPlay 2 launch with
+HomePod admission and the rail requested, private capture off, and explicit runtime session
+volume off; all other launches get `0`. `/command` and DACP adoption remain unchanged. When this
+private experiment is explicitly requested, a trial stream child removes only an inherited
+Type-130 value the CLI parses as enabled, never sets it to `0`; the exact `0`, `false` and `off`
+kills are preserved and fail the experiment closed. With the experiment disabled, inherited
+Type-130 behavior is unchanged. No CLI pin changes until the dependent canonical artifact exists.
+This is office-pod-only work under the existing bounded independent watchdog; do not deploy or
+run it outside an explicitly approved window.
+
 The existing provider diagnostics retain a bounded history of scalar CLI summaries and
 finite DACP classes, never UID values, request headers/bodies, Active-Remote values or raw
 status/error lines. DACP classification precedes suppression and numeric conversion. Raw

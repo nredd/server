@@ -26,6 +26,53 @@ from tests.providers.airplay.test_provider import _make_provider
 from tests.providers.airplay.test_stream import _make_player
 
 
+@pytest.mark.parametrize(
+    ("inherited", "unset", "expected"),
+    [
+        (None, frozenset(), "unset"),
+        ("1", frozenset({"CLIAIRPLAY_MRP_TYPE130"}), "unset"),
+        ("", frozenset({"CLIAIRPLAY_MRP_TYPE130"}), "unset"),
+        ("malformed", frozenset({"CLIAIRPLAY_MRP_TYPE130"}), "unset"),
+        ("0", frozenset(), "0"),
+        ("false", frozenset(), "false"),
+        ("off", frozenset(), "off"),
+    ],
+)
+async def test_private_process_type130_policy_reaches_the_real_child(
+    monkeypatch: pytest.MonkeyPatch,
+    inherited: str | None,
+    unset: frozenset[str],
+    expected: str,
+) -> None:
+    """The private wrapper's final environment reaches a real asyncio child unchanged."""
+    if inherited is None:
+        monkeypatch.delenv("CLIAIRPLAY_MRP_TYPE130", raising=False)
+    else:
+        monkeypatch.setenv("CLIAIRPLAY_MRP_TYPE130", inherited)
+    asset_fd = os.open("/usr/bin/true", os.O_RDONLY)
+    child = trial.TrialAsyncProcess(
+        ["/usr/bin/true"],
+        asset_fd=asset_fd,
+        env={"CLIAIRPLAY_PTP_STRICT_PEERS": "1"},
+        unset_env=unset,
+    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            'import os; print(f\'{os.getenv("CLIAIRPLAY_MRP_TYPE130", "unset")}\' '
+            "f'|{os.getenv(\"CLIAIRPLAY_PTP_STRICT_PEERS\")}')",
+            stdout=asyncio.subprocess.PIPE,
+            env=child._env,
+        )
+        stdout, _ = await process.communicate()
+    finally:
+        await child.close()
+
+    assert process.returncode == 0
+    assert stdout.decode() == f"{expected}|1\n"
+
+
 def test_private_manifest_matches_source_pin() -> None:
     """Keep the private source overlay and launch record on the same accepted artifact."""
     manifest = json.loads(

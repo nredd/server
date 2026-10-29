@@ -17,6 +17,7 @@ CONF_RADIO_STATION_FIRST: Final[str] = "radio_station_first"
 CONF_EXPERIMENTAL_HOMEPOD_REMOTE: Final[str] = "experimental_homepod_remote"
 CONF_EXPERIMENTAL_SESSION_VOLUME: Final[str] = "experimental_session_volume"
 CONF_PRIVATE_NATIVE_VOLUME_CAPTURE: Final[str] = "private_native_volume_capture"
+CONF_PRIVATE_NOW_PLAYING_DATASTREAM: Final[str] = "private_now_playing_datastream"
 
 
 class StreamingProtocol(IntEnum):
