@@ -32,7 +32,7 @@ from music_assistant.models.player import (
 )
 from music_assistant.models.setup_flow import AbortFlow
 
-from . import announce
+from . import announce, trial_binary
 from .constants import (
     AIRPLAY_DEFAULT_PORT,
     AIRPLAY_DISCOVERY_TYPE,
@@ -47,6 +47,7 @@ from .constants import (
     CONF_ENABLE_HIRES,
     CONF_ENCRYPTION,
     CONF_ENTRY_SYNC_ADJUST_AIRPLAY,
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_IGNORE_VOLUME,
     CONF_PAIR_NOW,
     CONF_PAIRING_PASSWORD,
@@ -847,14 +848,34 @@ class AirPlayPlayer(Player):
             self.update_state()
 
     @property
+    def native_volume_rail_enabled(self) -> bool:
+        """
+        Return whether the receiver's own volume rail drives this player (private trial).
+
+        Two live gesture windows on 2026-10-28 showed a HomePod sends every native volume
+        change (touch, Siri, Home app) to this server as DACP `dmcp.device-volume`, and
+        that its rail is live only while the CLI holds the receive-only DataStream
+        registration (`CLIAIRPLAY_NATIVE_VOLUME_RAIL`). Both halves hang off the
+        experimental HomePod-remote admission and exist only on the trial target.
+        """
+        return (
+            trial_binary.is_trial_target()
+            and self.provider.config.get_value(CONF_EXPERIMENTAL_HOMEPOD_REMOTE, False) is True
+        )
+
+    @property
     def ignore_volume_reports(self) -> bool:
         """Return True if the device's own volume reports must not be acted on."""
         if self._volume_reports_ignored_until > time.time():
             # a level we sent ourselves is still echoing back
             return True
-        return bool(
-            self.config.get_value(CONF_IGNORE_VOLUME)
-            or self.device_info.manufacturer.lower() == "apple"
+        if self.config.get_value(CONF_IGNORE_VOLUME):
+            return True
+        # Apple receivers echo every level back; outside the trial rail that echo would read
+        # as a user gesture, so their reports are ignored wholesale. The rail relies on the
+        # echo-grace window instead, so the real gestures get through.
+        return (
+            self.device_info.manufacturer.lower() == "apple" and not self.native_volume_rail_enabled
         )
 
     def suppress_volume_reports(self, seconds: float = AIRPLAY_VOLUME_ECHO_GRACE_S) -> None:

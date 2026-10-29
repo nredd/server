@@ -15,7 +15,9 @@ from music_assistant.providers.airplay import pairing as pairing_module
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay import trial_binary
 from music_assistant.providers.airplay.constants import COMPANION_DISCOVERY_TYPE
+from music_assistant.providers.airplay.player import AirPlayPlayer
 from music_assistant.providers.airplay.provider import AirPlayProvider
+from tests.providers.airplay.test_player import _stub_raw_config, _stub_volume_scaling
 from tests.providers.airplay.test_private_capture_api import _child, _playing_provider
 
 TARGET = "aabbccddeeff@Main Pod"
@@ -275,3 +277,102 @@ def test_private_ptp_readiness_requires_strict_peer_attestation(
     prov._ptp_daemon_warns_suppressed = 0
     prov._handle_ptp_daemon_line(line)
     assert prov._ptp_daemon_ready.is_set() is ready
+
+
+def _apple_player(monkeypatch: pytest.MonkeyPatch, *, private: bool, remote: bool) -> AirPlayPlayer:
+    """Build an Apple-manufactured player under the given profile and admission."""
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: private)
+    provider = MagicMock()
+    _stub_raw_config(provider)
+    _stub_volume_scaling(provider)
+    provider.config.get_value = lambda key, default=None: (
+        remote if key == "experimental_homepod_remote" else default
+    )
+    player = AirPlayPlayer(
+        provider=provider,
+        player_id=TARGET_PLAYER_ID,
+        display_name="main-pod",
+        address="192.168.40.99",
+        manufacturer="Apple",
+        model="HomePod",
+        raop_discovery_info=None,
+        airplay_discovery_info=None,
+    )
+    player.config.get_value.return_value = False  # type: ignore[attr-defined]
+    return player
+
+
+@pytest.mark.parametrize(
+    ("private", "remote", "adopted"),
+    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+)
+def test_apple_device_volume_is_adopted_only_on_the_trial_rail(
+    monkeypatch: pytest.MonkeyPatch, private: bool, remote: bool, adopted: bool
+) -> None:
+    """A HomePod's own DACP volume report drives the player only under the trial rail."""
+    player = _apple_player(monkeypatch, private=private, remote=remote)
+    player._attr_volume_level = 25
+    assert player.native_volume_rail_enabled is adopted
+    assert player.ignore_volume_reports is not adopted
+    with patch.object(AirPlayPlayer, "update_state"):
+        player.update_volume_from_device(40)
+    if adopted:
+        cast("MagicMock", player.mass).create_task.assert_called_once()
+    else:
+        cast("MagicMock", player.mass).create_task.assert_not_called()
+        assert player._attr_volume_level == 25
+
+
+def test_trial_rail_still_respects_the_echo_window_and_ignore_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Our own level echoing back, or the explicit ignore option, still wins on the rail."""
+    player = _apple_player(monkeypatch, private=True, remote=True)
+    player.suppress_volume_reports(10)
+    assert player.ignore_volume_reports is True
+    player._volume_reports_ignored_until = 0
+    player.config.get_value.return_value = True  # type: ignore[attr-defined]
+    assert player.ignore_volume_reports is True
+
+
+@pytest.mark.parametrize(
+    ("private", "remote", "volume", "rail"),
+    [
+        (True, True, False, "1"),
+        (True, True, True, "0"),
+        (True, False, False, "0"),
+        (False, True, False, "0"),
+    ],
+)
+async def test_stream_child_requests_the_native_rail(
+    monkeypatch: pytest.MonkeyPatch, private: bool, remote: bool, volume: bool, rail: str
+) -> None:
+    """The rail env rides HomePod-remote admission on the trial, never with session volume."""
+    provider, _player, stream = _playing_provider(monkeypatch)
+    values = {"experimental_homepod_remote": remote, "experimental_session_volume": volume}
+    provider.config = MagicMock()
+    provider.config.get_value.side_effect = lambda key, default=None: values.get(key, default)
+    child = _child()
+    monkeypatch.setattr(child, "start", AsyncMock())
+    factory = AsyncMock(return_value=child)
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: private)
+    monkeypatch.setattr(trial_binary, "create_private_process", factory)
+    monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=["unused"]))
+    monkeypatch.setattr(stream, "_check_password_preflight", lambda: None)
+    monkeypatch.setattr(stream.commands_pipe, "create", AsyncMock())
+    captured: dict[str, str] = {}
+
+    def discard_reader(coro: Coroutine[Any, Any, None]) -> MagicMock:
+        coro.close()
+        return MagicMock()
+
+    assert isinstance(provider.mass, MagicMock)
+    provider.mass.create_task.side_effect = discard_reader
+    if not private:
+        monkeypatch.setattr(
+            "music_assistant.providers.airplay.stream.AsyncProcess",
+            lambda *_args, **kwargs: captured.update(kwargs.get("env", {})) or child,
+        )
+    await stream.connect()
+    env = factory.call_args.kwargs["env"] if private else captured
+    assert env["CLIAIRPLAY_NATIVE_VOLUME_RAIL"] == rail

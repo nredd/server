@@ -39,6 +39,28 @@ the merge. The aarch64 artifact has ELF SHA256
 build label `vc4e7bef`; it is staged on the host and its `--check` passed there. The
 previous `0531c6c` asset (`0d069870…de47`) stays staged as history.
 
+## Native volume rail (trial only)
+
+Two owner-present gesture windows on 2026-10-28 settled what the "grey rail" is. A HomePod
+sends every native volume change (top touch, Siri, Home app) to this server as DACP
+`dmcp.device-volume` on the ActiveRemote server MA already runs; not one volume frame
+appeared on the MRP event channel or DataStream in a valid capture record. The rail in
+Control Center and the Home app is grey unless the CLI holds a receive-only type-130
+DataStream registration (`DEVICE_INFO`, connection state, updates config), which the
+capture profile happened to perform; with HomePod-remote admission alone the rail stayed
+grey while the DACP reports still arrived. MA then ignored them, because
+`AirPlayPlayer.ignore_volume_reports` has treated every Apple receiver's reports as echo
+since the 2025 player refactor.
+
+On the trial target with `experimental_homepod_remote` on, two things change and nothing
+else: the stream child receives `CLIAIRPLAY_NATIVE_VOLUME_RAIL=1` (never together with the
+session-volume backend), and `AirPlayPlayer.native_volume_rail_enabled` lets an Apple
+receiver's DACP volume report drive the player through the ordinary
+`update_volume_from_device` path, with the echo-grace window and the explicit
+`ignore_volume` option still in force. Session-volume publication stays off; no MRP
+volume command is sent or accepted; the output-role binding question has no traffic
+behind it and is retired for this receiver. Ordinary profiles are unchanged.
+
 ## Private aggregate volume capture
 
 The advanced `private_native_volume_capture` provider flag exists only in this private
