@@ -1432,6 +1432,8 @@ class AirPlayProvider(PlayerProvider):
                         player_id,
                         task_id=f"debounced_pause_{player_id}",
                     )
+            elif "dmcp.device-volume=" in path and player.native_volume_rail_enabled:
+                player.adopt_native_volume(float(path.split("dmcp.device-volume=", 1)[-1]))
             elif (
                 "dmcp.device-volume=" in path
                 and not player.ignore_volume_reports

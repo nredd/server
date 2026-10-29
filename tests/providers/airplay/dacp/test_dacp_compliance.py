@@ -348,3 +348,33 @@ async def test_documented_unhandled_commands_noop(
     ):
         getattr(players, cmd).assert_not_called()
     assert response.startswith(b"HTTP/1.0 204 No Content")
+
+
+async def test_device_volume_on_the_native_rail_is_adopted_not_written(
+    airplay_provider: AirPlayProvider, mock_mass: MagicMock
+) -> None:
+    """On the trial rail an Apple device's report is adopted locally and never echoed back."""
+    player = make_player(mock_mass, manufacturer="Apple")
+    player.native_volume_rail_enabled = True
+    for level in ("-18.000000", "-144.000000", "-22.500000"):
+        await replay(
+            airplay_provider,
+            build_dacp_request(f"/ctrl-int/1/setproperty?dmcp.device-volume={level}"),
+        )
+    assert [c.args[0] for c in player.adopt_native_volume.call_args_list] == [-18.0, -144.0, -22.5]
+    player.update_volume_from_device.assert_not_called()
+    player.stream.send_cli_command.assert_not_called()
+    assert player._attr_volume_muted is not True
+
+
+async def test_device_volume_off_the_rail_keeps_the_apple_ignore(
+    airplay_provider: AirPlayProvider, mock_mass: MagicMock
+) -> None:
+    """Without the rail the Apple echo rule is exactly as before."""
+    player = make_player(mock_mass, manufacturer="Apple")
+    player.native_volume_rail_enabled = False
+    await replay(
+        airplay_provider, build_dacp_request("/ctrl-int/1/setproperty?dmcp.device-volume=-18.0")
+    )
+    player.adopt_native_volume.assert_not_called()
+    player.update_volume_from_device.assert_not_called()

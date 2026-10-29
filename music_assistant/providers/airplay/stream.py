@@ -398,6 +398,15 @@ class AirPlayStream:
             ),
             "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if self.session_volume_requested else "off",
             "CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE": "1" if capture_eligible else "0",
+            # Receive-only DataStream registration that keeps the receiver's native rail live;
+            # never together with the session-volume backend, which owns that channel.
+            "CLIAIRPLAY_NATIVE_VOLUME_RAIL": (
+                "1"
+                if trial_binary.is_trial_target()
+                and self._homepod_remote_admission_requested
+                and not self.session_volume_requested
+                else "0"
+            ),
         }
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(

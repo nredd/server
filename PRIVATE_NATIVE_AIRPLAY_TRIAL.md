@@ -28,16 +28,14 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
-The private CLI observation branch is pinned to `c4e7bef9dc854e3550b87995a63f3817e64d1906`
-(merge of nredd/airplay-cli#5, receive-only DataStream attach for private capture, on top
-of #4 strict-peer attestation, `d286032` strict-peer receive gate and `716f894` passive
-capture). Canonical CLI Build `40774770257` passed the Linux aarch64/x86_64 platform jobs
-and the sanitizer job; the macOS jobs stalled in GitHub's hosted-runner queue and the
-identical `build-macos (arm64)` recipe was run locally on an arm64 Mac, all green, before
-the merge. The aarch64 artifact has ELF SHA256
-`ee32ce3d4edd3cdf287010384ab463bb37e380843e6877bbf1f7ee271546223f` (6173544 bytes) and
-build label `vc4e7bef`; it is staged on the host and its `--check` passed there. The
-previous `0531c6c` asset (`0d069870…de47`) stays staged as history.
+The private CLI observation branch is pinned to `8dfa952f871ea2c4e7a5b2cb27baea07ab00030d`
+(merge of nredd/airplay-cli#6, the receive-only native volume rail registration, on top
+of #5 receive-only capture attach, #4 strict-peer attestation, `d286032` strict-peer
+receive gate and `716f894` passive capture). Canonical CLI Build `40816795184` passed
+every platform job including both macOS jobs and the sanitizer job. The aarch64 artifact
+has ELF SHA256 `f7af74994caa8b29a3d06ed9e461036446a7ec7c6115ab7311b0e113b987c79b`
+(6169448 bytes) and build label `v8dfa952`; it is staged on the host and its `--check`
+passed there. Earlier assets stay staged as history.
 
 ## Private aggregate volume capture
 
@@ -229,7 +227,7 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
 - Every owned private CLI child (PTP daemon, stream and pair-setup) receives
   `CLIAIRPLAY_PTP_STRICT_PEERS=1`, and on the trial target the shared daemon counts as
   ready ONLY when its `[PTP] daemon up` line attests `strict-peers=on`. The pinned asset
-  `c4e7bef` implements the receive gate (`d286032`) and the attestation (#4). An older
+  `8dfa952` implements the receive gate (`d286032`) and the attestation (#4). An older
   asset that cannot attest it (e.g. the retired `716f894`) leaves `ptp_ready`,
   `prestream_ready` and `playing_ready` false, fails the readiness receipt closed, and
   makes every trial AirPlay 2 session start wait the full `PTP_DAEMON_READY_TIMEOUT` (3 s)
@@ -286,7 +284,7 @@ executable must match SHA256 and ELF64 little-endian AArch64 headers before `--c
 The build check executes a retained validated descriptor too, never a pathname which can
 be swapped and restored between pre/post validation. It has a five-second deadline,
 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `vc4e7bef` with exit zero.
+second of cleanup, and must report `cliairplay`, `check` and `v8dfa952` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.

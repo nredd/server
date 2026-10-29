@@ -32,7 +32,7 @@ from music_assistant.models.player import (
 )
 from music_assistant.models.setup_flow import AbortFlow
 
-from . import announce
+from . import announce, trial_binary
 from .constants import (
     AIRPLAY_DEFAULT_PORT,
     AIRPLAY_DISCOVERY_TYPE,
@@ -41,6 +41,7 @@ from .constants import (
     AIRPLAY_PCM_FORMAT,
     AIRPLAY_REJOIN_ATTEMPT_DELAYS,
     AIRPLAY_VOLUME_ECHO_GRACE_S,
+    AIRPLAY_VOLUME_MUTE,
     BASE_PLAYER_FEATURES,
     CONF_AIRPLAY_CREDENTIALS,
     CONF_BUFFER_DEPTH,
@@ -71,6 +72,7 @@ from .constants import (
     StreamingProtocol,
 )
 from .helpers import (
+    convert_airplay_volume,
     default_buffer_depth,
     default_hires_enabled,
     get_decoded_property,
@@ -847,6 +849,25 @@ class AirPlayPlayer(Player):
             self.update_state()
 
     @property
+    def native_volume_rail_enabled(self) -> bool:
+        """
+        Return whether the receiver's own volume rail drives this player (private trial).
+
+        Two live gesture windows on 2026-10-28 showed a HomePod sends every native volume
+        change (touch, Siri, Home app) to this server as DACP `dmcp.device-volume`, and
+        that its rail is live only while the CLI holds the receive-only DataStream
+        registration (`CLIAIRPLAY_NATIVE_VOLUME_RAIL`). The rail is on only for a current
+        stream whose child reported HomePod-remote admission and which does not run the
+        session-volume backend, so the receiver that reports is the one the CLI admitted.
+        """
+        return (
+            trial_binary.is_trial_target()
+            and self.stream is not None
+            and self.stream.homepod_remote_admission is True
+            and not self.stream.session_volume_requested
+        )
+
+    @property
     def ignore_volume_reports(self) -> bool:
         """Return True if the device's own volume reports must not be acted on."""
         if self._volume_reports_ignored_until > time.time():
@@ -856,6 +877,29 @@ class AirPlayPlayer(Player):
             self.config.get_value(CONF_IGNORE_VOLUME)
             or self.device_info.manufacturer.lower() == "apple"
         )
+
+    def adopt_native_volume(self, airplay_volume: float) -> None:
+        """
+        Take the level the receiver's native rail reports, without writing it back.
+
+        The receiver already has this level; writing it back would echo as a new gesture
+        and bounce against the next tap. Our own writes still open the echo window, and the
+        explicit ignore option still wins. Mute is the receiver's flag, not a level.
+
+        :param airplay_volume: The reported `dmcp.device-volume` in dB.
+        """
+        if self._volume_reports_ignored_until > time.time() or self.config.get_value(
+            CONF_IGNORE_VOLUME
+        ):
+            return
+        if airplay_volume <= AIRPLAY_VOLUME_MUTE:
+            self._attr_volume_muted = True
+        else:
+            self._attr_volume_muted = False
+            volume = convert_airplay_volume(airplay_volume)
+            self._attr_volume_level = volume
+            self.mass.config.set_raw_player_config_value(self.player_id, CONF_STORED_VOLUME, volume)
+        self.update_state()
 
     def suppress_volume_reports(self, seconds: float = AIRPLAY_VOLUME_ECHO_GRACE_S) -> None:
         """
