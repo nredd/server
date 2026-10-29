@@ -1396,6 +1396,20 @@ class AirPlayProvider(PlayerProvider):
                 parent_player = player
 
             player_id = player.player_id
+            if (
+                "dmcp.device-volume=" in path
+                and is_trial_target()
+                and not player.native_volume_rail_enabled
+            ):
+                stream = player.stream
+                self.logger.debug(
+                    f"Device-volume feedback bypassed `native_volume_rail_enabled`: "
+                    f"player='{player.display_name}', stream='{stream is not None}', "
+                    f"`homepod_remote_admission`="
+                    f"'{None if stream is None else stream.homepod_remote_admission}', "
+                    f"`session_volume_requested`="
+                    f"'{None if stream is None else stream.session_volume_requested}'"
+                )
             if path == "/ctrl-int/1/nextitem":
                 self.handle_remote_command(player, AirPlayRemoteCommand.NEXT)
             elif path == "/ctrl-int/1/previtem":

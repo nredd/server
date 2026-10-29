@@ -39,6 +39,20 @@ passed there. Earlier assets stay staged as history.
 
 ## Private aggregate volume capture
 
+### Corrected volume observations
+
+The earlier capture-on success and capture-on/capture-off A/B causality claims are INVALID,
+not established findings. The owner has never observed a Music Assistant AirPlay HomePod stream
+enabling an iPhone volume rail. On 2026-10-29 at 12:07, office-pod produced 13 DACP
+`dmcp.device-volume` reports and MA's API later showed 50% from a prior 25%; that is physical
+office-pod DACP adoption only, not phone-rail success. The 12:07 series ended at -15 dB (50%).
+An earlier 11:56 window ended at -22.5 dB (25%); only that earlier final value cannot show whether
+its intermediate reports were ignored.
+The acceptance oracle is the phone UI. The owner confirmed a usable rail for Siri-started
+receiver playback on office-pod. The Mac external-sender baseline remains pending; compare it
+from the SAME phone remote-control view. If both controls are grey, the result is inconclusive, never PASS,
+and does not invalidate the acceptance target. No existing machine-observable field establishes it.
+
 The advanced `private_native_volume_capture` provider flag exists only in this private
 profile and defaults to false. It is an additive private configuration value, not a
 normal-provider option or an environment inherited by all children. The operator must set
@@ -505,13 +519,13 @@ IDs. It never accepts an API host, endpoint, credential, media URL, queue, or ra
 configuration as an argument or stores any of those values. Never add it, its tests, or its
 runbook procedure to upstream work.
 
-Future hardware acceptance is `media_player.mainpod` ONLY. `media_player.officepod`
-(downstairs) is excluded from playback, volume, transport, grouping, power, native probes,
-and any request to interrupt TV/audio. Future office/group acceptance requirements are
-retired, not completed. Historical artifacts, pins, and offline group fixtures remain
-unchanged; they do not authorize office hardware use. Keep the existing active non-target
-stream guard: never clear office activity to enable a main trial. Safe main-only isolation
-redesign is separate task 70, not part of this offline recovery fix.
+Historical hardware rule: future acceptance was `media_player.mainpod` ONLY and
+`media_player.officepod` was excluded. That rule is superseded by the
+2026-10-29 owner override: the owner cannot go upstairs, so all live tests may use ONLY office-pod
+until the owner explicitly changes that scope.
+Retarget `private_trial_target` to office-pod. `scripts/private_trial_window.sh` hardcodes
+main-pod and MUST NOT run for the office window; do not refactor that wizard in this patch.
+Historical artifacts, pins and offline group fixtures remain historical, not authorization.
 
 Copy the reviewed helper to the SSH add-on, verify its SHA-256 against the external
 receipt, and set `RECOVERY_SCRIPT` to that verified absolute path. It supports the SSH

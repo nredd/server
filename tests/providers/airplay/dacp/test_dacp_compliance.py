@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay.provider import AirPlayProvider
 
 from .conftest import make_player
@@ -150,6 +151,45 @@ async def test_device_volume_mute_threshold_mutes(
     await replay(airplay_provider, raw)
     assert player._attr_volume_muted is True
     player.stream.send_cli_command.assert_called_once_with("VOLUME=0")
+
+
+async def test_trial_diagnostic_keeps_device_volume_fallback(
+    airplay_provider: AirPlayProvider,
+    mock_mass: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disabled trial rail leaves the established device-volume fallback reachable."""
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
+    player = make_player(mock_mass)
+
+    await replay(
+        airplay_provider,
+        build_dacp_request("/ctrl-int/1/setproperty?dmcp.device-volume=-15.000000"),
+    )
+
+    player.adopt_native_volume.assert_not_called()
+    player.update_volume_from_device.assert_called_once_with(50)
+
+
+@pytest.mark.parametrize("guard", ["ignore_volume_reports", "checked_volume_enabled"])
+async def test_trial_diagnostic_respects_device_volume_fallback_guards(
+    airplay_provider: AirPlayProvider,
+    mock_mass: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    guard: str,
+) -> None:
+    """A disabled trial rail preserves the original device-volume fallback guards."""
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
+    player = make_player(mock_mass)
+    setattr(player, guard, True)
+
+    await replay(
+        airplay_provider,
+        build_dacp_request("/ctrl-int/1/setproperty?dmcp.device-volume=-15.000000"),
+    )
+
+    player.adopt_native_volume.assert_not_called()
+    player.update_volume_from_device.assert_not_called()
 
 
 async def test_device_volume_ignored_for_apple_device(
