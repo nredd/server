@@ -279,15 +279,14 @@ def test_private_ptp_readiness_requires_strict_peer_attestation(
     assert prov._ptp_daemon_ready.is_set() is ready
 
 
-def _apple_player(monkeypatch: pytest.MonkeyPatch, *, private: bool, remote: bool) -> AirPlayPlayer:
-    """Build an Apple-manufactured player under the given profile and admission."""
+def _apple_player(
+    monkeypatch: pytest.MonkeyPatch, *, private: bool, admission: bool | None, volume: bool = False
+) -> AirPlayPlayer:
+    """Build an Apple-manufactured player with a stream in the given admission state."""
     monkeypatch.setattr(trial_binary, "is_trial_target", lambda: private)
     provider = MagicMock()
     _stub_raw_config(provider)
     _stub_volume_scaling(provider)
-    provider.config.get_value = lambda key, default=None: (
-        remote if key == "experimental_homepod_remote" else default
-    )
     player = AirPlayPlayer(
         provider=provider,
         player_id=TARGET_PLAYER_ID,
@@ -299,40 +298,74 @@ def _apple_player(monkeypatch: pytest.MonkeyPatch, *, private: bool, remote: boo
         airplay_discovery_info=None,
     )
     player.config.get_value.return_value = False  # type: ignore[attr-defined]
+    player.stream = MagicMock(homepod_remote_admission=admission, session_volume_requested=volume)
     return player
 
 
 @pytest.mark.parametrize(
-    ("private", "remote", "adopted"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+    ("private", "admission", "volume", "enabled"),
+    [
+        (True, True, False, True),
+        (True, True, True, False),
+        (True, False, False, False),
+        (True, None, False, False),
+        (False, True, False, False),
+    ],
 )
-def test_apple_device_volume_is_adopted_only_on_the_trial_rail(
-    monkeypatch: pytest.MonkeyPatch, private: bool, remote: bool, adopted: bool
+def test_native_rail_follows_the_admitted_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    private: bool,
+    admission: bool | None,
+    volume: bool,
+    enabled: bool,
 ) -> None:
-    """A HomePod's own DACP volume report drives the player only under the trial rail."""
-    player = _apple_player(monkeypatch, private=private, remote=remote)
+    """The rail is on only for a trial stream the CLI admitted, never with session volume."""
+    player = _apple_player(monkeypatch, private=private, admission=admission, volume=volume)
+    assert player.native_volume_rail_enabled is enabled
+    player.stream = None
+    assert player.native_volume_rail_enabled is False
+    # the Apple echo rule itself is untouched
+    assert player.ignore_volume_reports is True
+
+
+def test_adopt_native_volume_never_writes_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rail report sets the level and mute flag locally; nothing is sent to the device."""
+    player = _apple_player(monkeypatch, private=True, admission=True)
     player._attr_volume_level = 25
-    assert player.native_volume_rail_enabled is adopted
-    assert player.ignore_volume_reports is not adopted
-    with patch.object(AirPlayPlayer, "update_state"):
-        player.update_volume_from_device(40)
-    if adopted:
-        cast("MagicMock", player.mass).create_task.assert_called_once()
-    else:
-        cast("MagicMock", player.mass).create_task.assert_not_called()
-        assert player._attr_volume_level == 25
+    with patch.object(AirPlayPlayer, "update_state") as update_state:
+        player.adopt_native_volume(-18.0)  # one 1.5 dB step above -19.5
+        levels = [player._attr_volume_level]
+        muted = [player.volume_muted]
+        player.adopt_native_volume(-144.0)
+        levels.append(player._attr_volume_level)
+        muted.append(player.volume_muted)
+        player.adopt_native_volume(-22.5)
+        levels.append(player._attr_volume_level)
+        muted.append(player.volume_muted)
+    assert levels == [40, 40, 25]
+    assert muted == [False, True, False]
+    assert update_state.call_count == 3
+    cast("MagicMock", player.mass).create_task.assert_not_called()
+    cast("MagicMock", player.stream).send_cli_command.assert_not_called()
+    cast("MagicMock", player.mass).config.set_raw_player_config_value.assert_called_with(
+        TARGET_PLAYER_ID, "stored_volume", 25
+    )
 
 
-def test_trial_rail_still_respects_the_echo_window_and_ignore_option(
+def test_adopt_native_volume_respects_echo_window_and_ignore_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Our own level echoing back, or the explicit ignore option, still wins on the rail."""
-    player = _apple_player(monkeypatch, private=True, remote=True)
+    player = _apple_player(monkeypatch, private=True, admission=True)
+    player._attr_volume_level = 25
     player.suppress_volume_reports(10)
-    assert player.ignore_volume_reports is True
-    player._volume_reports_ignored_until = 0
-    player.config.get_value.return_value = True  # type: ignore[attr-defined]
-    assert player.ignore_volume_reports is True
+    with patch.object(AirPlayPlayer, "update_state") as update_state:
+        player.adopt_native_volume(-18.0)
+        player._volume_reports_ignored_until = 0
+        player.config.get_value.return_value = True  # type: ignore[attr-defined]
+        player.adopt_native_volume(-18.0)
+    update_state.assert_not_called()
+    assert player._attr_volume_level == 25
 
 
 @pytest.mark.parametrize(

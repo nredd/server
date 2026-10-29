@@ -53,13 +53,18 @@ grey while the DACP reports still arrived. MA then ignored them, because
 since the 2025 player refactor.
 
 On the trial target with `experimental_homepod_remote` on, two things change and nothing
-else: the stream child receives `CLIAIRPLAY_NATIVE_VOLUME_RAIL=1` (never together with the
-session-volume backend), and `AirPlayPlayer.native_volume_rail_enabled` lets an Apple
-receiver's DACP volume report drive the player through the ordinary
-`update_volume_from_device` path, with the echo-grace window and the explicit
-`ignore_volume` option still in force. Session-volume publication stays off; no MRP
-volume command is sent or accepted; the output-role binding question has no traffic
-behind it and is retired for this receiver. Ordinary profiles are unchanged.
+else. The stream child receives `CLIAIRPLAY_NATIVE_VOLUME_RAIL=1` (never together with the
+session-volume backend). And for a current stream whose child reported HomePod-remote
+admission (`AirPlayPlayer.native_volume_rail_enabled`, so the receiver reporting is the
+one the CLI admitted, never every Apple receiver on the host), a `dmcp.device-volume`
+report is ADOPTED, not written back: `adopt_native_volume` sets the level or the mute flag
+locally and updates state. The receiver already has the level; writing it back would echo
+as a new gesture and bounce against the next tap, and a reported `-30 dB` would turn into
+`VOLUME=0` and a hard mute. Our own writes still open the echo-grace window and the
+explicit `ignore_volume` option still wins; the Apple echo rule in `ignore_volume_reports`
+is untouched for every other path. Session-volume publication stays off; no MRP volume
+command is sent or accepted; the output-role binding question has no traffic behind it and
+is retired for this receiver. Ordinary profiles are unchanged.
 
 ## Private aggregate volume capture
 
