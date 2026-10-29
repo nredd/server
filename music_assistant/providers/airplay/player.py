@@ -851,14 +851,10 @@ class AirPlayPlayer(Player):
     @property
     def native_volume_rail_enabled(self) -> bool:
         """
-        Return whether the receiver's own volume rail drives this player (private trial).
+        Return whether private-trial device-volume feedback may drive this player.
 
-        Two live gesture windows on 2026-10-28 showed a HomePod sends every native volume
-        change (touch, Siri, Home app) to this server as DACP `dmcp.device-volume`, and
-        that its rail is live only while the CLI holds the receive-only DataStream
-        registration (`CLIAIRPLAY_NATIVE_VOLUME_RAIL`). The rail is on only for a current
-        stream whose child reported HomePod-remote admission and which does not run the
-        session-volume backend, so the receiver that reports is the one the CLI admitted.
+        This requires a current stream whose child reported HomePod-remote admission and
+        does not run the session-volume backend.
         """
         return (
             trial_binary.is_trial_target()
@@ -889,12 +885,12 @@ class AirPlayPlayer(Player):
         :param airplay_volume: The reported `dmcp.device-volume` in dB.
         """
         if self._volume_reports_ignored_until > time.time():
-            self.logger.debug("Native rail: report inside our own echo window, ignored")
+            self.logger.debug("Device-volume feedback ignored inside the echo window")
             return
         if self.config.get_value(CONF_IGNORE_VOLUME):
-            self.logger.debug("Native rail: ignore_volume is set, report ignored")
+            self.logger.debug("Device-volume feedback ignored: `ignore_volume` is set")
             return
-        self.logger.debug("Native rail: adopting device volume %.1f dB", airplay_volume)
+        self.logger.debug(f"Device-volume feedback adopting level='{airplay_volume:.1f} dB'")
         if airplay_volume <= AIRPLAY_VOLUME_MUTE:
             self._attr_volume_muted = True
         else:

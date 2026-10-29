@@ -398,7 +398,7 @@ class AirPlayStream:
             ),
             "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if self.session_volume_requested else "off",
             "CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE": "1" if capture_eligible else "0",
-            # Receive-only DataStream registration that keeps the receiver's native rail live;
+            # Receive-only DataStream registration for private device-volume feedback observation;
             # never together with the session-volume backend, which owns that channel.
             "CLIAIRPLAY_NATIVE_VOLUME_RAIL": (
                 "1"

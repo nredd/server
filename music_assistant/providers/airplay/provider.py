@@ -1396,6 +1396,20 @@ class AirPlayProvider(PlayerProvider):
                 parent_player = player
 
             player_id = player.player_id
+            if (
+                "dmcp.device-volume=" in path
+                and is_trial_target()
+                and not player.native_volume_rail_enabled
+            ):
+                stream = player.stream
+                self.logger.debug(
+                    f"Device-volume feedback bypassed `native_volume_rail_enabled`: "
+                    f"player='{player.display_name}', stream='{stream is not None}', "
+                    f"`homepod_remote_admission`="
+                    f"'{None if stream is None else stream.homepod_remote_admission}', "
+                    f"`session_volume_requested`="
+                    f"'{None if stream is None else stream.session_volume_requested}'"
+                )
             if path == "/ctrl-int/1/nextitem":
                 self.handle_remote_command(player, AirPlayRemoteCommand.NEXT)
             elif path == "/ctrl-int/1/previtem":
@@ -1434,17 +1448,6 @@ class AirPlayProvider(PlayerProvider):
                     )
             elif "dmcp.device-volume=" in path and player.native_volume_rail_enabled:
                 player.adopt_native_volume(float(path.split("dmcp.device-volume=", 1)[-1]))
-            elif "dmcp.device-volume=" in path and is_trial_target():
-                # The trial must say WHY a report was not adopted, in finite terms only.
-                stream = player.stream
-                self.logger.debug(
-                    "Native rail declined device-volume for %s: stream=%s admission=%s "
-                    "session_volume=%s",
-                    player.display_name,
-                    stream is not None,
-                    None if stream is None else stream.homepod_remote_admission,
-                    None if stream is None else stream.session_volume_requested,
-                )
             elif (
                 "dmcp.device-volume=" in path
                 and not player.ignore_volume_reports
