@@ -1434,6 +1434,17 @@ class AirPlayProvider(PlayerProvider):
                     )
             elif "dmcp.device-volume=" in path and player.native_volume_rail_enabled:
                 player.adopt_native_volume(float(path.split("dmcp.device-volume=", 1)[-1]))
+            elif "dmcp.device-volume=" in path and is_trial_target():
+                # The trial must say WHY a report was not adopted, in finite terms only.
+                stream = player.stream
+                self.logger.debug(
+                    "Native rail declined device-volume for %s: stream=%s admission=%s "
+                    "session_volume=%s",
+                    player.display_name,
+                    stream is not None,
+                    None if stream is None else stream.homepod_remote_admission,
+                    None if stream is None else stream.session_volume_requested,
+                )
             elif (
                 "dmcp.device-volume=" in path
                 and not player.ignore_volume_reports

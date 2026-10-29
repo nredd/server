@@ -888,10 +888,13 @@ class AirPlayPlayer(Player):
 
         :param airplay_volume: The reported `dmcp.device-volume` in dB.
         """
-        if self._volume_reports_ignored_until > time.time() or self.config.get_value(
-            CONF_IGNORE_VOLUME
-        ):
+        if self._volume_reports_ignored_until > time.time():
+            self.logger.debug("Native rail: report inside our own echo window, ignored")
             return
+        if self.config.get_value(CONF_IGNORE_VOLUME):
+            self.logger.debug("Native rail: ignore_volume is set, report ignored")
+            return
+        self.logger.debug("Native rail: adopting device volume %.1f dB", airplay_volume)
         if airplay_volume <= AIRPLAY_VOLUME_MUTE:
             self._attr_volume_muted = True
         else:
