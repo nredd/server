@@ -48,8 +48,9 @@ enabling an iPhone volume rail. On 2026-10-29 at 12:07, office-pod produced 13 D
 office-pod DACP adoption only, not phone-rail success. The 12:07 series ended at -15 dB (50%).
 An earlier 11:56 window ended at -22.5 dB (25%); only that earlier final value cannot show whether
 its intermediate reports were ignored.
-The acceptance oracle is the phone UI: the baseline requires native Apple-source control from the
-SAME phone remote-control view. If both controls are grey, the result is inconclusive, never PASS,
+The acceptance oracle is the phone UI. The owner confirmed a usable rail for Siri-started
+receiver playback on office-pod. The Mac external-sender baseline remains pending; compare it
+from the SAME phone remote-control view. If both controls are grey, the result is inconclusive, never PASS,
 and does not invalidate the acceptance target. No existing machine-observable field establishes it.
 
 The advanced `private_native_volume_capture` provider flag exists only in this private
@@ -519,8 +520,9 @@ configuration as an argument or stores any of those values. Never add it, its te
 runbook procedure to upstream work.
 
 Historical hardware rule: future acceptance was `media_player.mainpod` ONLY and
-`media_player.officepod` was excluded. That rule is superseded for the next live window by the
-2026-10-29 owner override: the owner cannot go upstairs, so tests may use ONLY office-pod.
+`media_player.officepod` was excluded. That rule is superseded by the
+2026-10-29 owner override: the owner cannot go upstairs, so all live tests may use ONLY office-pod
+until the owner explicitly changes that scope.
 Retarget `private_trial_target` to office-pod. `scripts/private_trial_window.sh` hardcodes
 main-pod and MUST NOT run for the office window; do not refactor that wizard in this patch.
 Historical artifacts, pins and offline group fixtures remain historical, not authorization.
