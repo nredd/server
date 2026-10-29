@@ -64,6 +64,7 @@ from .constants import (
     CONF_PASSWORD_INVALID,
     CONF_PASSWORD_MARKERS_REVIEWED,
     CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    CONF_PRIVATE_NOW_PLAYING_DATASTREAM,
     CONF_RADIO_STATION_FIRST,
     CONF_STORED_VOLUME,
     CONF_STREAMING_MODE,
@@ -319,6 +320,13 @@ class AirPlayProvider(PlayerProvider):
                 (
                     ConfigEntry(
                         key=CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+                        type=ConfigEntryType.BOOLEAN,
+                        default_value=False,
+                        required=False,
+                        advanced=True,
+                    ),
+                    ConfigEntry(
+                        key=CONF_PRIVATE_NOW_PLAYING_DATASTREAM,
                         type=ConfigEntryType.BOOLEAN,
                         default_value=False,
                         required=False,

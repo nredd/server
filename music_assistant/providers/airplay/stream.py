@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import signal
 import time
@@ -46,6 +47,7 @@ from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PASSWORD,
     CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    CONF_PRIVATE_NOW_PLAYING_DATASTREAM,
     CONF_RADIO_STATION_FIRST,
     CONF_RAOP_CREDENTIALS,
     RAOP_DEFAULT_PORT,
@@ -96,6 +98,7 @@ CLI_NATIVE_CONTROL_FAILURE: Final[str] = "[ERROR] AirPlay 2 control channel fail
 _CLI_ERROR_CODE_RE = re.compile(r"\bcode=(\S+)")
 _CLI_ERROR_HTTP_RE = re.compile(r"\bhttp=(\d+)")
 _CLI_ERROR_DETAIL_RE = re.compile(r'\bdetail="([^"]*)"')
+_MRP_TYPE130_KILL_VALUES = frozenset({"0", "false", "off"})
 
 # Seconds to wait for the binary's command pipe reader. It attaches right after
 # the connection is reported, so this only bridges the reader thread starting up.
@@ -382,6 +385,24 @@ class AirPlayStream:
             and not self.session_volume_requested
             and self.prov.config.get_value(CONF_PRIVATE_NATIVE_VOLUME_CAPTURE, False) is True
         )
+        native_volume_rail_enabled = (
+            trial_binary.is_trial_target()
+            and self._homepod_remote_admission_requested
+            and not self.session_volume_requested
+        )
+        private_now_playing_requested = (
+            self.prov.config.get_value(CONF_PRIVATE_NOW_PLAYING_DATASTREAM, False) is True
+        )
+        inherited_type130 = os.environ.get("CLIAIRPLAY_MRP_TYPE130")
+        type130_killed = inherited_type130 in _MRP_TYPE130_KILL_VALUES
+        private_now_playing_eligible = (
+            native_volume_rail_enabled
+            and (self.player.protocol_override or self.player.protocol)
+            == StreamingProtocol.AIRPLAY2
+            and not capture_eligible
+            and private_now_playing_requested
+            and not type130_killed
+        )
         self.native_volume_capture = None
         if self._cli_proc is not None:
             await self.session_volume.close()
@@ -400,12 +421,9 @@ class AirPlayStream:
             "CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE": "1" if capture_eligible else "0",
             # Receive-only DataStream registration for private device-volume feedback observation;
             # never together with the session-volume backend, which owns that channel.
-            "CLIAIRPLAY_NATIVE_VOLUME_RAIL": (
-                "1"
-                if trial_binary.is_trial_target()
-                and self._homepod_remote_admission_requested
-                and not self.session_volume_requested
-                else "0"
+            "CLIAIRPLAY_NATIVE_VOLUME_RAIL": "1" if native_volume_rail_enabled else "0",
+            "CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM": (
+                "1" if private_now_playing_eligible else "0"
             ),
         }
         if trial_binary.is_trial_target():
@@ -416,6 +434,13 @@ class AirPlayStream:
                 stderr=True,
                 name="cliairplay",
                 env={**cli_env, **private_child_env()},
+                unset_env=(
+                    frozenset({"CLIAIRPLAY_MRP_TYPE130"})
+                    if private_now_playing_requested
+                    and inherited_type130 is not None
+                    and not type130_killed
+                    else frozenset()
+                ),
             )
         else:
             self._cli_proc = AsyncProcess(
