@@ -42,9 +42,15 @@ def write_pcap(path: Path, destinations: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("destination", "passed"), [("192.0.2.10", True), ("198.51.100.20", False)]
+    ("destination", "passed", "kind"),
+    [
+        ("192.0.2.10", True, "udp"),
+        ("198.51.100.20", False, "udp"),
+        ("198.51.100.20", False, "non-ip"),
+        ("198.51.100.20", False, "icmp-baseline"),
+    ],
 )
-async def test_actual_verdict(tmp_path: Path, destination: str, passed: bool) -> None:
+async def test_actual_verdict(tmp_path: Path, destination: str, passed: bool, kind: str) -> None:
     """Target traffic passes; excluded traffic fails even with an empty baseline."""
     capture = tmp_path / "window.pcap"
     # Keep Ethernet destination consistent with the selected synthetic device.
@@ -55,7 +61,19 @@ async def test_actual_verdict(tmp_path: Path, destination: str, passed: bool) ->
                 bytes.fromhex("02aabbccddee"), bytes.fromhex("021122334455")
             )
         )
-    (tmp_path / "baseline.flows").write_text("")
+    baseline = ""
+    if kind == "non-ip":
+        packet = bytes.fromhex("02aabbccddee02000000000188b5") + bytes(46)
+        capture.write_bytes(
+            capture.read_bytes()[:24] + struct.pack("<IIII", 10, 0, 60, 60) + packet
+        )
+    elif kind == "icmp-baseline":
+        icmp_packet = bytearray(capture.read_bytes())
+        icmp_packet[63] = 1  # IPv4 protocol, after pcap/record/Ethernet headers.
+        icmp_packet[74:82] = struct.pack("!BBHHH", 8, 0, 0, 1, 1)
+        capture.write_bytes(icmp_packet)
+        baseline = "203.0.113.30 > 198.51.100.20\n"
+    (tmp_path / "baseline.flows").write_text(baseline)
     script = (ROOT / "scripts/private_trial_window.sh").read_text()
     flowkey = next(line for line in script.splitlines() if line.startswith("FLOWKEY="))
     verdict = script[script.index("VERDICT=$(remote") :]
@@ -83,6 +101,11 @@ async def test_actual_verdict(tmp_path: Path, destination: str, passed: bool) ->
     stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
     assert (process.returncode == 0) is passed, stdout + stderr
     assert (b"ISOLATION PASS" in stdout) is passed
+    if kind == "icmp-baseline":
+        assert b"HOST_TO_EXCLUDED 1" in stdout
+        assert b"NEW_EXCLUDED_FLOWS 0" in stdout
+    if kind == "non-ip":
+        assert b"NON_IP 0" not in stdout
 
 
 async def test_unreadable_capture_never_passes(tmp_path: Path) -> None:

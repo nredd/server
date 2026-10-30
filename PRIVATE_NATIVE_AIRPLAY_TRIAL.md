@@ -279,8 +279,10 @@ The validated scope supplies admission, player checks, capture and excluded-only
 filters. A one-ping positive control to the *admitted* target proves capture visibility;
 it does not claim to prove reachability of excluded devices. Baseline and verdict use
 the same exclusion inventory. The verdict rejects host/excluded IPv4 traffic, AirPlay
-ports and any non-baseline excluded unicast flow (including link-MAC-matched IPv6).
-New unrelated excluded traffic can therefore conservatively fail the window.
+ports and any non-baseline excluded IP flow (including link-MAC-matched IPv6).
+Non-IP excluded unicast frames refuse the verdict rather than silently producing zero
+IP counters. Host-originated IPv4 traffic is counted even without ports and regardless
+of baseline membership. New unrelated excluded traffic can conservatively fail the window.
 The capture is passive except for that target-only control; inventory completeness and
 link-MAC correctness are operator responsibilities, not facts inferred by a zero count.
 

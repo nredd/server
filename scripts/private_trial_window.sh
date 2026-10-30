@@ -285,7 +285,7 @@ say "stopped records those flows so the verdict can subtract them and judge only
 BASE="$PROBE_DIR/baseline-$(date +%Y%m%dT%H%M%S).pcap"
 # Flow keys are IP-only (ports stripped) so HomeKit reconnects on new source ports are
 # still recognised as baseline, and they are matched whole-line (-x) in the verdict.
-FLOWKEY='{if ($2=="IP"||$2=="IP6") {s=$3; d=$5; sub(/\.[0-9]+$/,"",s); sub(/\.[0-9]+:?$/,"",d); sub(/:$/,"",d); print s" > "d}}'
+FLOWKEY='function key(v,n,a) {n=split(v,a,"."); if ((index(v,":")||n==5)&&v~/\.[0-9]+$/) sub(/\.[0-9]+$/,"",v); return v} $2=="IP"||$2=="IP6" {d=$5; sub(/:$/,"",d); print key($3)" > "key(d)}'
 BASE_COUNT=$(remote "timeout $((BASELINE_SECONDS+2)) tcpdump -i end0 -nn -w $BASE '$CAP_FILTER' >/dev/null 2>&1; tcpdump -nn -r $BASE 2>/dev/null | awk '$FLOWKEY' | sort -u > $BASE.flows; wc -l < $BASE.flows")
 [[ "$BASE_COUNT" =~ ^[0-9]+$ ]] || fail "Baseline capture failed."
 say "baseline flows: $BASE_COUNT (zero is fine, it only means HA Core was quiet)"
@@ -410,17 +410,19 @@ VERDICT=$(remote "set -eu; set -o pipefail
  tcpdump -nn -tt -r $CAP_FILE '$EXCLUDED_FILTER' 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict
 awk '$FLOWKEY' $CAP_FILE.verdict | sort | uniq -c | sort -rn > $CAP_FILE.flows
 echo RAW \$(wc -l < $CAP_FILE.verdict)
-echo HOST_TO_EXCLUDED \$(grep -cF '$HAOS_IP.' $CAP_FILE.verdict || true)
+echo HOST_TO_EXCLUDED \$(awk '$FLOWKEY' $CAP_FILE.verdict | awk -v h='$HAOS_IP' '\$1==h{n++} END{print n+0}')
+echo NON_IP \$(awk 'NF && \$2!=\"IP\" && \$2!=\"IP6\"{n++} END{print n+0}' $CAP_FILE.verdict)
 echo AIRPLAY_PORTS \$(grep -cE '\\.(7000|7100|319|320|6[0-9]{3}):' $CAP_FILE.verdict || true)
 echo '--- non-baseline flows (count, flow):'
 awk '{c=\$1; \$1=\"\"; sub(/^ /,\"\"); print c\"\\t\"\$0}' $CAP_FILE.flows | awk -F'\\t' 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$2 in b)' $BASE.flows -
 echo NEW_EXCLUDED_FLOWS \$(awk '{\$1=\"\"; sub(/^ /,\"\"); print}' $CAP_FILE.flows | awk 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$0 in b)' $BASE.flows - | wc -l)") || fail "Verdict pipeline failed."
 printf '%s\n' "$VERDICT"
 H2E=$(printf '%s\n' "$VERDICT" | awk '/^HOST_TO_EXCLUDED /{print $2}'); AP=$(printf '%s\n' "$VERDICT" | awk '/^AIRPLAY_PORTS /{print $2}'); NEW=$(printf '%s\n' "$VERDICT" | awk '/^NEW_EXCLUDED_FLOWS /{print $2}')
-if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
+NON_IP=$(printf '%s\n' "$VERDICT" | awk '/^NON_IP /{print $2}')
+if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && "$NON_IP" == 0 && $ABORTED == 0 ]]; then
   printf '  %sISOLATION PASS%s\n' "$GREEN" "$RESET"
 else
-  printf '  %sISOLATION FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$ABORTED"
+  printf '  %sISOLATION FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
   VERDICT_FAILED=1
 fi
 say "The verdict reads only excluded endpoints from the validated inventory."
