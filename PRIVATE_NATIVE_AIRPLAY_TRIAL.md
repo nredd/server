@@ -248,26 +248,52 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
   and run without the shared clock; that is the intended consequence of refusing an
   unattested gate, not a regression to work around.
 
-`scripts/private_trial_window.sh` is the operator wizard for one live window, shaped by
-the first live runs on 2026-10-28. It verifies the CLI pin (hardcoded) against the asset
-on the host and its `--check` label, and requires the DEV add-on's `server_repo` option to
-equal the running checkout's `HEAD` with `boot: manual`, watchdog off and protection on:
-the add-on source-installs that option at startup, and a stale pin once ran a build
-without the admission seams against the office pod. It requires the by-hand sibling stop
-via `preflight`; resolves the office pod's Ethernet MAC from the kernel neighbour table
-(the mDNS device id `fa:38:…` is NOT the link MAC `40:ed:…`, which a control probe
-exposed); records a DEV-stopped baseline because HA Core itself talks HomeKit to the pod
-over IPv6 continuously; starts `tcpdump` on `end0` keyed on that MAC plus the office IPs,
-unicast only; proves the filter with a one-ping control probe before the window epoch;
-runs lifecycle capture/arm/start; waits for the private API; checks that no AirPlay
-player registered without a target; onboards or logs in; saves `private_trial_target`
-and reloads AirPlay through the API; requires `players/all` to list exactly
-`ap323e659fe4e1`; prints the readiness receipt; optionally plays a stream to main-pod;
-stops DEV; and prints the verdict as baseline-subtracted flows after the epoch with
-explicit `HOST_TO_OFFICE_IPV4` and `AIRPLAY_PORTS` counts. A failed fail-closed, isolation
-or readiness check skips playback and goes straight to stop. An `EXIT` trap stops DEV
-(receipted, idempotent) and the capture on any abort. Acceptance: both counts zero and no
-non-baseline flow from the host except the control-probe ARP in the first second.
+`scripts/private_trial_window.sh SCOPE.json` requires an explicit offline inventory before
+any remote action. No scope values are taken from saved wizard state. Example (synthetic
+RFC 5737 addresses, fictitious devices; replace with independently verified inventory):
+
+```json
+{
+  "target": "021122334455@test-speaker",
+  "target_ip": "192.0.2.10",
+  "target_link_mac": "02:11:22:33:44:55",
+  "excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}],
+  "host_ip": "203.0.113.30",
+  "ssh_host": "trial-host",
+  "mode": "homepod-ptp"
+}
+```
+
+The target is the advertised RAOP MAC and instance name; the player id is derived, never
+entered separately. `target_link_mac` is the independently supplied link-layer address,
+which need not equal the service MAC. Every excluded endpoint needs an IPv4 address;
+its optional link MAC also covers unicast IPv6/link-local traffic on that interface.
+List every known address/interface explicitly. IP-only inventory cannot establish IPv6
+isolation. IPv6 literals and hostnames are refused as address inputs in this wizard.
+Missing/unknown fields, malformed values, empty exclusions, duplicate addresses, target/host
+address overlap and excluded/target identity overlap refuse before remote I/O.
+Names use ASCII letters, digits, dots, underscores and hyphens; SSH aliases cannot contain
+options, usernames or shell syntax. No excluded endpoint is pinged or queried for ARP.
+
+The validated scope supplies admission, player checks, capture and excluded-only verdict
+filters. A one-ping positive control to the *admitted* target proves capture visibility;
+it does not claim to prove reachability of excluded devices. Baseline and verdict use
+the same exclusion inventory. The verdict rejects host/excluded IPv4 traffic, AirPlay
+ports and any non-baseline excluded IP flow (including link-MAC-matched IPv6).
+Non-IP excluded unicast frames refuse the verdict rather than silently producing zero
+IP counters. Host-originated IPv4 traffic is counted even without ports and regardless
+of baseline membership. New unrelated excluded traffic can conservatively fail the window.
+The capture is passive except for that target-only control; inventory completeness and
+link-MAC correctness are operator responsibilities, not facts inferred by a zero count.
+
+Only `homepod-ptp` mode is implemented. Readiness rechecks the exact admitted player and
+requires an Apple HomePod model before reading the PTP receipt or offering playback.
+TV/RAOP modes and unknown models refuse rather than reporting PTP readiness for them.
+This does not establish or rule out native receiver-side groups.
+
+CLI pin/source attestation, manual sibling-stop/catalog preflight, independent lifecycle
+lease/watchdog, no-target hold, stable single-player admission checks and receipted
+cleanup remain mandatory. No deployment or live window is authorized by this repair.
 
 Live results 2026-10-28 (evidence `/data/airplay-native-probe/WINDOW_EVIDENCE_20261028.json`
 on the host, pcaps 0600): the old `13df592bf` source registered office-pod and hit it on
@@ -519,13 +545,9 @@ IDs. It never accepts an API host, endpoint, credential, media URL, queue, or ra
 configuration as an argument or stores any of those values. Never add it, its tests, or its
 runbook procedure to upstream work.
 
-Historical hardware rule: future acceptance was `media_player.mainpod` ONLY and
-`media_player.officepod` was excluded. That rule is superseded by the
-2026-10-29 owner override: the owner cannot go upstairs, so all live tests may use ONLY office-pod
-until the owner explicitly changes that scope.
-Retarget `private_trial_target` to office-pod. `scripts/private_trial_window.sh` hardcodes
-main-pod and MUST NOT run for the office window; do not refactor that wizard in this patch.
-Historical artifacts, pins and offline group fixtures remain historical, not authorization.
+The launch scope must be supplied explicitly to the window wizard and approved for each
+window. Historical artifacts and offline fixtures are not launch authorization.
+The generic inventory does not change the recovery controller's separate fixed scopes.
 
 Copy the reviewed helper to the SSH add-on, verify its SHA-256 against the external
 receipt, and set `RECOVERY_SCRIPT` to that verified absolute path. It supports the SSH
