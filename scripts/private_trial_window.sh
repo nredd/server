@@ -180,28 +180,29 @@ finish() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────
-# STAGES: private native AirPlay trial live window (main pod ONLY).
+# STAGES: private native AirPlay trial live window (explicit operator scope).
 # Private trial tooling, never upstream. Runs on the operator's Mac; every HAOS
 # action is a plain `ssh home` the operator can read before it runs. The trial
 # API calls go to the private port with a token this wizard obtains itself.
 # ──────────────────────────────────────────────────────────────────────────
 
+# Validate scope before state, prompts, traps or remote actions.
+SCOPE_HELPER="$(cd "$(dirname "$0")" && pwd)/private_trial_scope.py"
+[[ $# == 1 ]] || { printf 'Usage: %s SCOPE.json\n' "$0" >&2; exit 2; }
+SCOPE_ASSIGNMENTS=$(python3 "$SCOPE_HELPER" --scope "$1") || exit 2
+eval "$SCOPE_ASSIGNMENTS"
+readonly TRIAL_TARGET TRIAL_PLAYER TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER
+
 TOTAL_STAGES=12
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
 mkdir -p "$(dirname "$ENV_FILE")"; chmod 700 "$(dirname "$ENV_FILE")"
 
-HOST=home
 # Pins are hardcoded or derived from this checkout on purpose: a stale .env value
 # can never select another asset or source.
 PINNED_CLI_SHA=f7af74994caa8b29a3d06ed9e461036446a7ec7c6115ab7311b0e113b987c79b
 PINNED_CLI_LABEL=v8dfa952
 SERVER_SHA=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
 DEV=d5369777_music_assistant_dev
-MAIN_POD_TARGET="323e659fe4e1@main-pod"
-MAIN_POD_PLAYER="ap323e659fe4e1"
-OFFICE_POD_IP=192.168.40.24
-OFFICE_TV_IPS="192.168.40.252 192.168.1.131"
-HAOS_IP=192.168.40.180
 TRIAL_API="http://${HAOS_IP}:18095"
 PROBE_DIR=/data/airplay-native-probe
 ASSET_ROOT=/media/.native-airplay
@@ -261,29 +262,20 @@ pause
 # ── 2 ─────────────────────────────────────────────────────────────────────
 stage "Stop the sibling Music Assistant apps BY HAND"
 warn "The controller can never stop another app. You do this, and you own the consequence"
-warn "for anything currently playing on main-pod or office-pod from local_music_assistant_dev."
+warn "for anything currently playing from the sibling apps."
 step "Settings -> Add-ons -> Music Assistant (local dev 2.10.6) -> STOP, and set 'Start on boot' OFF."
 step "Leave the beta stopped. Do not touch stock: it is absent and stays absent."
-open_url "https://home.meep.net/hassio/dashboard"
+step "Open your Supervisor dashboard using your approved local URL."
 pause "Press Enter once both siblings are stopped"
 remote "python3 $LIFECYCLE_SCRIPT preflight" || fail "preflight refused: the catalog is not stock-absent with siblings stopped."
 
 # ── 3 ─────────────────────────────────────────────────────────────────────
-stage "Resolve the office devices' link-layer addresses"
-say "The AirPlay device id in mDNS (fa:38:11:2b:21:1f) is NOT the pod's Ethernet MAC. The filter"
-say "keys on the MAC the kernel actually resolves, so IPv4, IPv6 and link-local are all caught."
-OFFICE_POD_MAC=$(remote "ping -c1 -W2 $OFFICE_POD_IP >/dev/null; ip neigh show $OFFICE_POD_IP | awk '/lladdr/{print \$5}'")
-[[ "$OFFICE_POD_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || fail "Could not resolve office-pod MAC via ARP ($OFFICE_POD_MAC)."
-write_env OFFICE_POD_MAC "$OFFICE_POD_MAC"
-ETHERS="ether host $OFFICE_POD_MAC"; HOSTS="host $OFFICE_POD_IP"
-for ip in $OFFICE_TV_IPS; do
-  HOSTS="$HOSTS or host $ip"
-  mac=$(remote "ping -c1 -W2 $ip >/dev/null 2>&1; ip neigh show $ip | awk '/lladdr/{print \$5}'")
-  if [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then ETHERS="$ETHERS or ether host $mac"; say "office TV $ip -> $mac"; else note "office TV $ip did not answer ARP (asleep?); matched by IP only"; fi
-done
-CAP_FILTER="($ETHERS or $HOSTS) and not multicast and not broadcast"
-OFFICE_IP_RE="($OFFICE_POD_IP|${OFFICE_TV_IPS// /|})"
-say "filter: $CAP_FILTER"
+stage "Review the validated scope (no excluded-device discovery)"
+say "Admitted target: $TRIAL_TARGET ($TRIAL_PLAYER) at $TARGET_IP"
+say "Capture: $CAP_FILTER"
+say "Excluded-only verdict: $EXCLUDED_FILTER"
+say "No ping, ARP or neighbor lookup of excluded endpoints is performed."
+say "IP-only exclusions cover listed IPv4 only; supply link MACs for IPv6 coverage."
 pause
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
@@ -300,15 +292,15 @@ say "baseline flows: $BASE_COUNT (zero is fine, it only means HA Core was quiet)
 write_env BASELINE_FILE "$BASE"
 
 # ── 5 ─────────────────────────────────────────────────────────────────────
-stage "Start the packet capture and prove it can see the office pod"
+stage "Start the packet capture and prove it sees the admitted target"
 CAP="$PROBE_DIR/window-$(date +%Y%m%dT%H%M%S).pcap"; CAP_FILE="$CAP"
 write_env CAPTURE_FILE "$CAP_FILE"
 remote "printf '%s\n' '$CAP_FILTER' > $CAP.filter; nohup tcpdump -i end0 -nn -U -w $CAP '$CAP_FILTER' >$CAP.log 2>&1 & echo \$! > $CAP.pid; sleep 2; grep -q 'listening on end0' $CAP.log && kill -0 \$(cat $CAP.pid)" \
   || fail "tcpdump did not start or died; see $CAP.log"
-say "Control probe: one ICMP echo to the office pod, recorded in a side capture. A later zero is"
+say "Control probe: one ICMP echo to the admitted target, recorded in a side capture. A later zero is"
 say "then a measured zero. The ARP refresh it causes lands in the first second of the window."
-CONTROL=$(remote "tcpdump -i end0 -nn -U -w $CAP.control '$CAP_FILTER' >/dev/null 2>&1 & p=\$!; sleep 1; ping -c1 -W2 $OFFICE_POD_IP >/dev/null; sleep 1; kill \$p; sleep 1; tcpdump -nn -r $CAP.control 2>/dev/null | grep -c 'ICMP echo'")
-[[ "$CONTROL" =~ ^[0-9]+$ ]] && (( CONTROL >= 2 )) || fail "Control ICMP count '$CONTROL': the filter cannot see the office pod; a zero would be meaningless."
+CONTROL=$(remote "tcpdump -i end0 -nn -U -w $CAP.control '$CAP_FILTER' >/dev/null 2>&1 & p=\$!; sleep 1; ping -c1 -W2 $TARGET_IP >/dev/null; sleep 1; kill \$p; sleep 1; tcpdump -nn -r $CAP.control 'icmp and host $TARGET_IP' 2>/dev/null | grep -c 'ICMP echo'")
+[[ "$CONTROL" =~ ^[0-9]+$ ]] && (( CONTROL >= 2 )) || fail "Control ICMP count '$CONTROL': the filter cannot see the admitted target; a zero would be meaningless."
 say "control count: $CONTROL"
 sleep 3
 WINDOW_START_EPOCH=$(remote "date +%s | tee $CAP.epoch")
@@ -367,9 +359,9 @@ fi
 # ── 9 ─────────────────────────────────────────────────────────────────────
 stage "Set the single admitted target and reload AirPlay"
 if (( ABORTED )); then say "Skipped (fail-closed already failed)."; else
-  SAVED=$(api config/core/save "{\"domain\":\"discovery\",\"values\":{\"private_trial_target\":\"$MAIN_POD_TARGET\"}}" \
+  SAVED=$(api config/core/save "{\"domain\":\"discovery\",\"values\":{\"private_trial_target\":\"$TRIAL_TARGET\"}}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["values"]["private_trial_target"]["value"])')
-  [[ "$SAVED" == "$MAIN_POD_TARGET" ]] || fail "Target not saved: $SAVED"
+  [[ "$SAVED" == "$TRIAL_TARGET" ]] || fail "Target not saved: $SAVED"
   api config/providers/reload '{"instance_id":"airplay"}' >/dev/null
   # Three reads over 60 s must all show exactly the target: a late registration is a failure.
   PLAYERS=""; STABLE=1
@@ -377,24 +369,27 @@ if (( ABORTED )); then say "Skipped (fail-closed already failed)."; else
     sleep 20
     PLAYERS=$(api players/all | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted(p["player_id"] for p in d if p["player_id"].startswith("ap"))) if isinstance(d,list) else "ERR")')
     say "AirPlay players: ${PLAYERS:-<none>}"
-    [[ "$PLAYERS" == "$MAIN_POD_PLAYER" ]] || STABLE=0
+    [[ "$PLAYERS" == "$TRIAL_PLAYER" ]] || STABLE=0
   done
-  (( STABLE )) || abort_to_stop "FAILED isolation: expected exactly $MAIN_POD_PLAYER over 60 s. DEV stopped."
+  (( STABLE )) || abort_to_stop "FAILED isolation: expected exactly $TRIAL_PLAYER over 60 s. DEV stopped."
 fi
 
 # ── 10 ────────────────────────────────────────────────────────────────────
 stage "Readiness receipt and (optional) playback"
 if (( ABORTED )); then say "Skipped."; else
+  # Recheck the same admitted player and refuse unsupported receiver classes.
+  api players/all | python3 "$SCOPE_HELPER" --check-players "$TRIAL_PLAYER" \
+    || fail "Readiness refused: target scope or supported HomePod class not established."
   READY=$(api airplay/private_native_volume_capture/readiness/get)
   printf '%s\n' "$READY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("ptp_ready","prestream_ready","playing_ready")}); s=d["startup_validation"]; print("check:",s.get("check_label"),s.get("check_outcome"),"provenance:",d["installer_provenance"]["status"])'
   PTP=$(printf '%s\n' "$READY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ptp_ready"])')
   if [[ "$PTP" != "True" ]]; then
     warn "ptp_ready false: the daemon did not attest strict peers. Skipping playback."
-  elif confirm "Play a short stream to $MAIN_POD_PLAYER at volume 20?"; then
-    api players/cmd/volume_set "{\"player_id\":\"$MAIN_POD_PLAYER\",\"volume_level\":20}" >/dev/null
-    api player_queues/play_media "{\"queue_id\":\"$MAIN_POD_PLAYER\",\"media\":\"https://ice1.somafm.com/groovesalad-128-mp3\"}" >/dev/null
+  elif confirm "Play a short stream to $TRIAL_PLAYER at volume 20?"; then
+    api players/cmd/volume_set "{\"player_id\":\"$TRIAL_PLAYER\",\"volume_level\":20}" >/dev/null
+    api player_queues/play_media "{\"queue_id\":\"$TRIAL_PLAYER\",\"media\":\"https://ice1.somafm.com/groovesalad-128-mp3\"}" >/dev/null
     pause "Playing. Press Enter to stop playback"
-    api players/cmd/stop "{\"player_id\":\"$MAIN_POD_PLAYER\"}" >/dev/null
+    api players/cmd/stop "{\"player_id\":\"$TRIAL_PLAYER\"}" >/dev/null
     api airplay/private_native_volume_capture/readiness/get | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after playback:",[{k:r[k] for k in ("protocol","flow","timing","playing","ready")} for r in d["streams"]])'
   fi
 fi
@@ -411,26 +406,25 @@ CAP=""
 
 # ── 12 ────────────────────────────────────────────────────────────────────
 stage "Verdict"
-VERDICT=$(remote "tcpdump -nn -tt -r $CAP_FILE 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict
+VERDICT=$(remote "set -eu; set -o pipefail
+ tcpdump -nn -tt -r $CAP_FILE '$EXCLUDED_FILTER' 2>/dev/null | awk -v t=$WINDOW_START_EPOCH '\$1>t' > $CAP_FILE.verdict
 awk '$FLOWKEY' $CAP_FILE.verdict | sort | uniq -c | sort -rn > $CAP_FILE.flows
 echo RAW \$(wc -l < $CAP_FILE.verdict)
-echo HOST_TO_OFFICE \$(grep -cE '$HAOS_IP(\.[0-9]+)? > $OFFICE_IP_RE(\.[0-9]+)?:' $CAP_FILE.verdict)
-echo AIRPLAY_PORTS \$(grep -cE ' > $OFFICE_IP_RE\.(7000|7100|319|320|6[0-9]{3}):' $CAP_FILE.verdict)
+echo HOST_TO_EXCLUDED \$(grep -cF '$HAOS_IP.' $CAP_FILE.verdict || true)
+echo AIRPLAY_PORTS \$(grep -cE '\\.(7000|7100|319|320|6[0-9]{3}):' $CAP_FILE.verdict || true)
 echo '--- non-baseline flows (count, flow):'
-awk '{c=\$1; \$1=\"\"; sub(/^ /,\"\"); print c\"\t\"\$0}' $CAP_FILE.flows | awk -F'\t' 'NR==FNR{b[\$0]=1; next} !(\$2 in b)' $BASE.flows -
-echo NEW_FROM_HOST \$(awk '{\$1=\"\"; sub(/^ /,\"\"); print}' $CAP_FILE.flows | awk 'NR==FNR{b[\$0]=1; next} !(\$0 in b)' $BASE.flows - | grep -c '^$HAOS_IP ')
-echo '--- ARP from host (expect only the control refresh at +0..1s):'
-grep 'tell $HAOS_IP' $CAP_FILE.verdict | awk -v e=$WINDOW_START_EPOCH '{printf \"+%.1fs\\n\", \$1-e}'") || fail "Verdict pipeline failed."
+awk '{c=\$1; \$1=\"\"; sub(/^ /,\"\"); print c\"\\t\"\$0}' $CAP_FILE.flows | awk -F'\\t' 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$2 in b)' $BASE.flows -
+echo NEW_EXCLUDED_FLOWS \$(awk '{\$1=\"\"; sub(/^ /,\"\"); print}' $CAP_FILE.flows | awk 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$0 in b)' $BASE.flows - | wc -l)") || fail "Verdict pipeline failed."
 printf '%s\n' "$VERDICT"
-H2O=$(printf '%s\n' "$VERDICT" | awk '/^HOST_TO_OFFICE /{print $2}'); AP=$(printf '%s\n' "$VERDICT" | awk '/^AIRPLAY_PORTS /{print $2}'); NEW=$(printf '%s\n' "$VERDICT" | awk '/^NEW_FROM_HOST /{print $2}')
-if [[ "$H2O" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
+H2E=$(printf '%s\n' "$VERDICT" | awk '/^HOST_TO_EXCLUDED /{print $2}'); AP=$(printf '%s\n' "$VERDICT" | awk '/^AIRPLAY_PORTS /{print $2}'); NEW=$(printf '%s\n' "$VERDICT" | awk '/^NEW_EXCLUDED_FLOWS /{print $2}')
+if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
   printf '  %sISOLATION PASS%s\n' "$GREEN" "$RESET"
 else
-  printf '  %sISOLATION FAIL%s (host->office %s, airplay ports %s, new host flows %s, aborted %s)\n' "$RED" "$RESET" "$H2O" "$AP" "$NEW" "$ABORTED"
+  printf '  %sISOLATION FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$ABORTED"
   VERDICT_FAILED=1
 fi
-say "Inbound mDNS from the pod and the control-probe ARP in the first second are not ours."
-warn "Restart local_music_assistant_dev yourself if you want it back. The trial never does."
+say "The verdict reads only excluded endpoints from the validated inventory."
+warn "Restart sibling apps yourself if desired. The trial never does."
 
 finish
 [[ "${VERDICT_FAILED:-0}" == 0 ]] || exit 2
