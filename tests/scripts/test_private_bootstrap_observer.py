@@ -408,7 +408,10 @@ def test_installed_marker_is_source_install_and_fetch_is_deps() -> None:
 
 
 class _Completed:
+    """Minimal `subprocess.CompletedProcess` stand-in."""
+
     def __init__(self, returncode: int, stdout: bytes) -> None:
+        """Keep the exit code and captured stdout."""
         self.returncode = returncode
         self.stdout = stdout
 
@@ -651,9 +654,11 @@ class _CliReader:
     """Stand in for the Supervisor reader in CLI tests."""
 
     def __init__(self, *_args: Any) -> None:
+        """Ignore the token/cursor and expose a sensitive-looking cursor."""
         self.first_cursor: str | None = "s=SECRETMACHINE;i=1;b=SECRETBOOT"
 
     def read(self, _deadline: float) -> bytes:
+        """Return a fixed two-line log."""
         return b"line one\nline two\n"
 
 
@@ -736,3 +741,27 @@ def test_observe_cli_refuses_loose_permissions_and_symlinks(
     link.symlink_to(real)
     assert observer.main(["observe", "--run", "r", "--baseline-file", str(link)]) == 1
     assert capsys.readouterr().out == ""
+
+
+def test_budget_exhaustion_after_lease_loss_is_unknown() -> None:
+    """The final budget-exhausted result also requires a live lease."""
+    log = current("start")
+    seen = log + current(f"Installing nredd/server@{SOURCE}")
+    clock = Clock()
+    kwargs: dict[str, Any] = {"now": clock.now, "sleep": clock.sleep}
+    live = observer.observe(
+        SequenceReader([seen]), SequenceProbe([False]), baseline(log), 500.0, **kwargs
+    )
+    assert live.expected_source_seen
+    assert not live.budget_remaining
+    clock.value = 0.0
+    # the lease is alive for every poll (budget ends at 380s) and dies only afterwards
+    result = observer.observe(
+        SequenceReader([seen]),
+        SequenceProbe([False]),
+        baseline(log),
+        500.0,
+        lease_live=lambda: clock.value < 380.0,
+        **kwargs,
+    )
+    assert result.phase is observer.BootstrapPhase.UNKNOWN

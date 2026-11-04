@@ -971,6 +971,7 @@ def load_watchdog_deadline(root: Path, run_id: str) -> float:
 
     :param root: Lifecycle state root.
     :param run_id: Run whose watchdog lease to read.
+    :return: Absolute monotonic deadline, never later than the wall-clock deadline allows.
     :raises LifecycleError: If the run or its watchdog state is not valid.
     """
     run_dir, snapshot = load_snapshot(root, run_id)

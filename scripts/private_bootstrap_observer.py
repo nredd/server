@@ -79,9 +79,8 @@ class LogBaseline:
     """
     A safe pre-start boundary for one log stream.
 
-    `cursor` is the journal cursor of the first entry in the baseline capture (empty when
-    the stream had no entries). Later reads are anchored on it, so the Supervisor's sliding
-    default tail window cannot push the baseline out of view.
+    The cursor identifies the first baseline entry (empty for an empty stream); it holds
+    machine and boot identifiers, so keep it out of output.
     """
 
     bytes: int
@@ -207,7 +206,12 @@ class LoopbackApiProbe:
     """Probe the fixed private API without credentials, redirects, or response disclosure."""
 
     def ready(self, deadline: float) -> bool:
-        """Return true only for a bounded JSON object from the fixed loopback endpoint."""
+        """
+        Probe the fixed loopback `/info` endpoint.
+
+        :param deadline: Absolute `time.monotonic()` deadline for the request.
+        :return: True only for a bounded JSON object with HTTP 200 before the deadline.
+        """
         try:
             remaining = min(HTTP_TIMEOUT, _remaining(deadline))
             cfg = (
@@ -244,7 +248,14 @@ class LoopbackApiProbe:
 
 
 def capture_baseline(reader: LogReader, deadline: float) -> LogBaseline:
-    """Capture a safe pre-start log boundary without persisting or printing log content."""
+    """
+    Capture a safe pre-start log boundary without persisting or printing log content.
+
+    :param reader: Log reader positioned on the last two entries.
+    :param deadline: Absolute `time.monotonic()` deadline for the read.
+    :return: Length, SHA-256 and journal cursor of the captured boundary.
+    :raises ObserverError: If the read fails or returned bytes without a cursor.
+    """
     raw = reader.read(deadline)
     cursor = reader.first_cursor or ""
     if raw and not cursor:
@@ -334,7 +345,7 @@ def observe(
                 return _unknown(False)
             last_phase = phase
         sleep(min(POLL_INTERVAL, max(0.0, deadline - now())))
-    if anchor_offset is not None:
+    if anchor_offset is not None and lease_live():
         return BootstrapObservation(
             phase=last_phase,
             expected_source_seen=True,
@@ -347,7 +358,12 @@ def observe(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Capture a baseline or emit one safe bounded bootstrap observation as JSON."""
+    """
+    Capture a baseline file or emit one safe bounded bootstrap observation as JSON.
+
+    :param argv: Command-line arguments; defaults to `sys.argv`.
+    :return: Zero on success, one after a refusal (a fixed line is written to stderr).
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("baseline", "observe"))
     parser.add_argument("--root", type=Path, default=lifecycle.ROOT)

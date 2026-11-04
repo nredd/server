@@ -472,8 +472,9 @@ install without permitting an unbounded readiness loop. No observer result autho
 mutation; the single designated live-run owner (named by the parent for that run) remains the
 exclusive recovery owner.
 
-The observer rechecks the live lease on every poll, and again after a blocking log read or API
-probe before it can report `api-ready`; a dead lease or expired deadline yields `unknown`.
+The observer rechecks the live lease on every poll, after the API probe before it can report
+`api-ready`, and before any failure or budget-exhausted result; a dead lease or expired deadline
+yields `unknown`.
 The Supervisor add-on log endpoint defaults to a sliding tail of the last 100 journal entries,
 so the baseline records the journal cursor (`X-First-Cursor`) of its first entry, and later
 reads use the supported `Range: entries=<cursor>:0:2000` header to start at that exact entry
