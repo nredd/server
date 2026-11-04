@@ -378,11 +378,29 @@ def test_main_returns_failure_for_preflight_error(
 ) -> None:
     """Distinguish a failed setup from clean but insufficient transport facts."""
     inventory = tmp_path / "scope.json"
-    inventory.write_text("{}", encoding="utf-8")
+    inventory.write_text(
+        json.dumps(
+            {
+                "target": "021122334455@test-tv",
+                "target_ip": "192.0.2.10",
+                "target_link_mac": "02:11:22:33:44:55",
+                "excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}],
+                "host_ip": "203.0.113.30",
+                "ssh_host": "trial-host",
+                "mode": "tv-raop",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         transport,
         "validate_lifecycle_run",
         lambda *_args: (_ for _ in ()).throw(TransportError("watchdog missing")),
+    )
+    monkeypatch.setattr(
+        transport,
+        "StimulusServer",
+        lambda *_args: pytest.fail("preflight must reject before constructing the source server"),
     )
 
     result = transport.main(
@@ -403,7 +421,9 @@ def test_main_returns_failure_for_preflight_error(
     )
 
     assert result == 1
-    assert json.loads(capsys.readouterr().out)["outcome"] == "FAILED"
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["outcome"] == "FAILED"
+    assert receipt["error"] == "watchdog missing"
 
 
 def test_only_the_stimulus_path_is_served() -> None:
