@@ -35,11 +35,15 @@ EXPECTED_SOURCE = "0f7b543127f71c5639d55d4e0e34168ba92d0c33"
 DEV = lifecycle.DEV
 PRIVATE_INFO_URL = "http://127.0.0.1:18095/info"
 MAX_LOG_BYTES = 256 * 1024
+MAX_HEADER_BYTES = 8192
+MAX_LOG_ENTRIES = 2000
 MAX_API_BYTES = 4096
 HTTP_TIMEOUT = 3.0
 STARTUP_BUDGET = 480.0
 CLEANUP_RESERVE = 120.0
 POLL_INTERVAL = 2.0
+
+_CURSOR = re.compile(r"[A-Za-z0-9=;_.:-]{1,512}")
 
 _INSTALLER_ANCHOR = re.compile(
     rb"\b(?:installing|updating)\b.*\bnredd/server@" + EXPECTED_SOURCE.encode() + rb"\b",
@@ -72,10 +76,17 @@ class BootstrapPhase(StrEnum):
 
 @dataclass(frozen=True)
 class LogBaseline:
-    """A safe pre-start boundary for one log stream."""
+    """
+    A safe pre-start boundary for one log stream.
+
+    `cursor` is the journal cursor of the first entry in the baseline capture (empty when
+    the stream had no entries). Later reads are anchored on it, so the Supervisor's sliding
+    default tail window cannot push the baseline out of view.
+    """
 
     bytes: int
     sha256: str
+    cursor: str = ""
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,8 @@ class BootstrapObservation:
 
 class LogReader(Protocol):
     """Read the bounded current add-on log stream without exposing it to callers."""
+
+    first_cursor: str | None
 
     def read(self, deadline: float) -> bytes:
         """Return current raw bytes, bounded by this module's fixed response limit."""
@@ -111,18 +124,36 @@ class ObserverError(RuntimeError):
 class SupervisorLogReader:
     """Read the one fixed DEV log endpoint through native curl with no output leak."""
 
-    def __init__(self, token: str) -> None:
-        """Keep the Supervisor token private to the in-memory curl configuration."""
+    def __init__(self, token: str, cursor: str | None = None) -> None:
+        """
+        Keep the Supervisor token private to the in-memory curl configuration.
+
+        :param token: Supervisor token.
+        :param cursor: Baseline journal cursor to anchor on, or None to read the last two
+            entries (used only to capture a baseline). An empty cursor reads from the start.
+        """
         self._token = lifecycle.validate_token(token)
+        if cursor is not None and cursor != "" and not _CURSOR.fullmatch(cursor):
+            raise ObserverError("log cursor is invalid")
+        self._cursor = cursor
+        self.first_cursor: str | None = None
 
     def read(self, deadline: float) -> bytes:
-        """Fetch bounded current log bytes with no redirect or inherited environment."""
+        """Fetch bounded log bytes with no redirect or inherited environment."""
         remaining = _remaining(deadline)
+        # Supervisor maps the Range header to journal-gatewayd `entries=cursor[:skip]:count`;
+        # the default is a sliding tail of the last 100 entries.
+        if self._cursor is None:
+            entries = "entries=:-1:2"
+        else:
+            entries = f"entries={self._cursor}::{MAX_LOG_ENTRIES}"
         url = f"{lifecycle.SUPERVISOR_BASE_URL}/addons/{DEV}/logs"
         config = (
             "\n".join(
                 (
                     "fail",
+                    'dump-header = "-"',
+                    f'header = "Range: {entries}"',
                     'header = "Accept: text/plain"',
                     f'url = "{_curl_value(url)}"',
                     f"max-time = {remaining:.6f}",
@@ -146,9 +177,19 @@ class SupervisorLogReader:
             raise ObserverError("log capture unavailable") from err
         if result.returncode == 63:
             raise ObserverError("log capture exceeded limit")
-        if result.returncode != 0 or len(result.stdout) > MAX_LOG_BYTES:
+        if result.returncode != 0:
             raise ObserverError("log capture unavailable")
-        return result.stdout
+        head, separator, body = result.stdout.partition(b"\r\n\r\n")
+        if not separator or len(head) > MAX_HEADER_BYTES or len(body) > MAX_LOG_BYTES:
+            raise ObserverError("log capture unavailable")
+        self.first_cursor = _first_cursor(head)
+        if self._cursor is not None and self._cursor != "":
+            # Anchored reads must start at the baseline entry; otherwise it was rotated away.
+            if self.first_cursor != self._cursor:
+                raise ObserverError("log baseline cursor is no longer present")
+        elif body and self.first_cursor is None:
+            raise ObserverError("log capture has no cursor")
+        return body
 
 
 class LoopbackApiProbe:
@@ -194,7 +235,10 @@ class LoopbackApiProbe:
 def capture_baseline(reader: LogReader, deadline: float) -> LogBaseline:
     """Capture a safe pre-start log boundary without persisting or printing log content."""
     raw = reader.read(deadline)
-    return LogBaseline(len(raw), hashlib.sha256(raw).hexdigest())
+    cursor = reader.first_cursor or ""
+    if raw and not cursor:
+        raise ObserverError("log capture has no cursor")
+    return LogBaseline(len(raw), hashlib.sha256(raw).hexdigest(), cursor)
 
 
 def observe(
@@ -259,6 +303,9 @@ def observe(
                     log_continuity=True,
                 )
             if phase is BootstrapPhase.RUNTIME and probe.ready(deadline):
+                # The probe can block: the lease or budget may have ended meanwhile.
+                if now() >= deadline or not lease_live():
+                    return _unknown(False)
                 return BootstrapObservation(
                     phase=BootstrapPhase.API_READY,
                     expected_source_seen=True,
@@ -293,9 +340,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         token = lifecycle.validate_token(os.environ.get("SUPERVISOR_TOKEN", ""))
-        reader = SupervisorLogReader(token)
         if args.command == "baseline":
-            baseline = capture_baseline(reader, time.monotonic() + HTTP_TIMEOUT)
+            baseline = capture_baseline(SupervisorLogReader(token), time.monotonic() + HTTP_TIMEOUT)
             sys.stdout.write(json.dumps(asdict(baseline), sort_keys=True) + "\n")
             return 0
         if args.run is None or args.baseline is None:
@@ -303,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         baseline = LogBaseline(**json.loads(args.baseline))
         deadline = _watchdog_deadline(args.root, args.run)
         result = observe(
-            reader,
+            SupervisorLogReader(token, baseline.cursor),
             LoopbackApiProbe(),
             baseline,
             deadline,
@@ -334,6 +380,18 @@ def _find_anchor(raw: bytes, offset: int) -> int | None:
     """Return the first exact expected-source installer anchor after the baseline."""
     match = _INSTALLER_ANCHOR.search(raw, offset)
     return match.start() if match else None
+
+
+def _first_cursor(head: bytes) -> str | None:
+    """Return the validated `X-First-Cursor` response header, if any."""
+    for line in head.split(b"\r\n"):
+        name, separator, value = line.partition(b":")
+        if separator and name.strip().lower() == b"x-first-cursor":
+            cursor = value.strip().decode("ascii", "replace")
+            if not _CURSOR.fullmatch(cursor):
+                raise ObserverError("log cursor is invalid")
+            return cursor
+    return None
 
 
 def _unknown(current_boot: bool) -> BootstrapObservation:

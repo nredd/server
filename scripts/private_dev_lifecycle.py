@@ -843,7 +843,9 @@ def _require_live_lease(root: Path, snapshot: Snapshot) -> None:
     descriptor = _open_lock(root, "watchdog.lock")
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Shared, not exclusive: the watchdog holds LOCK_EX, so a shared probe fails only
+            # for a real holder. A read-only observer's transient LOCK_SH cannot fake liveness.
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             pass
         else:

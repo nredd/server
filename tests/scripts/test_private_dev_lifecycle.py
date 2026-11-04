@@ -1438,3 +1438,21 @@ def test_watchdog_deadline_is_bounded_by_the_wall_deadline() -> None:
         {"deadline": wall, "monotonic_deadline": time.monotonic() + 5}
     )
     assert near - time.monotonic() <= 5
+
+
+def test_shared_observer_lock_and_stale_owner_cannot_fake_a_live_watchdog(tmp_path: Path) -> None:
+    """A read-only observer's shared flock plus stale owner JSON must not permit start."""
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    lifecycle._write_json_exclusive(
+        run_dir / "watchdog.json",
+        {"run_id": state.run_id, "nonce": state.nonce, "deadline": time.time() + 60},
+    )
+    descriptor = lifecycle._open_lock(tmp_path, "watchdog.lock")
+    try:
+        os.write(descriptor, json.dumps({"run_id": state.run_id, "nonce": state.nonce}).encode())
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(lifecycle.LifecycleError, match="no live watchdog"):
+            lifecycle._require_armed(tmp_path, run_dir, state)
+    finally:
+        os.close(descriptor)

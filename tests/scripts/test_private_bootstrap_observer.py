@@ -39,6 +39,8 @@ class Clock:
 class SequenceReader:
     """Return cumulative sanitized synthetic logs and record supplied deadlines."""
 
+    first_cursor: str | None = None
+
     def __init__(self, entries: list[bytes]) -> None:
         """Keep one or more complete current-log snapshots."""
         self.entries = deque(entries)
@@ -55,6 +57,8 @@ class SequenceReader:
 
 class DelayedReader:
     """Return one synthetic log only after consuming the supplied fake-clock budget."""
+
+    first_cursor: str | None = None
 
     def __init__(self, clock: Clock, delay: float, log: bytes) -> None:
         """Keep a clock seam, blocking duration and one complete log snapshot."""
@@ -452,3 +456,128 @@ def test_lease_rejects_other_owner_and_unsafe_mode(tmp_path: Path) -> None:
     with pytest.raises(observer.ObserverError, match="not live"):
         observer._require_live_lease(tmp_path, "r", "n")
     assert not observer._lease_is_live(tmp_path, "r")
+
+
+def _api_ready_run(lease_after: bool, clock_jump: float) -> observer.BootstrapObservation:
+    """Run to a `runtime` log with a probe that blocks, then optionally kills lease/budget."""
+    clock = Clock()
+    log = current("start")
+    runtime = log + current(f"Installing nredd/server@{SOURCE}", "Starting Music Assistant")
+
+    class BlockingProbe:
+        def ready(self, deadline: float) -> bool:
+            clock.value += clock_jump
+            return True
+
+    leases = iter([True, lease_after])
+    return observer.observe(
+        SequenceReader([log, runtime]),
+        BlockingProbe(),
+        baseline(log),
+        1000.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        lease_live=lambda: next(leases, lease_after),
+    )
+
+
+def test_lease_dying_during_api_probe_is_unknown() -> None:
+    """A probe that blocks while the owner tears down must not report api-ready."""
+    assert _api_ready_run(False, 0.0).phase is observer.BootstrapPhase.UNKNOWN
+    assert _api_ready_run(True, 0.0).phase is observer.BootstrapPhase.API_READY
+
+
+def test_deadline_expiring_during_api_probe_is_not_ready() -> None:
+    """A probe returning after the absolute deadline cannot be a ready observation."""
+    result = _api_ready_run(True, 10_000.0)
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
+    assert not result.api_ready
+
+
+class FakeJournal:
+    """Emulate Supervisor's journal-backed add-on log endpoint, including its 100-line tail."""
+
+    def __init__(self, count: int) -> None:
+        """Start with `count` historical entries `c0..`."""
+        self.entries = [(f"c{i}", f"old line {i}") for i in range(count)]
+        self.next_id = count
+
+    def append(self, *lines: str) -> None:
+        """Append new entries."""
+        for line in lines:
+            self.entries.append((f"c{self.next_id}", line))
+            self.next_id += 1
+
+    def rotate(self, drop: int) -> None:
+        """Drop the oldest entries as journald vacuuming would."""
+        del self.entries[:drop]
+
+    def run(self, _argv: list[str], **kwargs: Any) -> _Completed:
+        """Serve the requested Range window with an `X-First-Cursor` response header."""
+        config = kwargs["input"].decode()
+        assert "fail" in config.splitlines()
+        spec = next(
+            line.split("entries=")[1].rstrip('"')
+            for line in config.splitlines()
+            if "Range:" in line
+        )
+        cursor, skip, count = spec.split(":")
+        if cursor == "" and skip:
+            chosen = self.entries[int(skip) - 1 :][: int(count)]
+        else:
+            ids = [c for c, _ in self.entries]
+            start = ids.index(cursor) if cursor in ids else 0
+            chosen = self.entries[start:][: int(count)]
+        body = "".join(f"{line}\n" for _, line in chosen).encode()
+        head = (
+            f"HTTP/1.1 200 OK\r\nX-First-Cursor: {chosen[0][0]}\r\n\r\n"
+            if chosen
+            else ("HTTP/1.1 200 OK\r\n\r\n")
+        )
+        return _Completed(0, head.encode() + body)
+
+
+def test_baseline_survives_a_full_sliding_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hundreds of new lines must not push the baseline out of an already-full 100-line tail."""
+    journal = FakeJournal(300)
+    monkeypatch.setattr(subprocess, "run", journal.run)
+    token = "a" * 40
+    base = observer.capture_baseline(observer.SupervisorLogReader(token), time.monotonic() + 5)
+    assert base.cursor == "c298"
+    journal.append(f"Installing nredd/server@{SOURCE}")
+    journal.append(*[f"Fetching wheel {i}" for i in range(400)])
+    journal.append("Starting Music Assistant")
+    reader = observer.SupervisorLogReader(token, base.cursor)
+    result = observer.observe(
+        reader,
+        type("P", (), {"ready": lambda _s, _d: True})(),
+        base,
+        time.monotonic() + 1000,
+    )
+    assert result.phase is observer.BootstrapPhase.API_READY
+    assert result.log_continuity
+
+
+def test_rotated_baseline_cursor_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Journal vacuuming past the baseline entry fails closed instead of misreading history."""
+    journal = FakeJournal(50)
+    monkeypatch.setattr(subprocess, "run", journal.run)
+    token = "a" * 40
+    base = observer.capture_baseline(observer.SupervisorLogReader(token), time.monotonic() + 5)
+    journal.rotate(49)
+    journal.append(f"Installing nredd/server@{SOURCE}")
+    result = observer.observe(
+        observer.SupervisorLogReader(token, base.cursor),
+        SequenceProbe([True]),
+        base,
+        time.monotonic() + 1000,
+    )
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
+
+
+def test_log_cursor_header_is_validated() -> None:
+    """A hostile cursor cannot be spliced into a later Range header."""
+    with pytest.raises(observer.ObserverError):
+        observer._first_cursor(b"HTTP/1.1 200 OK\r\nX-First-Cursor: a b")
+    with pytest.raises(observer.ObserverError):
+        observer.SupervisorLogReader("a" * 40, 'bad"cursor')

@@ -468,11 +468,18 @@ install without permitting an unbounded readiness loop. No observer result autho
 mutation; the single designated live-run owner (named by the parent for that run) remains the
 exclusive recovery owner.
 
-The observer rechecks the live lease on every poll and reports `unknown` once it is gone. The
-Supervisor log endpoint is a bounded tail: if the window slides past the captured baseline or
-the 256 KiB cap, the observer reports `unknown` rather than guessing. The lease probe takes a
-non-blocking shared lock only, so arm the watchdog before observing. Capture the baseline while
-DEV is stopped; this is an operator step and is not enforced by code.
+The observer rechecks the live lease on every poll, and again after a blocking log read or API
+probe before it can report `api-ready`; a dead lease or expired deadline yields `unknown`.
+The Supervisor add-on log endpoint defaults to a sliding tail of the last 100 journal entries,
+so the baseline records the journal cursor (`X-First-Cursor`) of its first entry, and later
+reads use the supported `Range: entries=<cursor>::<count>` header to start at that exact entry
+(Supervisor 2026.10.5 `api/host.py` `advanced_logs_handler`; systemd journal-gatewayd). The
+baseline cursor must come back as the first entry again; if journald vacuumed it, the result is
+`unknown`. Reads over 256 KiB or 2000 entries also yield `unknown`. The live-lease probe takes a
+non-blocking shared flock only, and the lifecycle `start` probe is shared too, so an observer
+can never make a dead watchdog look alive; arm the watchdog before observing, because an
+observer's momentary shared lock can make a concurrent `arm` report the lease as taken. Capture
+the baseline while DEV is stopped; this is an operator step and is not enforced by code.
 
 ## Gates before any launch
 
