@@ -104,6 +104,9 @@ class DiscoveryController(CoreController):
     async def setup(self, config: CoreConfig) -> None:
         """Initialize discovery controller."""
         self.config = config
+        if is_trial_target():
+            self.mass.config.set_raw_core_config_value(self.domain, CONF_PRIVATE_TRIAL_TARGET, "")
+            await self.mass.config.async_save()
         self._configure_library_loggers()
         await self._setup_mdns_browser()
         await self._register_mass_service()

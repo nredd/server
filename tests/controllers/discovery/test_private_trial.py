@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Coroutine
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from zeroconf import ServiceStateChange
 
+from music_assistant.controllers.discovery import controller as discovery_module
 from music_assistant.controllers.discovery.controller import HA_ANNOUNCE_TIMER_ID
 from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
 from music_assistant.mass import MusicAssistant
@@ -78,6 +80,122 @@ async def test_cold_setup_and_periodic_publication(
             discovery._aiozc.async_register_service.assert_awaited_once()
             discovery._aiozc.async_update_service.assert_awaited_once()
     discovery._aiozc = None
+
+
+async def test_trial_setup_clears_stale_admission_before_browser(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """Private startup clears persisted admission before any browser callback can resolve it."""
+    mass = mass_minimal
+    discovery = mass.discovery
+    discovery._aiozc = MagicMock()
+    mass.config.set_raw_core_config_value(
+        "discovery", CONF_PRIVATE_TRIAL_TARGET, "aabbccddeeff@test"
+    )
+    await mass.config.async_save()
+    provider = MagicMock(
+        instance_id="private-airplay",
+        available=True,
+        manifest=MagicMock(mdns_discovery=["_raop._tcp.local."], upnp_discovery=None),
+        on_mdns_service_state_change=AsyncMock(),
+    )
+    mass._providers[provider.instance_id] = provider
+
+    async def setup_browser() -> None:
+        assert discovery.trial_target() is None
+        discovery._on_mdns_service_state_change(
+            MagicMock(),
+            "_raop._tcp.local.",
+            "aabbccddeeff@test._raop._tcp.local.",
+            ServiceStateChange.Added,
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    with (
+        patch(
+            "music_assistant.controllers.discovery.controller.is_trial_target", return_value=True
+        ),
+        patch.object(discovery, "_setup_mdns_browser", side_effect=setup_browser) as browser,
+        patch.object(discovery_module, "AsyncServiceInfo") as service_info,
+    ):
+        config = await mass.config.get_core_config("discovery")
+        assert config.get_value(CONF_PRIVATE_TRIAL_TARGET) == "aabbccddeeff@test"
+        await discovery.setup(config)
+
+    browser.assert_awaited_once()
+    service_info.assert_not_called()
+    provider.on_mdns_service_state_change.assert_not_awaited()
+    assert mass.config.get_raw_core_config_value("discovery", CONF_PRIVATE_TRIAL_TARGET) == ""
+    mass._providers.pop(provider.instance_id)
+    discovery._aiozc = None
+
+
+async def test_private_target_can_be_admitted_after_boot(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """The existing config API admits an explicit target after private startup resets it."""
+    mass = mass_minimal
+    discovery = mass.discovery
+    discovery._aiozc = MagicMock()
+    provider = MagicMock(
+        instance_id="private-airplay",
+        available=True,
+        manifest=MagicMock(mdns_discovery=["_raop._tcp.local."], upnp_discovery=None),
+        on_mdns_service_state_change=AsyncMock(),
+    )
+    mass._providers[provider.instance_id] = provider
+
+    with (
+        patch(
+            "music_assistant.controllers.discovery.controller.is_trial_target", return_value=True
+        ),
+        patch.object(discovery, "_setup_mdns_browser", new_callable=AsyncMock),
+    ):
+        await discovery.setup(await mass.config.get_core_config("discovery"))
+        await mass.config.save_core_config(
+            "discovery", {CONF_PRIVATE_TRIAL_TARGET: "aabbccddeeff@test"}
+        )
+        info = MagicMock()
+        info.async_request = AsyncMock(return_value=True)
+        with patch.object(discovery_module, "AsyncServiceInfo", return_value=info):
+            discovery._on_mdns_service_state_change(
+                MagicMock(),
+                "_raop._tcp.local.",
+                "aabbccddeeff@test._raop._tcp.local.",
+                ServiceStateChange.Added,
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+    info.async_request.assert_awaited_once()
+    provider.on_mdns_service_state_change.assert_awaited_once_with(
+        "aabbccddeeff@test._raop._tcp.local.", ServiceStateChange.Added, info
+    )
+    mass._providers.pop(provider.instance_id)
+    discovery._aiozc = None
+
+
+async def test_ordinary_setup_preserves_private_target_value(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """Ordinary startup leaves persisted values untouched."""
+    mass = mass_minimal
+    discovery = mass.discovery
+    mass.config.set_raw_core_config_value("discovery", CONF_PRIVATE_TRIAL_TARGET, "retained")
+    config = await mass.config.get_core_config("discovery")
+    with (
+        patch(
+            "music_assistant.controllers.discovery.controller.is_trial_target", return_value=False
+        ),
+        patch.object(discovery, "_setup_mdns_browser", new_callable=AsyncMock),
+        patch.object(discovery, "_register_mass_service", new_callable=AsyncMock),
+    ):
+        await discovery.setup(config)
+
+    assert (
+        mass.config.get_raw_core_config_value("discovery", CONF_PRIVATE_TRIAL_TARGET) == "retained"
+    )
 
 
 async def test_trial_provider_browser_and_callback_unchanged(mass_minimal: MusicAssistant) -> None:
