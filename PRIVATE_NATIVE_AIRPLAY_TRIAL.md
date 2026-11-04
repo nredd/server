@@ -422,8 +422,9 @@ from the exact server source under review:
 python3 -m scripts.private_trial_binary_gate
 ```
 
-It executes the same `trial_binary.validate_trial_binary()` then
-`trial_binary.preflight_current_image()` order used by private provider startup. The latter starts
+It refuses any non-Linux-ARM host before validation, then executes the same
+`trial_binary.validate_trial_binary()` then `trial_binary.preflight_current_image()` order used by
+private provider startup. The latter starts
 the retained validated executable descriptor with `--attest-only`, injects a fresh nonce, and
 requires the bounded exact FD/self-digest acknowledgement before its intentional zero exit. It
 opens no provider, receiver connection, playback session, or DEV app.

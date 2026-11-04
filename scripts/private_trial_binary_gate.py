@@ -30,7 +30,9 @@ def main() -> int:
 
 
 async def _run_gate() -> None:
-    """Use the same ordering as private AirPlay provider initialization."""
+    """Use the same Linux ARM ordering as private AirPlay provider initialization."""
+    if not trial_binary.is_trial_target():
+        raise trial_binary.TrialBinaryError("Private CLI artifact gate requires Linux ARM")
     await trial_binary.validate_trial_binary()
     await trial_binary.preflight_current_image()
 

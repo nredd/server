@@ -36,11 +36,29 @@ def test_gate_import_does_not_require_the_server_dependency_stack() -> None:
     assert result.returncode == 0, result.stderr
 
 
+async def test_gate_rejects_nontrial_platform_without_running_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ARM host cannot turn an ordinary subprocess into a valid attestation gate."""
+    validation = AsyncMock()
+    preflight = AsyncMock()
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: False)
+    monkeypatch.setattr(trial_binary, "validate_trial_binary", validation)
+    monkeypatch.setattr(trial_binary, "preflight_current_image", preflight)
+
+    with pytest.raises(trial_binary.TrialBinaryError, match="Linux ARM"):
+        await gate._run_gate()
+
+    validation.assert_not_awaited()
+    preflight.assert_not_awaited()
+
+
 async def test_gate_uses_provider_validation_then_current_image_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The standalone gate must retain the provider startup ordering and strict preflight."""
     calls: list[str] = []
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: True)
 
     async def validate() -> dict[str, object]:
         calls.append("validate")
