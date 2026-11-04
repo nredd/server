@@ -113,6 +113,13 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         if provider.AirPlayControlPlayer is not control_player.AirPlayControlPlayer:
             return failure
         if (
+            vars(control_player)["AirPlayPlayer"] is not player.AirPlayPlayer
+            or player.AirPlayPlayer not in control_player.AirPlayControlPlayer.__mro__
+            or inspect.getattr_static(control_player.AirPlayControlPlayer, "_is_airplay2_capable")
+            is not inspect.getattr_static(player.AirPlayPlayer, "_is_airplay2_capable")
+        ):
+            return failure
+        if (
             provider.trial_binary is not trial_binary
             or vars(control_player)["trial_binary"] is not trial_binary
         ):

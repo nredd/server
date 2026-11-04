@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import platform
 from collections import deque
 from collections.abc import Coroutine
 from dataclasses import replace
@@ -80,6 +81,33 @@ def _playing_provider(
     monkeypatch.setattr(provider, "get_players", lambda: [player])
     monkeypatch.setattr(provider_module, "installer_provenance", dict)
     return provider, player, stream
+
+
+async def test_readiness_reports_verified_real_server_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real readiness wiring reports verified evidence on the private profile."""
+    provider, _ = _provider()
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(provider, "get_players", list)
+    response = await provider.get_private_native_volume_capture_readiness()
+    evidence = response["server_code_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["schema_version"] == 1
+    assert evidence["status"] == "verified"
+    hashes = evidence["source_hashes"]
+    assert isinstance(hashes, dict)
+    assert set(hashes) == {
+        "provider",
+        "control_player",
+        "player",
+        "helpers",
+        "constants",
+        "trial_binary",
+        "private_trial",
+        "server_code_evidence",
+    }
 
 
 async def test_registers_fixed_scoped_route_only_for_trial_target(

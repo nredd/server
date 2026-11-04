@@ -11,6 +11,7 @@ from music_assistant.helpers.private_trial import encode_public_digest
 from music_assistant.providers.airplay import (
     constants,
     control_player,
+    player,
     provider,
     trial_binary,
 )
@@ -77,6 +78,24 @@ def test_property_and_binding_swaps(monkeypatch: pytest.MonkeyPatch) -> None:
         assert evidence.server_code_evidence(provider)["status"] == "unverified"
     monkeypatch.setattr(provider, "AirPlayControlPlayer", object)
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+def test_stale_inherited_player_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject a reloaded player class while the control class inherits the old one."""
+    replacement = type("AirPlayPlayer", (player.AirPlayPlayer,), {})
+    monkeypatch.setattr(player, "AirPlayPlayer", replacement)
+    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+def test_shadowed_inherited_getter() -> None:
+    """Reject a control class override of the checked base capability property."""
+    cls = control_player.AirPlayControlPlayer
+    assert "_is_airplay2_capable" not in vars(cls)
+    type.__setattr__(cls, "_is_airplay2_capable", property(lambda _: False))
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        type.__delattr__(cls, "_is_airplay2_capable")
 
 
 def test_unsupported_decorator_and_defaults(

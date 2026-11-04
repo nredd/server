@@ -147,7 +147,8 @@ Readiness schema version `1` has exactly these top-level fields:
   with an externally generated manifest for the final reviewed commit. This is approved source
   hashes plus selected live-code and binding checks, not loaded-commit proof. Source reads and
   compilation are bounded and read-only; unsupported descriptors, mismatched code or bindings,
-  unreadable or oversized files fail closed. This does not check all runtime globals and does not
+  including the control class's inherited AirPlay capability getter, unreadable or oversized
+  files fail closed. This does not check all runtime globals and does not
   defend against a malicious process.
 - `snapshot_current`: boolean. Provenance is collected first, then exact PTP/event and
   player/stream/child/request/capture references are snapshotted. After ALL awaits, the same
