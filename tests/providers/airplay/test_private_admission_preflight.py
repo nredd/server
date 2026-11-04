@@ -128,6 +128,14 @@ async def test_target_and_streams_fail_closed() -> None:
     mass.config.set.assert_not_called()
 
 
+async def test_missing_raw_target_fails_closed() -> None:
+    """An omitted raw target does not prove that startup reset completed."""
+    provider, _, store = _provider({})
+    del store["core"]["discovery"]["values"]["private_trial_target"]
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["target_unset"] is False
+
+
 async def test_direct_handler_rejects_other_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Direct invocation outside the private profile is unavailable."""
     provider, mass, _ = _provider({})

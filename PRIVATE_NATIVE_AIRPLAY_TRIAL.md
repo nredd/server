@@ -12,8 +12,9 @@ Before enabling the private target, call the private-only `SYSTEM_MANAGE` comman
 or `present`, and every boolean (`setup_data_empty`, `credentials_absent`,
 `default_volume_bounds`, `target_unset`, `no_current_streams`) true. Any error,
 missing field, unexpected value, or `unsafe` state fails closed. The command reads
-raw config without repairing it and never returns identifiers or stored values.
-Nonempty setup data and legacy credentials are rejected; absent volume limits mean
+raw config without repairing it and never returns identifiers or stored values. The
+raw target must explicitly be an empty string, as written by private discovery startup;
+missing target state fails closed. Nonempty setup data and legacy credentials are rejected; absent volume limits mean
 0 and 100. Native MRP for a private TV also requires stored credentials.
 
 This permits a discovery-only proof, not default-output, active Music, or playback

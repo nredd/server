@@ -766,7 +766,7 @@ class AirPlayProvider(PlayerProvider):
         }
 
     def _register_private_capture_api(self) -> None:
-        """Atomically claim both private routes within the load-failing lifecycle."""
+        """Atomically claim all private routes within the load-failing lifecycle."""
         if not is_trial_target():
             return
         self._unregister_private_capture_api = self.mass.register_api_command(
