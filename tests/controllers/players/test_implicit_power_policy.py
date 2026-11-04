@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.constants import PLAYER_CONTROL_FAKE, PLAYER_CONTROL_NATIVE
 from music_assistant_models.enums import MediaType, PlayerFeature, PlayerType
 from music_assistant_models.player import PlayerMedia
+from pyatv.interface import AppleTV
 
 from music_assistant.constants import CONF_POWER_CONTROL
 from music_assistant.controllers.players import PlayerController
+from tests.common import use_real_create_task
 from tests.controllers.players.test_player_controller import _player_config_stub
 from tests.controllers.players.test_player_controller import mock_mass as controller_mock_mass
 from tests.providers.airplay.test_control_player import _make_control_player
@@ -163,6 +166,77 @@ async def test_controller_group_power_provenance(
         else:
             await controller.cmd_power(group.player_id, True)
     assert power.await_count == int(not automatic)
+
+
+@pytest.mark.parametrize("explicit_power", [False, True])
+async def test_ugp_playback_skips_sleeping_tv_without_wake(
+    mock_mass: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    explicit_power: bool,
+) -> None:
+    """A sleeping trial TV is excluded unless explicitly powered on first."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    config_value = _player_config_stub({CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE})
+    mock_mass.config.get_raw_player_config_value.side_effect = lambda player_id, key, default=None: (
+        PLAYER_CONTROL_FAKE
+        if player_id == "ugp_test" and key == CONF_POWER_CONTROL
+        else config_value(player_id, key, default)
+    )
+    controller = PlayerController(mock_mass)
+    mock_mass.players = controller
+    group = _make_ugp(mock_mass)
+    group.logger = logging.getLogger("test.ugp.implicit_power")
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    device = MagicMock(spec=AppleTV)
+    device.features.in_state.return_value = True
+    device.power.turn_on = AsyncMock()
+    player._companion_device = device
+    player.config.name = None
+    player.config.default_name = "Test TV"
+    group._attr_static_group_members = [player.player_id]
+    group._attr_group_members = [player.player_id]
+    group._attr_powered = False
+    controller._players = {group.player_id: group, player.player_id: player}
+    for item in (group, player):
+        item.set_initialized()
+        item.update_state(signal_event=False)
+    assert list(controller.iter_group_members(group, only_powered=True)) == []
+
+    async def report_awake() -> None:
+        player._attr_powered = True
+        player.update_state(signal_event=False)
+
+    device.power.turn_on.side_effect = report_awake
+    media = PlayerMedia(uri="http://example.test/audio", media_type=MediaType.TRACK)
+    mock_mass.streams.base_url = "http://example.test"
+    mock_mass.player_queues.resume = AsyncMock()
+    use_real_create_task(mock_mass)
+    with (
+        patch.object(group, "_play_media_on_member", new=AsyncMock()) as fanout,
+        patch.object(controller, "_fetch_palette", new=AsyncMock()),
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+        caplog.at_level(logging.WARNING),
+    ):
+        if explicit_power:
+            await controller.cmd_power(group.player_id, True)
+        await group.play_media(media)
+
+    assert device.power.turn_on.await_count == int(explicit_power)
+    assert fanout.await_count == int(explicit_power)
+    if not explicit_power:
+        assert player.state.powered is False
+        assert player.display_name in caplog.text
+        assert "automatic power" in caplog.text
+    else:
+        assert player.state.powered is True
+        assert fanout.await_args is not None
+        assert fanout.await_args.args[0] == player.player_id
 
 
 @pytest.mark.parametrize("explicit_power", [False, True])

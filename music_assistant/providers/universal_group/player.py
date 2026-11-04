@@ -514,6 +514,12 @@ class UniversalGroupPlayer(Player):
             if member.synced_to:
                 # member is part of a syncgroup — release it first
                 await member.ungroup()
+            if automatic and member.state.powered is False and not member.allow_implicit_power_on:
+                self.logger.warning(
+                    "Skipping %s in group %s: automatic power on is disabled and the player is off",
+                    member.display_name,
+                    self.display_name,
+                )
             if (
                 not member.powered
                 and (not automatic or member.allow_implicit_power_on)
