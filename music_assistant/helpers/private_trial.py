@@ -7,6 +7,7 @@ References:
 
 from __future__ import annotations
 
+import importlib
 import importlib.metadata
 import json
 import platform
@@ -16,7 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import music_assistant
-from music_assistant.helpers.json import json_loads
 
 if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
@@ -346,6 +346,8 @@ def _read_json(path: Path) -> dict[str, object]:
     if len(raw) > MAX_JSON:
         raise PrivateTrialError("Trial metadata exceeds limit")
     try:
+        # Defer the full JSON helper so the receiver-free artifact gate stays import-light.
+        json_loads = importlib.import_module("music_assistant.helpers.json").json_loads
         # Match the real config loader before its fallback can read a backup.
         # stdlib JSON alone accepts NaN and escaped lone surrogates that MA rejects.
         json_loads(raw)
