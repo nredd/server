@@ -65,6 +65,12 @@ SUPERVISOR_BASE_URL = "http://supervisor"
 CONFIRMED_STATES = ("started", "stopped")
 VERIFIED_STATUS = "DEV stopped and stock absence re-verified; nothing else touched"
 LOGGER = logging.getLogger(__name__)
+DEV_NOT_RUNNING_ENVELOPE = {
+    "result": "error",
+    "message": f"App {DEV} is not running",
+    "error_key": "app_not_running_error",
+    "extra_fields": {"app": DEV},
+}
 
 
 class LifecycleError(RuntimeError):
@@ -173,10 +179,12 @@ class SupervisorTransport:
         """
         Require the stats route's exact not-running response for DEV.
 
-        Supervisor answers `GET /addons/<DEV>/stats?one_shot=true` with HTTP 400 and
-        `{"result": "error", "message": "App <DEV> is not running"}` only when the
-        Docker container is not running. Success, other statuses, non-JSON bodies and
-        any extra or differing key are all treated as unconfirmed.
+        Supervisor 2026.10.5 answers `GET /addons/<DEV>/stats?one_shot=true` with HTTP
+        400 and exactly four keys, `result: error`, `message: App <DEV> is not running`,
+        `error_key: app_not_running_error` and `extra_fields: {"app": <DEV>}`, only when
+        the Docker container is not running. The earlier two-key form was never the real
+        wire shape and is refused. Success, other statuses, non-JSON bodies and any
+        missing, extra, differing or nested-extra key are all treated as unconfirmed.
 
         :raises LifecycleError: Unless that exact response was received.
         """
@@ -190,7 +198,7 @@ class SupervisorTransport:
             parsed = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as err:
             raise LifecycleError("DEV running state is not confirmed") from err
-        if parsed != {"result": "error", "message": f"App {DEV} is not running"}:
+        if parsed != DEV_NOT_RUNNING_ENVELOPE:
             raise LifecycleError("DEV running state is not confirmed")
 
     def _curl(self, method: str, url: str) -> tuple[bytes, int]:
