@@ -266,6 +266,7 @@ class StimulusServer:
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(controller._stimulus.payload)
+                # Reached only if the whole body was written; an aborted fetch raises.
                 controller._record_completed_fetch()
 
             def log_message(self, _format: str, *_args: object) -> None:
@@ -282,7 +283,7 @@ class StimulusServer:
 
     @property
     def completed_fetches(self) -> int:
-        """Return how many requests had the whole payload written to the socket."""
+        """Return how many fetches of the stimulus completed."""
         with self._lock:
             return self._completed_fetches
 
@@ -299,7 +300,7 @@ class StimulusServer:
         self._server.server_close()
 
     def _record_completed_fetch(self) -> None:
-        """Count one request whose full response body was handed to the socket."""
+        """Count one completed fetch of the stimulus."""
         with self._lock:
             self._completed_fetches += 1
 

@@ -28,6 +28,7 @@ from scripts.private_tv_transport import (
 
 PLAY_SLACK_SECONDS = 2
 WATCHDOG_STOP_OFFSET_SECONDS = 2
+WATCHDOG_TIMING_TOLERANCE_SECONDS = 0.5
 
 
 def tv_scope() -> TrialScope:
@@ -234,7 +235,10 @@ def test_arming_failure_is_error_and_never_plays() -> None:
     """A watchdog that cannot arm fails closed before any play request."""
 
     class BrokenGuard:
+        """A stop guard that can never arm."""
+
         def arm(self, player: str, deadline: float) -> None:
+            """Fail closed before dispatch."""
             raise TransportError("could not arm independent stop watchdog")
 
     stimulus = generate_stimulus()
@@ -257,7 +261,10 @@ def test_stop_failure_is_recorded_after_full_observation() -> None:
     """A failed final stop keeps the error and never reports a stop request."""
 
     class FailingStop(FakeApi):
+        """Fail only the final stop request."""
+
         def command(self, command: str, args: dict[str, Any], timeout: float = 3.0) -> Any:
+            """Raise on stop, otherwise behave like `FakeApi`."""
             if command == "players/cmd/stop":
                 raise TransportError("stop failed")
             return super().command(command, args, timeout)
@@ -431,7 +438,11 @@ def test_independent_watchdog_stops_after_slow_play_response(
         )
         assert receipt.ma_play_request_accepted is False
         assert stopped.wait(2)
-        assert WATCHDOG_STOP_OFFSET_SECONDS - 0.5 <= stopped_at[0] - started < HTTP_TIMEOUT_SECONDS
+        assert (
+            WATCHDOG_STOP_OFFSET_SECONDS - WATCHDOG_TIMING_TOLERANCE_SECONDS
+            <= stopped_at[0] - started
+            < HTTP_TIMEOUT_SECONDS
+        )
     finally:
         source.close()
         server.shutdown()
