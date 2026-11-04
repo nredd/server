@@ -32,6 +32,7 @@ def test_private_manifest_matches_source_pin() -> None:
     manifest = json.loads(
         (Path(__file__).resolve().parents[3] / "private-native-airplay-trial-pin.json").read_text()
     )
+    assert manifest["cli_source_sha"] == "429c5670fb6cdf1ddbf28ca5cfab0e5db7d2aea4"
     assert manifest["cli_sha256"] == trial.EXPECTED_SHA
     assert manifest["cli_build_label"] == trial.EXPECTED_BUILD
     assert manifest["cli_path"] == str(trial.TRIAL_ROOT / trial.EXPECTED_SHA / trial.ASSET_NAME)

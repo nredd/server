@@ -28,19 +28,19 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
-The private CLI candidate is pinned to `e255a82f11d9cc7f8fbc8a01f5bd0a40cbbe3138`,
-the merged `nredd/airplay-cli` commit containing the prior receive-only trial work plus
-bounded STOP, resolver, and RTSP response handling repairs. GitHub workflow `41716916801`
-passed its build, sanitizer, and updater jobs. Its aarch64 artifact has ELF SHA256
-`bdbece07a15eca764c84a83eac4e6dc4bacc3770370df891b20e869db66e51f1` (6152968 bytes)
-and expected build label `ve255a82`. Scoped runtime acceptance is cleared for this exact
-artifact's synthetic loopback lifecycle contract: the natural handshake rejection reached
-EOF with no extra handshake bytes or UDP and cleaned up naturally; the test-only two-second
-deadline rejected as `child_deadline` and cleaned up before rescue. The retained rejection,
-STOP, SIGTERM, and SIGINT cases also pass. This acceptance excludes receiver identity,
-snapshot freshness, receiver admission, playback, native volume behavior, and deployment.
-The candidate remains an immutable acceptance artifact only; `launch_authorized` stays
-false and no trial deployment is authorized. Earlier assets stay staged as history.
+The private CLI candidate source is `429c5670fb6cdf1ddbf28ca5cfab0e5db7d2aea4`,
+merged as `7a03fcfd45ebfb584921d942bef7b68b660cea03`. GitHub workflow `41769386002`
+passed, including the fully static Linux ARM64 artifact job. The artifact was built from
+CI synthetic merge `cd7d36b`; its tree equals the reviewed source and merged trees
+`20c188938ed3ab3d547dd8f099cb8f5e9324b79e`. It has ELF SHA256
+`fc77ceec40e796fffa89a06b95c384f5838d6308bdedda3cc2491d3a53cf7fb8` (6415680 bytes)
+and build label `vcd7d36b`. Receiver-free current-image attestation and the reviewed v2
+synthetic-loopback suite passed: natural handshake rejection, test-only two-second
+`child_deadline`, rejection, STOP, SIGTERM, and SIGINT cases. This acceptance excludes
+receiver identity, snapshot freshness, receiver admission, playback, native volume behavior,
+and deployment. The candidate remains an immutable acceptance artifact only;
+`launch_authorized` stays false and no trial deployment is authorized. Earlier assets stay
+staged as history.
 
 ## Private aggregate volume capture
 
@@ -245,8 +245,8 @@ Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile cha
   control lookup consult the same admission.
 - Every owned private CLI child (PTP daemon, stream and pair-setup) receives
   `CLIAIRPLAY_PTP_STRICT_PEERS=1`, and on the trial target the shared daemon counts as
-  ready ONLY when its `[PTP] daemon up` line attests `strict-peers=on`. The pinned asset
-  `e255a82` includes the receive gate (`d286032`) and the attestation (#4). An older
+  ready ONLY when its `[PTP] daemon up` line attests `strict-peers=on`. The retired
+  `e255a82` asset includes the receive gate (`d286032`) and the attestation (#4); the current pin is documented above. An older
   asset that cannot attest it (e.g. the retired `716f894`) leaves `ptp_ready`,
   `prestream_ready` and `playing_ready` false, fails the readiness receipt closed, and
   makes every trial AirPlay 2 session start wait the full `PTP_DAEMON_READY_TIMEOUT` (3 s)
@@ -335,7 +335,7 @@ executable must match SHA256 and ELF64 little-endian AArch64 headers before `--c
 The build check executes a retained validated descriptor too, never a pathname which can
 be swapped and restored between pre/post validation. It has a five-second deadline,
 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `ve255a82` with exit zero.
+second of cleanup, and must report `cliairplay`, `check` and `vcd7d36b` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.
