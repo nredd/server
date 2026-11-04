@@ -60,6 +60,8 @@ wall-clock deadline tests. `VolumeRig.close()` restores the module reference; th
 must use `make_rig(..., real_deadlines=True)`. The explicit real-budget regression retains
 the production 2.5-second deadline and checks whole-group unknown state plus rejection of
 late receipts. The executable volume-contract checker also opts into real deadlines.
+Create each rig's real command FIFO with `VolumeRig.open_fifo()` inside the test's
+`try`, so `close()` releases the FIFO, reader and module patch on any setup failure.
 
 ### Using Devcontainer/Codespace
 We removed support for devcontainers because we do not have anyone willing to maintain it.
