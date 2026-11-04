@@ -431,7 +431,7 @@ def test_independent_watchdog_stops_after_slow_play_response(
         )
         assert receipt.ma_play_request_accepted is False
         assert stopped.wait(2)
-        assert 1.5 <= stopped_at[0] - started < HTTP_TIMEOUT_SECONDS
+        assert WATCHDOG_STOP_OFFSET_SECONDS - 0.5 <= stopped_at[0] - started < HTTP_TIMEOUT_SECONDS
     finally:
         source.close()
         server.shutdown()
