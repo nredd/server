@@ -162,6 +162,100 @@ async def test_regular_bridge_command_awaits_receipt_without_double_scale_or_fee
         await rig.close()
 
 
+async def test_cold_bridge_retries_checked_initial_volume_after_publishing_owner() -> None:
+    """A connect-time checked commit is retried after the bridge publishes its stream."""
+    fixture = await make_bridge_rig(1)
+    rig = fixture.rig
+    bridge = fixture.bridges[0]
+    stream = rig.streams[0]
+
+    async def connect_before_ownership(*_args: object) -> None:
+        """Reproduce the initial volume push inside `AirPlayStream.connect`."""
+        await stream._send_current_volume()
+
+    try:
+        bridge._airplay_stream = None
+        stream.player.stream = None
+        stream.session_volume.confirmed_level = None
+        bridge._airplay_stream_start_task = asyncio.current_task()
+        rig.commands.clear()
+
+        with (
+            patch.object(stream, "connect", new=AsyncMock(side_effect=connect_before_ownership)),
+            patch.object(stream, "wait_for_connection", new=AsyncMock()),
+            patch.object(bridge, "_anchor_stream", new=AsyncMock(return_value=True)),
+        ):
+            assert await bridge._start_cold_stream(stream)
+        assert sum("ACTION=STREAM_VOLUME_APPLY" in command for command in rig.commands) == 1
+        assert stream.session_volume.confirmed_level == 60
+    finally:
+        await rig.close()
+
+
+async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
+    """The final group owner retries members whose first commit lacked a complete group."""
+    fixture = await make_bridge_rig(2)
+    rig = fixture.rig
+    provider = cast("AirPlayProvider", rig.streams[0].prov)
+    manager = provider.bridge_manager
+    first, second = fixture.bridges
+    try:
+        rig.streams[0].session_volume.confirmed_level = None
+        second._airplay_stream = None
+        second.airplay_player.stream = None
+        second_stream = rig.streams[1]
+        second_stream.session_volume.confirmed_level = None
+        rig.commands.clear()
+        await manager.retry_initial_checked_volumes(first)
+        assert not rig.commands
+
+        second._airplay_stream = rig.streams[1]
+        second.airplay_player.stream = rig.streams[1]
+        await manager.retry_initial_checked_volumes(second)
+        assert sum("ACTION=STREAM_VOLUME_APPLY" in command for command in rig.commands) == 2
+    finally:
+        await rig.close()
+
+
+async def test_initial_retry_ignores_distinct_groups_and_confirmed_members() -> None:
+    """A group's publication retries only its unresolved checked streams."""
+    fixture = await make_bridge_rig(1)
+    manager = cast("AirPlayProvider", fixture.rig.streams[0].prov).bridge_manager
+    group_a = object()
+    group_b = object()
+
+    def bridge(group: object, confirmed: int | None) -> MagicMock:
+        """Build a bridge-shaped retry candidate with no real transport."""
+        stream = MagicMock()
+        stream.session_volume_requested = True
+        stream.session_volume.supported = True
+        stream.session_volume.confirmed_level = confirmed
+        stream._send_current_volume = AsyncMock()
+        return MagicMock(sendspin_group=group, _airplay_stream=stream)
+
+    owner = bridge(group_a, None)
+    same_group_confirmed = bridge(group_a, 60)
+    other_group_unresolved = bridge(group_b, None)
+    original = manager._bridges
+    try:
+        manager._bridges = {
+            "owner": cast("SendspinAirPlayBridge", owner),
+            "confirmed": cast("SendspinAirPlayBridge", same_group_confirmed),
+            "other": cast("SendspinAirPlayBridge", other_group_unresolved),
+        }
+        await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
+        owner._airplay_stream._send_current_volume.assert_awaited_once_with()
+        same_group_confirmed._airplay_stream._send_current_volume.assert_not_awaited()
+        other_group_unresolved._airplay_stream._send_current_volume.assert_not_awaited()
+
+        owner.sendspin_group = None
+        await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
+        owner._airplay_stream._send_current_volume.assert_awaited_once_with()
+    finally:
+        manager._bridges = original
+        await fixture.rig.close()
+
+
 @pytest.mark.parametrize(
     "change", ["missing", "mixed", "replaced", "membership", "native", "cycle"]
 )
