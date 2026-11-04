@@ -201,4 +201,5 @@ async def test_controller_group_member_power_provenance(
         )
     assert power.await_count == int(explicit_power)
     join.assert_awaited_once()
+    assert join.await_args is not None
     assert join.await_args.args[1] == [player.player_id]
