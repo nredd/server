@@ -328,23 +328,25 @@ async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
 ) -> None:
     """An old exact-generation UNBIND cannot detach a replacement binding."""
     rig = make_rig(1)
-    stream = rig.streams[0]
-    backend = stream.session_volume
-    old_unbind_reached = asyncio.Event()
-    release_old_unbind = asyncio.Event()
-    old_unbind_done = asyncio.Event()
-    send = stream.send_cli_command
-
-    async def delay_old_unbind(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        if "ACTION=SESSION_VOLUME_UNBIND" in command:
-            old_unbind_reached.set()
-            await release_old_unbind.wait()
-            result = await send(command, guard=guard)
-            old_unbind_done.set()
-            return result
-        return await send(command, guard=guard)
-
     try:
+        stream = rig.streams[0]
+        backend = stream.session_volume
+        old_unbind_reached = asyncio.Event()
+        release_old_unbind = asyncio.Event()
+        old_unbind_done = asyncio.Event()
+        send = stream.send_cli_command
+
+        async def delay_old_unbind(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            if "ACTION=SESSION_VOLUME_UNBIND" in command:
+                old_unbind_reached.set()
+                await release_old_unbind.wait()
+                result = await send(command, guard=guard)
+                old_unbind_done.set()
+                return result
+            return await send(command, guard=guard)
+
         assert await backend.bind(b"old-output", b"", verified_identity=True)
         old_generation = backend.generation
         rig.commands.clear()

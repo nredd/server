@@ -809,30 +809,30 @@ async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fi
 async def test_real_child_stdout_fifo_round_trip(tmp_path: Path) -> None:
     """Exercise real process/stdout/FIFO plus real controller, without a receiver or network."""
     rig = make_rig(1)
-    stream = rig.streams[0]
-    pipe = tmp_path / "commands"
-    stream.commands_pipe = AsyncNamedPipeWriter(str(pipe))
-    cast("MagicMock", stream.prov.config).get_value.return_value = True
-    capabilities_seen = asyncio.Event()
-    script = (
-        "import sys\n"
-        "print('[STATUS] session_volume version=1', flush=True)\n"
-        "print('[STATUS] capabilities live_metadata=1', flush=True)\n"
-        "print('[STATUS] connected', file=sys.stderr, flush=True)\n"
-        f"with open({str(pipe)!r}) as commands:\n"
-        " fields = {}\n"
-        " for line in commands:\n"
-        "  key, value = line.strip().split('=', 1)\n"
-        "  fields[key] = value\n"
-        "  if key != 'ACTION': continue\n"
-        "  if value == 'STREAM_VOLUME_APPLY':\n"
-        "   print('[EVENT] stream_volume_result generation=' + fields['STREAM_VOLUME_GENERATION']"
-        " + ' ordinal=' + fields['STREAM_VOLUME_ORDINAL'] + ' status=committed level='"
-        " + str(min(61, int(fields['STREAM_VOLUME_LEVEL']))), flush=True)\n"
-        "  if value == 'STOP': break\n"
-        "  fields = {}\n"
-    )
     try:
+        stream = rig.streams[0]
+        pipe = tmp_path / "commands"
+        stream.commands_pipe = AsyncNamedPipeWriter(str(pipe))
+        cast("MagicMock", stream.prov.config).get_value.return_value = True
+        capabilities_seen = asyncio.Event()
+        script = (
+            "import sys\n"
+            "print('[STATUS] session_volume version=1', flush=True)\n"
+            "print('[STATUS] capabilities live_metadata=1', flush=True)\n"
+            "print('[STATUS] connected', file=sys.stderr, flush=True)\n"
+            f"with open({str(pipe)!r}) as commands:\n"
+            " fields = {}\n"
+            " for line in commands:\n"
+            "  key, value = line.strip().split('=', 1)\n"
+            "  fields[key] = value\n"
+            "  if key != 'ACTION': continue\n"
+            "  if value == 'STREAM_VOLUME_APPLY':\n"
+            "   print('[EVENT] stream_volume_result generation=' + fields['STREAM_VOLUME_GENERATION']"
+            " + ' ordinal=' + fields['STREAM_VOLUME_ORDINAL'] + ' status=committed level='"
+            " + str(min(61, int(fields['STREAM_VOLUME_LEVEL']))), flush=True)\n"
+            "  if value == 'STOP': break\n"
+            "  fields = {}\n"
+        )
         with (
             patch.object(
                 stream,

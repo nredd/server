@@ -7,6 +7,7 @@ References:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import time
@@ -178,3 +179,42 @@ async def test_partial_fifo_setup_is_released_by_close(tmp_path: Path, open_fail
     for descriptor in descriptors:
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(descriptor)
+
+
+def _unguarded_rigs(path: Path) -> list[int]:
+    """Return lines where `make_rig()` is not immediately followed by a closing `try`."""
+    tree = ast.parse(path.read_text())
+    bad: list[int] = []
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for index, stmt in enumerate(body):
+            call = stmt.value if isinstance(stmt, ast.Assign) else None
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "make_rig"
+            ):
+                continue
+            if any(
+                kw.arg == "real_deadlines" and ast.literal_eval(kw.value) is True
+                for kw in call.keywords
+                if isinstance(kw.value, ast.Constant)
+            ):
+                continue  # no module patch is installed
+            following = body[index + 1] if index + 1 < len(body) else None
+            if not isinstance(following, ast.Try):
+                bad.append(stmt.lineno)
+    return bad
+
+
+def test_every_offline_rig_is_closed_by_the_next_statement() -> None:
+    """Nothing fallible may sit between `make_rig()` and the `try` that calls `close()`."""
+    root = Path(__file__).resolve().parents[2]
+    offenders = {
+        f"{path.relative_to(root)}:{line}": None
+        for path in sorted(root.rglob("test_*.py"))
+        for line in _unguarded_rigs(path)
+    }
+    assert not offenders

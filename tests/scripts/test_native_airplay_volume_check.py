@@ -85,9 +85,9 @@ async def test_bad_timeout(timeout: float) -> None:
 async def test_mux_only_fakes_actuator_receipts(tmp_path: Path) -> None:
     """Control transactions reach the real FIFO; only checked actuators are faked."""
     rig = make_rig(1)
-    fifo = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    mux = check.Transactions(rig, fifo)
     try:
+        fifo = AsyncNamedPipeWriter(str(tmp_path / "commands"))
+        mux = check.Transactions(rig, fifo)
         with patch.object(fifo, "write_atomic", new_callable=AsyncMock) as write:
             write.return_value = True
             data = b"SESSION_VOLUME_GENERATION=7\nACTION=SESSION_VOLUME_UNBIND\n"
