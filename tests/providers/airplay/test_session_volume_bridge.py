@@ -23,7 +23,6 @@ from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.constants import CONF_MAX_VOLUME, CONF_MIN_VOLUME, CONF_VOLUME_CONTROL
 from music_assistant.controllers.players.constants import PlayerLockPurpose
-from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.providers.airplay.provider import AirPlayProvider
 from music_assistant.providers.airplay.sendspin_bridge import (
     SendspinAirPlayBridge,
@@ -174,14 +173,14 @@ async def test_cold_bridge_retries_checked_initial_volume_after_publishing_owner
     """A connect-time checked commit is retried after the bridge publishes its stream."""
     fixture = await make_bridge_rig(1)
     rig = fixture.rig
-    bridge = fixture.bridges[0]
-    stream = rig.streams[0]
-
-    async def connect_before_ownership(*_args: object) -> None:
-        """Reproduce the initial volume push inside `AirPlayStream.connect`."""
-        await stream._send_current_volume()
-
     try:
+        bridge = fixture.bridges[0]
+        stream = rig.streams[0]
+
+        async def connect_before_ownership(*_args: object) -> None:
+            """Reproduce the initial volume push inside `AirPlayStream.connect`."""
+            await stream._send_current_volume()
+
         bridge._airplay_stream = None
         stream.player.stream = None
         stream.session_volume.confirmed_level = None
@@ -204,10 +203,10 @@ async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
     """The final group owner retries members whose first commit lacked a complete group."""
     fixture = await make_bridge_rig(2)
     rig = fixture.rig
-    provider = cast("AirPlayProvider", rig.streams[0].prov)
-    manager = provider.bridge_manager
-    first, second = fixture.bridges
     try:
+        provider = cast("AirPlayProvider", rig.streams[0].prov)
+        manager = provider.bridge_manager
+        first, second = fixture.bridges
         rig.streams[0].session_volume.confirmed_level = None
         second._airplay_stream = None
         second.airplay_player.stream = None
@@ -225,32 +224,37 @@ async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
         await rig.close()
 
 
-async def test_initial_retry_ignores_distinct_groups_and_confirmed_members() -> None:
+async def test_initial_retry_ignores_distinct_groups_and_confirmed_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A group's publication retries only its unresolved checked streams."""
     fixture = await make_bridge_rig(1)
-    manager = cast("AirPlayProvider", fixture.rig.streams[0].prov).bridge_manager
-    group_a = object()
-    group_b = object()
-
-    def bridge(group: object, confirmed: int | None) -> MagicMock:
-        """Build a bridge-shaped retry candidate with no real transport."""
-        stream = MagicMock()
-        stream.session_volume_requested = True
-        stream.session_volume.supported = True
-        stream.session_volume.confirmed_level = confirmed
-        stream._send_current_volume = AsyncMock()
-        return MagicMock(sendspin_group=group, _airplay_stream=stream)
-
-    owner = bridge(group_a, None)
-    same_group_confirmed = bridge(group_a, 60)
-    other_group_unresolved = bridge(group_b, None)
-    original = manager._bridges
     try:
-        manager._bridges = {
-            "owner": cast("SendspinAirPlayBridge", owner),
-            "confirmed": cast("SendspinAirPlayBridge", same_group_confirmed),
-            "other": cast("SendspinAirPlayBridge", other_group_unresolved),
-        }
+        manager = cast("AirPlayProvider", fixture.rig.streams[0].prov).bridge_manager
+        group_a = object()
+        group_b = object()
+
+        def bridge(group: object, confirmed: int | None) -> MagicMock:
+            """Build a bridge-shaped retry candidate with no real transport."""
+            stream = MagicMock()
+            stream.session_volume_requested = True
+            stream.session_volume.supported = True
+            stream.session_volume.confirmed_level = confirmed
+            stream._send_current_volume = AsyncMock()
+            return MagicMock(sendspin_group=group, _airplay_stream=stream)
+
+        owner = bridge(group_a, None)
+        same_group_confirmed = bridge(group_a, 60)
+        other_group_unresolved = bridge(group_b, None)
+        monkeypatch.setattr(
+            manager,
+            "_bridges",
+            {
+                "owner": cast("SendspinAirPlayBridge", owner),
+                "confirmed": cast("SendspinAirPlayBridge", same_group_confirmed),
+                "other": cast("SendspinAirPlayBridge", other_group_unresolved),
+            },
+        )
         await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
         owner._airplay_stream._send_current_volume.assert_awaited_once_with()
         same_group_confirmed._airplay_stream._send_current_volume.assert_not_awaited()
@@ -260,7 +264,6 @@ async def test_initial_retry_ignores_distinct_groups_and_confirmed_members() -> 
         await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
         owner._airplay_stream._send_current_volume.assert_awaited_once_with()
     finally:
-        manager._bridges = original
         await fixture.rig.close()
 
 
@@ -299,33 +302,33 @@ async def test_warm_bridge_source_replacement_drops_queued_checked_fifo_transact
     """The actual warm Sendspin replacement callbacks retire a queued transaction."""
     fixture = await make_bridge_rig(1)
     rig = fixture.rig
-    bridge = fixture.bridges[0]
-    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    await writer.create()
-    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
-    stream = rig.streams[0]
-    stream.commands_pipe = writer
-    stream._connected.set()
-    bridge._started = True
-    process = stream._cli_proc
-    fixture.roles[0]._on_stream_start_cb = bridge._on_bridge_stream_start
-    queued = asyncio.Event()
-    delivered = asyncio.Event()
-    send = stream.send_cli_command
-    write_atomic = writer.write_atomic
-
-    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        queued.set()
-        return await send(command, guard=guard)
-
-    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
-        result = await write_atomic(data, guard=guard)
-        delivered.set()
-        return result
-
-    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
-    monkeypatch.setattr(writer, "write_atomic", record_delivery)
     try:
+        bridge = fixture.bridges[0]
+        writer, reader = await rig.open_fifo(tmp_path)
+        stream = rig.streams[0]
+        stream.commands_pipe = writer
+        stream._connected.set()
+        bridge._started = True
+        process = stream._cli_proc
+        fixture.roles[0]._on_stream_start_cb = bridge._on_bridge_stream_start
+        queued = asyncio.Event()
+        delivered = asyncio.Event()
+        send = stream.send_cli_command
+        write_atomic = writer.write_atomic
+
+        async def send_after_queue(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            queued.set()
+            return await send(command, guard=guard)
+
+        async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+            result = await write_atomic(data, guard=guard)
+            delivered.set()
+            return result
+
+        monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+        monkeypatch.setattr(writer, "write_atomic", record_delivery)
         async with writer._write_lock:
             command = asyncio.create_task(
                 rig.controller.cmd_volume_set(fixture.players[0].player_id, 80)
@@ -342,13 +345,13 @@ async def test_warm_bridge_source_replacement_drops_queued_checked_fifo_transact
             os.read(reader, 4096)
         assert stream.session_volume.confirmed_level is None
     finally:
-        if "command" in locals() and not command.done():
-            command.cancel()
-            with suppress(asyncio.CancelledError):
-                await command
-        os.close(reader)
-        await writer.remove()
-        await rig.close()
+        try:
+            if "command" in locals() and not command.done():
+                command.cancel()
+                with suppress(asyncio.CancelledError):
+                    await command
+        finally:
+            await rig.close()
 
 
 @pytest.mark.parametrize("purpose", [PlayerLockPurpose.GROUP_VOLUME, PlayerLockPurpose.VOLUME])

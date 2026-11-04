@@ -181,31 +181,46 @@ async def test_partial_fifo_setup_is_released_by_close(tmp_path: Path, open_fail
             os.fstat(descriptor)
 
 
+def _factory_name(stmt: ast.stmt) -> tuple[str, ast.Call] | None:
+    """Return the rig factory called by an assignment statement, if any."""
+    value = stmt.value if isinstance(stmt, ast.Assign) else None
+    if isinstance(value, ast.Await):
+        value = value.value
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in {"make_rig", "make_bridge_rig"}
+    ):
+        return value.func.id, value
+    return None
+
+
 def _unguarded_rigs(path: Path) -> list[int]:
-    """Return lines where `make_rig()` is not immediately followed by a closing `try`."""
-    tree = ast.parse(path.read_text())
+    """Return lines where a rig factory is not immediately followed by a closing `try`."""
     bad: list[int] = []
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if not isinstance(body, list):
-            continue
-        for index, stmt in enumerate(body):
-            call = stmt.value if isinstance(stmt, ast.Assign) else None
-            if not (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id == "make_rig"
-            ):
+    for node in ast.walk(ast.parse(path.read_text())):
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, None)
+            if not isinstance(body, list):
                 continue
-            if any(
-                kw.arg == "real_deadlines" and ast.literal_eval(kw.value) is True
-                for kw in call.keywords
-                if isinstance(kw.value, ast.Constant)
-            ):
-                continue  # no module patch is installed
-            following = body[index + 1] if index + 1 < len(body) else None
-            if not isinstance(following, ast.Try):
-                bad.append(stmt.lineno)
+            for index, stmt in enumerate(body):
+                factory = _factory_name(stmt)
+                if factory is None:
+                    continue
+                call = factory[1]
+                if any(
+                    kw.arg == "real_deadlines"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True
+                    for kw in call.keywords
+                ):
+                    continue  # no module patch is installed
+                rest = body[index + 1 :]
+                # `rig = fixture.rig` merely unpacks a bridge fixture and cannot fail.
+                while rest and ast.unparse(rest[0]) == "rig = fixture.rig":
+                    rest = rest[1:]
+                if not rest or not isinstance(rest[0], ast.Try):
+                    bad.append(stmt.lineno)
     return bad
 
 

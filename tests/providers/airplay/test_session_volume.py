@@ -644,13 +644,15 @@ async def test_retired_pending_snapshot_cannot_poison_successor_transaction(
         assert await successor == 80
         assert (backend._pending, backend._pending_snapshot) == (None, None)
     finally:
-        for task_name in ("old", "successor"):
-            task = locals().get(task_name)
-            if task is not None and not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-        await rig.close()
+        try:
+            for task_name in ("old", "successor"):
+                task = locals().get(task_name)
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            await rig.close()
 
 
 async def test_unknown_startup_state_retires_queued_transaction_on_membership_change(
@@ -695,11 +697,13 @@ async def test_unknown_startup_state_retires_queued_transaction_on_membership_ch
             os.read(reader, 4096)
         assert backend.confirmed_level is None
     finally:
-        if "transaction" in locals() and not transaction.done():
-            transaction.cancel()
-            with suppress(asyncio.CancelledError):
-                await transaction
-        await rig.close()
+        try:
+            if "transaction" in locals() and not transaction.done():
+                transaction.cancel()
+                with suppress(asyncio.CancelledError):
+                    await transaction
+        finally:
+            await rig.close()
 
 
 async def test_current_checked_transaction_delivers_to_real_fifo(
@@ -740,11 +744,13 @@ async def test_current_checked_transaction_delivers_to_real_fifo(
         assert stream.session_volume._pending is None
         assert stream.session_volume._pending_snapshot is None
     finally:
-        if "transaction" in locals() and not transaction.done():
-            transaction.cancel()
-            with suppress(asyncio.CancelledError):
-                await transaction
-        await rig.close()
+        try:
+            if "transaction" in locals() and not transaction.done():
+                transaction.cancel()
+                with suppress(asyncio.CancelledError):
+                    await transaction
+        finally:
+            await rig.close()
 
 
 async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fifo(
@@ -799,11 +805,13 @@ async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fi
         assert stream.session_volume._pending is None
         assert stream.session_volume._pending_snapshot is None
     finally:
-        if "command" in locals() and not command.done():
-            command.cancel()
-            with suppress(asyncio.CancelledError):
-                await command
-        await rig.close()
+        try:
+            if "command" in locals() and not command.done():
+                command.cancel()
+                with suppress(asyncio.CancelledError):
+                    await command
+        finally:
+            await rig.close()
 
 
 async def test_real_child_stdout_fifo_round_trip(tmp_path: Path) -> None:
