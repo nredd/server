@@ -31,7 +31,7 @@ from typing import Protocol
 
 from scripts import private_dev_lifecycle as lifecycle
 
-EXPECTED_SOURCE = "a6382b99fad1603176fe89daf0a233406e77f5ad"
+EXPECTED_SOURCE = "ad73c02283350952f535e328f7c001c8b209e9fa"
 DEV = lifecycle.DEV
 PRIVATE_INFO_URL = "http://127.0.0.1:18095/info"
 MAX_LOG_BYTES = 256 * 1024
