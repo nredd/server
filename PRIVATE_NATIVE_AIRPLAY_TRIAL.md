@@ -4,6 +4,24 @@ NOT ready to deploy. NEVER include this overlay, its tests or this runbook in th
 native-controls feature PR. This is deliberate private source selection, not a supported
 binary-path setting, downloader, image distribution or production deployment procedure.
 
+## Discovery admission
+
+Before enabling the private target, call the private-only `SYSTEM_MANAGE` command
+`airplay/private_trial_admission/preflight` with `player_id` set to the canonical
+`ap` plus 12 lowercase hex digits. Require `version` 1, `config_state` of `absent`
+or `present`, and every boolean (`setup_data_empty`, `credentials_absent`,
+`default_volume_bounds`, `target_unset`, `no_current_streams`) true. Any error,
+missing field, unexpected value, or `unsafe` state fails closed. The command reads
+raw config without repairing it and never returns identifiers or stored values. The
+raw target must explicitly be an empty string, as written by private discovery startup;
+missing target state fails closed. Nonempty setup data and legacy credentials are
+rejected; absent volume limits mean 0 and 100. Native MRP for a private TV also requires
+stored credentials.
+
+This permits a discovery-only proof, not default-output, active Music, or playback
+acceptance. It is a snapshot, so the caller must keep the target unset and prevent
+concurrent config changes until it enables discovery.
+
 ## Discovery identity
 
 For a private trial Apple TV, registration retains the reported AirPlay ID but does not

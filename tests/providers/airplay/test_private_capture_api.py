@@ -89,7 +89,12 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     provider, mass = _provider()
     unregister_capture = MagicMock()
     unregister_readiness = MagicMock()
-    mass.register_api_command.side_effect = (unregister_capture, unregister_readiness)
+    unregister_admission = MagicMock()
+    mass.register_api_command.side_effect = (
+        unregister_capture,
+        unregister_readiness,
+        unregister_admission,
+    )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
     provider._register_private_capture_api()
@@ -103,7 +108,15 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
             (_READINESS_COMMAND, provider.get_private_native_volume_capture_readiness),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
+        (
+            (
+                "airplay/private_trial_admission/preflight",
+                provider.get_private_trial_admission_preflight,
+            ),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
     ]
+    assert provider._unregister_private_admission_api is unregister_admission
     assert provider._unregister_private_capture_api is unregister_capture
     assert provider._unregister_private_capture_readiness_api is unregister_readiness
 
@@ -137,6 +150,27 @@ async def test_second_route_collision_rolls_back_real_registry(
 
     assert registry.command_handlers == {_READINESS_COMMAND: incumbent}
     assert provider._unregister_private_capture_api is None
+
+
+async def test_admission_route_collision_rolls_back_both_existing_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A collision on admission releases both capture routes and preserves the incumbent."""
+    provider, mass = _provider()
+    registry = MusicAssistant.__new__(MusicAssistant)
+    registry.command_handlers = {}
+    command = "airplay/private_trial_admission/preflight"
+    registry.register_api_command(command, provider.get_private_native_volume_capture)
+    incumbent = registry.command_handlers[command]
+    mass.register_api_command.side_effect = registry.register_api_command
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
+
+    with pytest.raises(RuntimeError, match="already registered"):
+        provider._register_private_capture_api()
+
+    assert registry.command_handlers == {command: incumbent}
+    assert provider._unregister_private_capture_api is None
+    assert provider._unregister_private_capture_readiness_api is None
 
 
 async def test_route_collision_fails_async_initialization_and_cleans_up(

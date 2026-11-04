@@ -579,6 +579,12 @@ class AirPlayControlPlayer(AirPlayPlayer):
             return False
         discovery_info, protocol = endpoint
         credentials = self._mrp_credentials
+        if (
+            protocol == Protocol.MRP
+            and self.implicit_receiver_writes_blocked
+            and credentials is None
+        ):
+            return False
         if protocol == Protocol.AirPlay and credentials is None and not self._uses_transient_mrp:
             return False
         config = self._build_config(

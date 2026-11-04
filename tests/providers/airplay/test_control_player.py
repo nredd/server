@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from music_assistant_models.enums import (
@@ -1150,6 +1150,41 @@ async def test_native_mrp_connection_uses_advertised_service() -> None:
     service = config.get_service(Protocol.MRP)
     assert service is not None
     assert service.port == player.mrp_discovery_info.port
+
+
+@pytest.mark.parametrize(
+    ("private", "apple_tv", "credentials", "connect_expected"),
+    [
+        (True, True, None, False),
+        (True, True, "creds", True),
+        (False, True, None, True),
+        (True, False, None, True),
+    ],
+)
+async def test_private_tv_native_mrp_requires_credentials(
+    private: bool, apple_tv: bool, credentials: str | None, connect_expected: bool
+) -> None:
+    """Private TVs never initiate native MRP without credentials."""
+    player = _make_control_player(setup_data={CONF_NATIVE_MRP_CREDENTIALS: credentials})
+    player.mrp_discovery_info = _service_info(
+        MRP_DISCOVERY_TYPE, properties={"SystemBuildVersion": "18A123"}
+    )
+    device = MagicMock(spec=AppleTV)
+    device.features.in_state.return_value = False
+    with (
+        patch(
+            "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+            return_value=private,
+        ),
+        patch.object(
+            type(player), "_is_apple_tv_device", new_callable=PropertyMock, return_value=apple_tv
+        ),
+        patch(
+            "music_assistant.providers.airplay.control_player.pyatv.connect", return_value=device
+        ) as connect,
+    ):
+        assert await player._connect_mrp() is False
+    assert connect.await_count == int(connect_expected)
 
 
 def test_mrp_credentials_are_scoped_to_transport() -> None:
