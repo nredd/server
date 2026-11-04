@@ -507,11 +507,12 @@ are refused). The file holds a length, a SHA-256 prefix identity and a journal c
 contains machine and boot identifiers), never log content, so it is never printed or passed on
 argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
-`nredd/server@a6382b99fad1603176fe89daf0a233406e77f5ad` installer anchor after it.
+`nredd/server@ad73c02283350952f535e328f7c001c8b209e9fa` installer anchor after it.
 
-The observer's runtime pin is the merge `a6382b99fad1603176fe89daf0a233406e77f5ad` (PR #48), whose tree equals
-the reviewed `95de38700` tree. It was previously `0f7b543127f71c5639d55d4e0e34168ba92d0c33`; that is observer
-history only. The CLI pins (`429c5670` source, `cd7d36b` CI label, `fc77ceec` ELF) did not change between
+The observer's runtime pin is the merge `ad73c02283350952f535e328f7c001c8b209e9fa` (PR #51), whose tree equals
+the reviewed `e15a0582e879b64baba451a5eab463fdc2fb138a` tree. Previous pins `a6382b99fad1603176fe89daf0a233406e77f5ad`
+(PR #48, tree equal to reviewed `95de38700`) and `0f7b543127f71c5639d55d4e0e34168ba92d0c33` are observer history only.
+The CLI pins (`429c5670` source, `cd7d36b` CI label, `fc77ceec` ELF) did not change between
 `0f7b543` and `a6382b99`.
 The pin is a code constant with no argument, so a later merge deliberately differs from it until a new
 reviewed runtime is chosen.
