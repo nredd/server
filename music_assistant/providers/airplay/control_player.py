@@ -171,6 +171,11 @@ class AirPlayControlPlayer(AirPlayPlayer):
         self.on_companion_state_change: Callable[[], None] | None = None
 
     @property
+    def allow_automatic_mac_resolution(self) -> bool:
+        """Do not infer a routed private trial TV's hardware MAC from ARP."""
+        return not (trial_binary.is_trial_target() and self._is_apple_tv_device)
+
+    @property
     def implicit_receiver_writes_blocked(self) -> bool:
         """Return True for an Apple TV in the private trial, which only obeys explicit commands."""
         return trial_binary.is_trial_target() and self._is_apple_tv_device

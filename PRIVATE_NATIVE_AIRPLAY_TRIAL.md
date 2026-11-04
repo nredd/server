@@ -4,6 +4,15 @@ NOT ready to deploy. NEVER include this overlay, its tests or this runbook in th
 native-controls feature PR. This is deliberate private source selection, not a supported
 binary-path setting, downloader, image distribution or production deployment procedure.
 
+## Discovery identity
+
+For a private trial Apple TV, registration retains the reported AirPlay ID but does not
+use it as a hardware MAC, consult cached ARP values, or perform an automatic MAC lookup.
+Other players retain their normal behavior. This is a discovery-only policy: the TV is
+routed from HAOS, the available capture is partial, and it does not establish L2 identity
+or playback. The TV and both HomePod identities have been verified; Music/output and the
+home-theater pairing remain unknown.
+
 ## Implicit receiver power
 
 On the private trial target, Apple TV playback and automatic group capture do not issue

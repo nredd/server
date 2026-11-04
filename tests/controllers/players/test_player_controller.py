@@ -31,6 +31,7 @@ from music_assistant_models.constants import (
 from music_assistant_models.enums import (
     ConfigEntryType,
     EventType,
+    IdentifierType,
     MediaType,
     PlaybackState,
     PlayerFeature,
@@ -80,6 +81,8 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 from music_assistant.helpers.tts import TTS_QUERY_TIMEOUT_SECONDS, TTSLanguageNotSupportedError
 from music_assistant.models.player import AnnouncementFeature, LinkedOutputProtocol, Player
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.providers.airplay.control_player import AirPlayControlPlayer
+from music_assistant.providers.airplay.provider import AirPlayProvider
 from music_assistant.providers.universal_player.player import UniversalPlayer
 from tests.common import MockPlayer, MockProvider, create_mock_config, use_real_create_task
 
@@ -1156,6 +1159,63 @@ class TestRegisterUnregisterRace:
             call_args.args and call_args.args[0] == EventType.PLAYER_ADDED
             for call_args in mock_mass.signal_event.call_args_list
         )
+
+    @pytest.mark.parametrize(
+        ("model", "trial", "passive"),
+        [("Apple TV 4K", True, True), ("Apple TV 4K", False, False), ("HomePod", True, False)],
+    )
+    async def test_registration_mac_policy(
+        self, mock_mass: MagicMock, model: str, trial: bool, passive: bool
+    ) -> None:
+        """Registration keeps private TV identity separate from cached or probed MACs."""
+        controller = PlayerController(mock_mass)
+        self._stub_register_calls(mock_mass)
+        provider = MockProvider("airplay", instance_id="airplay", mass=mock_mass)
+        player = AirPlayControlPlayer(
+            provider=cast("AirPlayProvider", provider),
+            player_id="ap021122334455",
+            raop_discovery_info=None,
+            airplay_discovery_info=None,
+            companion_discovery_info=None,
+            mrp_discovery_info=None,
+            address="192.0.2.10",
+            display_name="Device",
+            manufacturer="Apple",
+            model=model,
+            initial_volume=25,
+        )
+        gateway = "AA:BB:CC:DD:EE:FF"
+        mock_mass.config.get.side_effect = lambda key, default=None: (
+            gateway if key.endswith("/cached_arp_mac") and passive else default
+        )
+        lookup = AsyncMock(return_value="10:20:30:40:50:60")
+        with (
+            patch(
+                "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+                return_value=trial,
+            ),
+            patch("music_assistant.helpers.util.get_mac_address", lookup),
+            patch.object(player, "on_config_updated", AsyncMock()),
+            patch.object(
+                AirPlayControlPlayer,
+                "can_group_with",
+                new_callable=PropertyMock,
+                return_value=set(),
+            ),
+        ):
+            await controller.register(player)
+
+        assert player.initialized.is_set()
+        assert player.device_info.identifiers[IdentifierType.AIRPLAY_ID] == player.player_id
+        if passive:
+            lookup.assert_not_awaited()
+            assert not player.device_info.identifiers.get(IdentifierType.MAC_ADDRESS)
+            assert not any(
+                "cached_arp_mac" in str(args) for args in mock_mass.config.set.call_args_list
+            )
+        else:
+            lookup.assert_awaited_once_with("192.0.2.10")
+            assert player.device_info.identifiers[IdentifierType.MAC_ADDRESS] == "10:20:30:40:50:60"
 
     async def test_register_aborts_when_unregistered_during_config_load(
         self, mock_mass: MagicMock
