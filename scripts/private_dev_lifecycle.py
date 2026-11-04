@@ -972,7 +972,7 @@ def load_watchdog_deadline(root: Path, run_id: str) -> float:
     :raises LifecycleError: If the run or its watchdog state is not valid.
     """
     run_dir, snapshot = load_snapshot(root, run_id)
-    return _watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot))
+    return float(_watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot)))
 
 
 def _watchdog_monotonic_deadline(watch: dict[str, Any]) -> float:

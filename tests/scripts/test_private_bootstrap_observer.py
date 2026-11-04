@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
 from collections import deque
 from dataclasses import asdict
@@ -382,7 +383,7 @@ def test_bool_baseline_size_is_refused() -> None:
         observer.observe(
             SequenceReader([b""]),
             SequenceProbe([False]),
-            observer.LogBaseline(True, "0" * 64),  # type: ignore[arg-type]
+            observer.LogBaseline(True, "0" * 64),
             10.0,
             now=lambda: 0.0,
             sleep=lambda _seconds: None,
@@ -417,7 +418,7 @@ def test_log_reader_fails_closed_without_leaking_token(
         seen["input"] = kwargs["input"]
         return _Completed(returncode, stdout)
 
-    monkeypatch.setattr(observer.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
     reader = observer.SupervisorLogReader("a" * 40)
     with pytest.raises(observer.ObserverError):
         reader.read(time.monotonic() + 5)
@@ -430,15 +431,13 @@ def test_log_reader_fails_closed_without_leaking_token(
 )
 def test_api_probe_rejects_bad_responses(monkeypatch: pytest.MonkeyPatch, stdout: bytes) -> None:
     """Only a bounded JSON object with HTTP 200 is api-ready."""
-    monkeypatch.setattr(observer.subprocess, "run", lambda *_a, **_k: _Completed(0, stdout))
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _Completed(0, stdout))
     assert not observer.LoopbackApiProbe().ready(time.monotonic() + 5)
 
 
 def test_api_probe_accepts_json_object(monkeypatch: pytest.MonkeyPatch) -> None:
     """A bounded JSON object with 200 is ready."""
-    monkeypatch.setattr(
-        observer.subprocess, "run", lambda *_a, **_k: _Completed(0, b'{"a":1}\n200')
-    )
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _Completed(0, b'{"a":1}\n200'))
     assert observer.LoopbackApiProbe().ready(time.monotonic() + 5)
 
 
