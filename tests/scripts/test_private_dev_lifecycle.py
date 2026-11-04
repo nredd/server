@@ -405,6 +405,16 @@ def test_recovery_start_skips_post_when_fresh_stats_fails(
     assert f"POST /addons/{DEV}/start" not in transport.calls
 
 
+@pytest.mark.parametrize("dev_started", [False, True])
+def test_recovery_start_refuses_dev_that_is_no_longer_error(dev_started: bool) -> None:
+    """A recovery run never starts once DEV left `error` (stopped or already running)."""
+    transport = ScriptedTransport(dev_started=dev_started)
+    with pytest.raises(lifecycle.LifecycleError, match="not confirmed"):
+        lifecycle.start(transport, snapshot(recovery_from_error=True), time.monotonic() + 5)
+    assert f"POST /addons/{DEV}/start" not in transport.calls
+    assert not any("stats" in call for call in transport.calls)
+
+
 @pytest.mark.parametrize(
     ("drift", "message"),
     [("catalog", "catalog changed"), ("version", "version changed")],
@@ -776,6 +786,9 @@ def test_request_allowlist_has_no_stock_store_or_core_requests() -> None:
         ("POST", f"/addons/{DEV}/info"),
         ("GET", f"/addons/{DEV}/start"),
         ("GET", f"/addons/{DEV}/stop"),
+        ("GET", f"/addons/{DEV}/stats"),
+        ("GET", f"/addons/{DEV}/stats?one_shot=false"),
+        ("POST", f"/addons/{DEV}/stats?one_shot=true"),
     ):
         with pytest.raises(lifecycle.LifecycleError, match="invalid fixed API request"):
             transport.request(method, path)
@@ -817,6 +830,9 @@ def test_snapshot_roundtrip_and_schema_rejections(tmp_path: Path) -> None:
         {"dev_version": ""},
         {"created_at": "now"},
         {"extra": True},
+        {"recovery_from_error": 1},
+        {"recovery_from_error": "yes"},
+        {"recovery_from_error": None},
     ],
 )
 def test_load_rejects_malformed_or_stock_bearing_snapshots(tmp_path: Path, damage: Any) -> None:
@@ -825,6 +841,17 @@ def test_load_rejects_malformed_or_stock_bearing_snapshots(tmp_path: Path, damag
     run_dir = lifecycle.save_snapshot(tmp_path, state)
     raw = json.loads((run_dir / "snapshot.json").read_text())
     raw["snapshot"].update(damage)
+    (run_dir / "snapshot.json").write_text(json.dumps(raw))
+    with pytest.raises(lifecycle.LifecycleError, match="malformed"):
+        lifecycle.load_snapshot(tmp_path, state.run_id)
+
+
+def test_load_rejects_snapshot_missing_recovery_flag(tmp_path: Path) -> None:
+    """The recovery flag is mandatory, so recovery mode is never inferred."""
+    state = snapshot()
+    run_dir = lifecycle.save_snapshot(tmp_path, state)
+    raw = json.loads((run_dir / "snapshot.json").read_text())
+    del raw["snapshot"]["recovery_from_error"]
     (run_dir / "snapshot.json").write_text(json.dumps(raw))
     with pytest.raises(lifecycle.LifecycleError, match="malformed"):
         lifecycle.load_snapshot(tmp_path, state.run_id)
@@ -1184,6 +1211,7 @@ def test_self_test_retries_a_partially_written_receipt(
 ) -> None:
     """The child creates then writes the receipt, so a half-written one is retried."""
     good = {"run_id": "", "verified": True}
+    writers: list[threading.Thread] = []
 
     def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
         receipt = root / run_id / "receipt.json"
@@ -1194,11 +1222,17 @@ def test_self_test_retries_a_partially_written_receipt(
             time.sleep(0.1)
             _private_write(receipt, json.dumps(good))
 
-        threading.Thread(target=finish).start()
+        writer = threading.Thread(target=finish)
+        writer.start()
+        writers.append(writer)
         return 0
 
     monkeypatch.setattr(lifecycle, "arm_watchdog", arm)
-    lifecycle.self_test(tmp_path)
+    try:
+        lifecycle.self_test(tmp_path)
+    finally:
+        for writer in writers:
+            writer.join()
 
 
 def test_self_test_persistently_malformed_receipt_fails_closed(

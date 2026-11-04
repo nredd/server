@@ -57,6 +57,7 @@ MAX_RUN_AGE = 600.0
 MAX_WATCHDOG_TIMEOUT = 3600.0
 LOCK_TIMEOUT = 600.0
 SELF_TEST_TIMEOUT = 5.0
+SELF_TEST_POLL_INTERVAL = 0.02
 POLL_INTERVAL = 1.0
 STOP_RESEND_INTERVAL = 5.0
 WATCHDOG_WAKE_INTERVAL = 5.0
@@ -586,12 +587,12 @@ def self_test(root: Path) -> None:
                 # retried, and only within this loop's budget; a persistently malformed
                 # receipt falls through to the timeout failure. Unsafe permissions,
                 # wrong types or oversize files are never retried.
-                time.sleep(0.02)
+                time.sleep(SELF_TEST_POLL_INTERVAL)
                 continue
             if payload.get("run_id") == snapshot.run_id and payload.get("verified") is True:
                 return
             raise LifecycleError("self-test child returned an invalid receipt")
-        time.sleep(0.02)
+        time.sleep(SELF_TEST_POLL_INTERVAL)
     raise LifecycleError("self-test watchdog receipt timed out")
 
 
