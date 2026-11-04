@@ -19,11 +19,17 @@ explicit. It serves only `/stimulus.wav`; a completed fetch is measured from tha
 server, not assumed from a successful MA API request. This identifies only a
 client fetch, not Music Assistant's requester identity.
 
-The controller makes one `player_queues/play_media` request and always attempts
-`players/cmd/stop` in `finally`. Once playback is requested, the fetch wait and
-stop request share a five-second monotonic budget. It requires an already armed
+Before its one `player_queues/play_media` request, the controller spawns a
+one-shot detached `emergency-stop` process. That process waits on a monotonic
+clock until a full bounded stop-request interval remains, then sends
+`players/cmd/stop` even if the parent is stuck in an accepted playback response.
+The parent also attempts the same idempotent stop in `finally`; its result is
+receipt evidence, not the safety guarantee. Every MA HTTP operation has one
+absolute timeout covering connection, headers and body transfer, so a slow-drip
+response cannot extend the budget. It requires an already armed
 `private_dev_lifecycle.py` run and verifies its live lease before dispatch; that
-independent watchdog remains the recovery authority if an HTTP operation stalls.
+independent lifecycle watchdog remains the recovery authority if either
+transport process fails.
 
 An `OBSERVED` receipt means only that MA accepted the request, the constrained
 source was fetched, and the controller requested stop. `INCOMPLETE` is expected

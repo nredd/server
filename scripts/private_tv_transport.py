@@ -3,8 +3,8 @@ Run one bounded private TV RAOP transport experiment.
 
 The controller deliberately uses Music Assistant's supported authenticated API.  It is
 private trial tooling, not an AirPlay provider feature or receiver acceptance oracle.
-It serves a deterministic finite WAV stimulus, performs one play request, and sends an
-unconditional stop request from ``finally`` within a five-second monotonic budget.
+It serves a deterministic finite WAV stimulus, performs one play request, and arms an
+independent unconditional stop request within a five-second monotonic budget.
 
 References:
 - https://music-assistant.io/
@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import signal
 import struct
 import sys
 import threading
@@ -65,6 +66,13 @@ class Api(Protocol):
         self, command: str, args: dict[str, Any], timeout: float = HTTP_TIMEOUT_SECONDS
     ) -> Any:
         """Call one supported Music Assistant JSON API command."""
+
+
+class StopGuard(Protocol):
+    """Independently dispatch a bounded stop before the transport deadline."""
+
+    def arm(self, player: str, deadline: float) -> None:
+        """Arm the stop path before playback is dispatched."""
 
 
 @dataclass(frozen=True)
@@ -123,19 +131,20 @@ class MusicAssistantApi:
         )
         body = json.dumps({"command": command, "args": args}, separators=(",", ":")).encode()
         try:
-            connection.request(
-                "POST",
-                parsed_url.path,
-                body=body,
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "Content-Type": "application/json",
-                },
-            )
-            response = connection.getresponse()
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if not 200 <= response.status < 300:
-                raise TransportError("MA API returned unsuccessful HTTP status")
+            with _AbsoluteTimeout(timeout):
+                connection.request(
+                    "POST",
+                    parsed_url.path,
+                    body=body,
+                    headers={
+                        "Authorization": f"Bearer {self._token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if not 200 <= response.status < 300:
+                    raise TransportError("MA API returned unsuccessful HTTP status")
         except (HTTPException, TimeoutError, OSError, ValueError) as err:
             raise TransportError("MA API request failed") from err
         finally:
@@ -171,6 +180,39 @@ def generate_stimulus() -> Stimulus:
         wav.writeframes(frames)
     payload = output.getvalue()
     return Stimulus(payload, hashlib.sha256(payload).hexdigest())
+
+
+class StopWatchdog:
+    """Detached, monotonic stop process that survives a blocked parent request."""
+
+    def __init__(self, api_url: str, token: str, credential_env: str) -> None:
+        """Keep the endpoint and credential only until the child is spawned."""
+        self._api_url = api_url
+        self._token = token
+        self._credential_env = credential_env
+
+    def arm(self, player: str, deadline: float) -> None:
+        """Spawn a one-shot stop process with a full HTTP budget before the deadline."""
+        delay = deadline - time.monotonic() - HTTP_TIMEOUT_SECONDS
+        if delay <= 0:
+            raise TransportError("stop watchdog could not reserve its HTTP budget")
+        argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "emergency-stop",
+            "--ma-url",
+            self._api_url,
+            "--player",
+            player,
+            "--delay",
+            f"{delay:.6f}",
+            "--credential-env",
+            self._credential_env,
+        ]
+        try:
+            os.posix_spawn(sys.executable, argv, {self._credential_env: self._token}, setsid=True)
+        except OSError as err:
+            raise TransportError("could not arm independent stop watchdog") from err
 
 
 class StimulusServer:
@@ -234,6 +276,7 @@ def run_once(
     stimulus: Stimulus,
     *,
     packet_receipt: str | None = None,
+    stop_guard: StopGuard | None = None,
 ) -> Receipt:
     """Run exactly one constrained MA playback request and unconditional bounded stop."""
     if scope.mode != TrialMode.TV_RAOP:
@@ -263,9 +306,10 @@ def run_once(
     try:
         players = api.command("players/all", {})
         check_players(players, scope.player, TrialMode.TV_RAOP)
-        # Begin the stop budget before dispatch: MA may accept a request whose
-        # response is lost or delayed, so cleanup cannot depend on that response.
+        # Begin and independently arm the stop budget before dispatch: MA may accept
+        # a request whose response is lost or delayed, so parent cleanup is not safety.
         stop_deadline = time.monotonic() + STOP_BUDGET_SECONDS
+        _require_stop_guard(stop_guard).arm(scope.player, stop_deadline)
         api.command(
             "player_queues/play_media",
             {"queue_id": scope.player, "media": advertised_url},
@@ -297,6 +341,46 @@ def run_once(
     return receipt
 
 
+class _DeadlineExpired(TimeoutError):
+    """Raised when one synchronous HTTP operation outlives its absolute budget."""
+
+
+def _raise_deadline(_signum: int, _frame: object) -> None:
+    """Interrupt the in-flight main-thread socket operation at its hard deadline."""
+    raise _DeadlineExpired
+
+
+class _AbsoluteTimeout:
+    """Apply one process-local monotonic deadline to all phases of a HTTP request."""
+
+    def __init__(self, timeout: float) -> None:
+        """Validate one short bounded operation timeout."""
+        self._timeout = timeout
+        self._previous_handler: Any = None
+        self._previous_timer: tuple[float, float] | None = None
+
+    def __enter__(self) -> None:
+        """Install the temporary deadline timer only from the main thread."""
+        if threading.current_thread() is not threading.main_thread():
+            raise TransportError("MA API requests must run on the main thread")
+        self._previous_handler = signal.signal(signal.SIGALRM, _raise_deadline)
+        self._previous_timer = signal.setitimer(signal.ITIMER_REAL, self._timeout)
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        """Restore the caller's signal state after cancelling this short timer."""
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        if self._previous_timer is not None and self._previous_timer != (0.0, 0.0):
+            signal.setitimer(signal.ITIMER_REAL, *self._previous_timer)
+
+
+def _require_stop_guard(stop_guard: StopGuard | None) -> StopGuard:
+    """Return the independently armed stop authority required before dispatch."""
+    if stop_guard is None:
+        raise TransportError("independent stop watchdog is required")
+    return stop_guard
+
+
 def _ipv4(value: str, label: str) -> str:
     """Validate one explicit unicast IPv4 address."""
     try:
@@ -323,6 +407,26 @@ def _credential_from_env(name: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the private transport controller once and emit only a sanitized receipt."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "emergency-stop":
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--ma-url", required=True)
+        parser.add_argument("--player", required=True)
+        parser.add_argument("--delay", type=float, required=True)
+        parser.add_argument("--credential-env", required=True)
+        args = parser.parse_args(argv[1:])
+        if not math.isfinite(args.delay) or args.delay < 0:
+            return 1
+        deadline = time.monotonic() + args.delay
+        while (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(remaining, 0.05))
+        try:
+            MusicAssistantApi(args.ma_url, _credential_from_env(args.credential_env)).command(
+                "players/cmd/stop", {"player_id": args.player}
+            )
+        except TransportError:
+            return 1
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--ma-url", required=True)
@@ -340,7 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         stimulus = generate_stimulus()
         server = StimulusServer(_ipv4(args.bind, "bind address"), stimulus)
         host = _ipv4(args.advertised_host, "advertised host")
-        api = MusicAssistantApi(args.ma_url, _credential_from_env(args.credential_env))
+        token = _credential_from_env(args.credential_env)
+        api = MusicAssistantApi(args.ma_url, token)
+        stop_guard = StopWatchdog(args.ma_url, token, args.credential_env)
         server.start()
         receipt = run_once(
             scope,
@@ -349,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             server,
             stimulus,
             packet_receipt=args.packet_receipt,
+            stop_guard=stop_guard,
         )
     except (OSError, ValueError, TransportError) as err:
         receipt = Receipt(
