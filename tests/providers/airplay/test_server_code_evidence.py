@@ -95,6 +95,14 @@ def test_stale_inherited_player_class(monkeypatch: pytest.MonkeyPatch) -> None:
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
 
 
+def test_stale_mro_with_matching_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject a stale control base even when both imported aliases agree."""
+    replacement = type("AirPlayPlayer", (player.AirPlayPlayer,), {})
+    monkeypatch.setattr(player, "AirPlayPlayer", replacement)
+    monkeypatch.setattr(control_player, "AirPlayPlayer", replacement)
+    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
 def test_shadowed_inherited_getter() -> None:
     """Reject a control class override of the checked base capability property."""
     cls = control_player.AirPlayControlPlayer
