@@ -253,6 +253,7 @@ async def test_initial_retry_ignores_distinct_groups_and_confirmed_members() -> 
         owner._airplay_stream._send_current_volume.assert_awaited_once_with()
     finally:
         manager._bridges = original
+        await fixture.rig.close()
 
 
 @pytest.mark.parametrize(
