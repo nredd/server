@@ -372,6 +372,21 @@ async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
         await rig.close()
 
 
+async def test_rebinding_accepts_low_ordinal_after_generation_retirement() -> None:
+    """A newly bound native generation owns its ordinal sequence from one."""
+    rig = make_rig(1)
+    try:
+        backend = await rig.bind()
+        await rig.request(500, ordinal=100)
+        await backend.invalidate()
+        await backend.apply(60)
+        assert await rig.bind() is backend
+        await rig.request(400, ordinal=1)
+        assert backend.confirmed_level == 40
+    finally:
+        await rig.close()
+
+
 async def test_retired_binding_snapshot_ignores_repeated_neutral_updates() -> None:
     """An invalidated binding cannot retire each later ordinary state update again."""
     rig = make_rig(1)

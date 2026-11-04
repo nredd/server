@@ -162,6 +162,35 @@ async def test_regular_bridge_command_awaits_receipt_without_double_scale_or_fee
         await rig.close()
 
 
+async def test_cold_bridge_retries_checked_initial_volume_after_publishing_owner() -> None:
+    """A connect-time checked commit is retried after the bridge publishes its stream."""
+    fixture = await make_bridge_rig(1)
+    rig = fixture.rig
+    bridge = fixture.bridges[0]
+    stream = rig.streams[0]
+
+    async def connect_before_ownership(*_args: object) -> None:
+        """Reproduce the initial volume push inside `AirPlayStream.connect`."""
+        await stream._send_current_volume()
+
+    try:
+        bridge._airplay_stream = None
+        stream.player.stream = None
+        bridge._airplay_stream_start_task = asyncio.current_task()
+        rig.commands.clear()
+
+        with (
+            patch.object(stream, "connect", new=AsyncMock(side_effect=connect_before_ownership)),
+            patch.object(stream, "wait_for_connection", new=AsyncMock()),
+            patch.object(bridge, "_anchor_stream", new=AsyncMock(return_value=True)),
+        ):
+            assert await bridge._start_cold_stream(stream)
+        assert sum("ACTION=STREAM_VOLUME_APPLY" in command for command in rig.commands) == 1
+        assert stream.session_volume.confirmed_level == 60
+    finally:
+        await rig.close()
+
+
 @pytest.mark.parametrize(
     "change", ["missing", "mixed", "replaced", "membership", "native", "cycle"]
 )

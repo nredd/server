@@ -523,9 +523,9 @@ class AirPlayStream:
             )
             if demoted:
                 force = False
-            await self.session_volume.close()
             self._stopping = True
             self._teardown_started.set()
+            await self.session_volume.close()
             async with self._metadata_lock:
                 self._metadata_generation += 1
                 try:

@@ -790,34 +790,34 @@ async def test_stdout_reader_ignores_remote_event_during_stop() -> None:
     stream = AirPlayStream(player)
     player.stream = stream
     output = asyncio.StreamReader()
-    stopping = asyncio.Event()
-    release_stop = asyncio.Event()
+    closing = asyncio.Event()
+    release_close = asyncio.Event()
 
-    async def stop_command(_command: str) -> bool:
-        stopping.set()
-        await release_stop.wait()
-        return True
+    async def close_backend() -> None:
+        closing.set()
+        await release_close.wait()
 
     stream._cli_proc = MagicMock(read=output.read)
     stream._cli_proc.write_eof = AsyncMock()
     stream._stdout_reader_task = asyncio.create_task(stream._stdout_reader())
     with (
-        patch.object(stream, "_write_cli_command", side_effect=stop_command),
+        patch.object(stream.session_volume, "close", side_effect=close_backend),
+        patch.object(stream, "_write_cli_command", new_callable=AsyncMock),
         patch.object(stream.commands_pipe, "remove", new_callable=AsyncMock),
     ):
         stop_task = asyncio.create_task(stream.stop())
         try:
-            await stopping.wait()
+            await closing.wait()
             assert stream._stopping
             assert not stream._stopped
             assert player.stream is stream
             output.feed_data(b"[EVENT] remote command=next\n")
-            output.feed_eof()
-            await stream._stdout_reader_task
+            await asyncio.sleep(0)
             player.provider.handle_remote_command.assert_not_called()
         finally:
-            release_stop.set()
-            await stop_task
+            release_close.set()
+            output.feed_eof()
+            await asyncio.gather(stream._stdout_reader_task, stop_task, return_exceptions=True)
 
 
 def test_command_pipe_paths_are_unique_per_stream() -> None:

@@ -433,6 +433,7 @@ class SessionVolumeBackend:
         self._transaction_token = object()
         self._discard_receipt()
         self.generation = next(_GENERATIONS)
+        self._last_request = 0
         self._trailing = None
         self._balance = None
         if self._runner is not None and self._runner is not asyncio.current_task():
@@ -450,6 +451,7 @@ class SessionVolumeBackend:
         self._transaction_token = object()
         self._discard_receipt()
         self.generation = next(_GENERATIONS)
+        self._last_request = 0
         self._balance = None
         self._trailing = None
         if self._pending is not None:

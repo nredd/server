@@ -899,6 +899,8 @@ class SendspinAirPlayBridge:
                 return False
             self._airplay_stream = stream
             self.airplay_player.stream = stream
+            if stream.session_volume_requested is True and stream.session_volume.supported is True:
+                await stream._send_current_volume()
             if await self._anchor_stream(stream, warm=False):
                 return True
             # A superseded cold stream is this task's to tear down: it was
