@@ -413,6 +413,30 @@ main-pod radio trial has owner-confirmed station-first/song/art/LIVE metadata an
 Apple Music button volume audibility, but it does not establish native-state synchronization,
 Control Other Speakers volume, grouping, slider routing, or this backend's identity binding.
 
+## Receiver-free artifact gate
+
+Before adopting or staging a candidate pin, run this receiver-free gate on the Linux ARM host
+from the exact server source under review:
+
+```sh
+python3 -m scripts.private_trial_binary_gate
+```
+
+It refuses any non-Linux-ARM host before validation, then executes the same
+`trial_binary.validate_trial_binary()` then `trial_binary.preflight_current_image()` order used by
+private provider startup. The latter starts
+the retained validated executable descriptor with `--attest-only`, injects a fresh nonce, and
+requires the bounded exact FD/self-digest acknowledgement before its intentional zero exit. It
+opens no provider, receiver connection, playback session, or DEV app.
+
+`cliairplay --check` is necessary only for the build/asset validation half of this gate. A clean
+`--check` result does not establish support for `--attest-only`, inherited attestation FDs, the
+nonce/digest acknowledgement, or this preflight. Treat any nonzero gate result as a rejected
+artifact; do not update the manifest pin, stage the candidate for DEV, or replace this gate with
+a mocked acknowledgement. Record the command's bounded stdout/stderr and exit status in the
+external artifact receipt. This gate proves only the current server/CLI integration contract, not
+receiver, playback, or native-control acceptance.
+
 ## Gates before any launch
 
 - Preserve a verified backup and restore route for protected official MA 2.10.7, including
