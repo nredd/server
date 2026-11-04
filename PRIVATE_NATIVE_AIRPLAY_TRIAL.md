@@ -599,8 +599,8 @@ This matches Supervisor `2026.10.5`: an exited failed Docker container remains `
 its stats endpoint returns that error only when the container is not running. The accepted body
 is the full four-key envelope, `result: error`, `message: App <DEV> is not running`,
 `error_key: app_not_running_error`, `extra_fields: {"app": <DEV>}`; any missing, extra or
-differing key, including nested `extra_fields` extras, is refused. (An earlier revision claimed
-the body had exactly two keys; that was incorrect and refused real non-running containers.) It then uses the
+differing key, including nested `extra_fields` extras, is refused. The earlier "exactly two keys"
+claim was incorrect. It then uses the
 same fresh arm, live lease, start, and stop path. It never alters options, protection,
 boot, watchdog settings, stock state, or any player.
 

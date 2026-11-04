@@ -65,6 +65,7 @@ SUPERVISOR_BASE_URL = "http://supervisor"
 CONFIRMED_STATES = ("started", "stopped")
 VERIFIED_STATUS = "DEV stopped and stock absence re-verified; nothing else touched"
 LOGGER = logging.getLogger(__name__)
+# Supervisor 2026.10.5 stats 400 body for a non-running container, verified on staging.
 DEV_NOT_RUNNING_ENVELOPE = {
     "result": "error",
     "message": f"App {DEV} is not running",
@@ -179,12 +180,8 @@ class SupervisorTransport:
         """
         Require the stats route's exact not-running response for DEV.
 
-        Supervisor 2026.10.5 answers `GET /addons/<DEV>/stats?one_shot=true` with HTTP
-        400 and exactly four keys, `result: error`, `message: App <DEV> is not running`,
-        `error_key: app_not_running_error` and `extra_fields: {"app": <DEV>}`, only when
-        the Docker container is not running. The earlier two-key form was never the real
-        wire shape and is refused. Success, other statuses, non-JSON bodies and any
-        missing, extra, differing or nested-extra key are all treated as unconfirmed.
+        Anything but the exact documented response, including a missing, extra or
+        nested-extra key, is unconfirmed.
 
         :raises LifecycleError: Unless that exact response was received.
         """

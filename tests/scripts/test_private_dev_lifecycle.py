@@ -1339,7 +1339,7 @@ def test_supervisor_transport_real_wire_contract(monkeypatch: pytest.MonkeyPatch
 
 
 def _not_running_envelope(**overrides: object) -> dict[str, object]:
-    """Return Supervisor 2026.10.5's full 4-key not-running body, with keys overridden."""
+    """Return the full not-running body, with keys overridden."""
     return {
         "result": "error",
         "message": f"App {DEV} is not running",
