@@ -22,15 +22,16 @@ metadata probe (e.g. `ffprobe`) or the PCM read, and it identifies only a client
 fetch, not Music Assistant's requester identity.
 
 Time budget: `OBSERVATION_SECONDS` is 6s, the 4s wave plus 2s for MA play latency,
-any early metadata fetch, and receiver start. The final `HTTP_TIMEOUT_SECONDS` (3s) are
-reserved for the stop request, so the whole budget is 9s from before arming. The
+any early metadata fetch, and receiver start. The final `HTTP_TIMEOUT_SECONDS` (3s)
+are reserved for the stop request, so the whole budget is 9s from before arming. The
 controller never stops on a fetch, because the first one can be a metadata probe that
 lands well before playback. It observes until the reserved stop deadline, then stops.
 
 Before its one `player_queues/play_media` request, the controller spawns a
 one-shot detached `emergency-stop` process. That process waits on a monotonic
 clock until a full bounded stop-request interval remains, then sends
-`players/cmd/stop` at that reserved point even if the parent is stuck in an accepted playback response.
+`players/cmd/stop` at that reserved point even if the parent is stuck in an accepted
+playback response.
 The parent also attempts the same idempotent stop in `finally`; its result is
 receipt evidence, not the safety guarantee. Every MA HTTP operation has one
 absolute timeout covering connection, headers and body transfer, so a slow-drip
