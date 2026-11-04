@@ -1190,6 +1190,7 @@ class TestRegisterUnregisterRace:
             model=model,
             initial_volume=25,
         )
+        assert player.device_info.identifiers[IdentifierType.MAC_ADDRESS] == "02:11:22:33:44:55"
         gateway = "AA:BB:CC:DD:EE:FF"
         mock_mass.config.get.side_effect = lambda key, default=None: (
             gateway if key.endswith("/cached_arp_mac") and cached else default
