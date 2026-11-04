@@ -147,6 +147,24 @@ async def test_nondefault_bounds_fail_closed(values: dict[str, Any]) -> None:
     ] is False
 
 
+async def test_explicit_default_volume_bounds() -> None:
+    """Explicit integer defaults are accepted as well as omitted bounds."""
+    provider, _, _ = _provider({PLAYER_ID: {"values": {"min_volume": 0, "max_volume": 100}}})
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["default_volume_bounds"] is True
+
+
+@pytest.mark.parametrize(
+    "core", [None, [], {"discovery": None}, {"discovery": []}, {"discovery": {"values": []}}]
+)
+async def test_malformed_discovery_fails_closed(core: object) -> None:
+    """Malformed raw discovery containers never prove target reset."""
+    provider, _, store = _provider({})
+    store["core"] = core
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["target_unset"] is False
+
+
 async def test_target_and_streams_fail_closed() -> None:
     """A configured target or any current stream prevents admission."""
     provider, mass, store = _provider({})
