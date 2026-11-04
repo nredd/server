@@ -492,7 +492,7 @@ class AirPlayStream:
         # after the session ends, so it is only sent when nothing else owns this output's
         # volume: otherwise the device keeps playing at the level its own app or remote is
         # set to. A latched mute would start the stream silent, so it does travel along.
-        if self.player.owns_volume or self.player.volume_muted:
+        if self._connect_volume_allowed():
             # Repeat after 2 seconds because some players ignore the first volume command
             # (https://github.com/music-assistant/support/issues/3330). The repeat reads
             # the level when it fires, so it never replays a value that changed since.
@@ -2139,6 +2139,8 @@ class AirPlayStream:
 
     async def _send_current_volume(self) -> None:
         """Send the player's current volume level to the device, muted as zero."""
+        if self.player.implicit_receiver_writes_blocked:
+            return
         volume = 0 if self.player.volume_muted else self.player.volume_level
         if self.session_volume_requested and self.session_volume.supported:
             if volume is None:
@@ -2149,6 +2151,12 @@ class AirPlayStream:
                 self.player.logger.debug("Initial checked stream volume is unconfirmed")
         else:
             await self.send_cli_command(f"VOLUME={volume}")
+
+    def _connect_volume_allowed(self) -> bool:
+        """Return whether the connect may write the receiver's volume unprompted."""
+        if self.player.implicit_receiver_writes_blocked:
+            return False
+        return bool(self.player.owns_volume or self.player.volume_muted)
 
     async def _cleanup_failed_start(self) -> None:
         """Release all resources owned by a cliairplay process that failed to start."""

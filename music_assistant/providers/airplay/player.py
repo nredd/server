@@ -1033,6 +1033,11 @@ class AirPlayPlayer(Player):
             return True
         return self._control_routes_to_self(parent_player.volume_control_for_output(self.player_id))
 
+    @property
+    def implicit_receiver_writes_blocked(self) -> bool:
+        """Return True if the receiver must only be written to on an explicit command."""
+        return False
+
     def release_foreign_mute_latch(self) -> None:
         """Clear our mute latch when another control owns the mute of this output."""
         if not self._attr_volume_muted:

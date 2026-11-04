@@ -365,7 +365,11 @@ class SyncGroupPlayer(Player):
                 self._pending_content_takeover = None
                 await owner.on_group_content_takeover_aborted(token)
 
-    async def power(self, powered: bool) -> None:
+    async def power_for_playback(self) -> None:
+        """Form the group for playback without explicit member power commands."""
+        await self.power(True, automatic=True)
+
+    async def power(self, powered: bool, *, automatic: bool = False) -> None:
         """
         Handle POWER command to group player.
 
@@ -375,6 +379,7 @@ class SyncGroupPlayer(Player):
         in). Powering OFF stops any playback and dissolves the group.
 
         :param powered: True to power on (form/capture), False to power off (dissolve).
+        :param automatic: The power-on was initiated for playback or grouping.
         """
         # always cancel pending lifecycle tasks on explicit power transitions
         self._cancel_idle_grace_timer()
@@ -400,7 +405,9 @@ class SyncGroupPlayer(Player):
                 *preset_members,
                 *[x for x in self._attr_group_members if x not in preset_members],
             ]
-            takeover = await self._form_syncgroup(new_content=self._preparing_play_media)
+            takeover = await self._form_syncgroup(
+                new_content=self._preparing_play_media, explicit_power=not automatic
+            )
             if takeover is not None:
                 self._pending_content_takeover = takeover
         else:
@@ -812,8 +819,15 @@ class SyncGroupPlayer(Player):
         allowed_members = cast("list[str]", self.config.get_value(CONF_ALLOWED_MEMBERS, []) or [])
         return not allowed_members or player_id in allowed_members
 
-    async def _form_syncgroup(self, *, new_content: bool = False) -> tuple[Player, object] | None:
-        """Form syncgroup by syncing all (possible) members."""
+    async def _form_syncgroup(
+        self, *, new_content: bool = False, explicit_power: bool = False
+    ) -> tuple[Player, object] | None:
+        """
+        Form syncgroup by syncing all (possible) members.
+
+        :param new_content: The caller is preparing new playback content.
+        :param explicit_power: The group was explicitly powered on.
+        """
         # any in-flight grace or debounced re-form timer is moot now —
         # we're (re)forming the group
         self._cancel_idle_grace_timer()
@@ -916,6 +930,13 @@ class SyncGroupPlayer(Player):
             async with self.mass.players.get_player_lock(
                 leader.player_id, PlayerLockPurpose.PLAYBACK
             ):
+                if explicit_power:
+                    return await self.mass.players._handle_set_members(
+                        leader,
+                        player_ids_to_add=members_to_sync,
+                        new_content=new_content,
+                        explicit_power=True,
+                    )
                 return await self.mass.players._handle_set_members(
                     leader, player_ids_to_add=members_to_sync, new_content=new_content
                 )

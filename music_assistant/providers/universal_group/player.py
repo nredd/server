@@ -262,41 +262,18 @@ class UniversalGroupPlayer(Player):
 
         :param powered: True to power on (capture members), False to power off (release).
         """
-        # any pending idle-grace release is moot — we're on an explicit transition
-        self._cancel_idle_grace_timer()
+        await self._set_power(powered, automatic=False)
 
-        # always stop at power off
-        if not powered and self._attr_playback_state in (
-            PlaybackState.PLAYING,
-            PlaybackState.PAUSED,
-        ):
-            await self.stop()
-
-        prev_power = self._attr_powered
-        self._attr_powered = powered
-
-        if powered:
-            await self._capture_members()
-        elif prev_power:
-            # handle TURN_OFF of the group player by turning off all members
-            for member in self.mass.players.iter_group_members(
-                self, only_powered=True, active_only=True
-            ):
-                if member.powered and member.power_control != PLAYER_CONTROL_NONE:
-                    with suppress(PlayerUnavailableError):
-                        await self.mass.players.cmd_power(member.player_id, False)
-
-        if not powered:
-            # reset the original group members when powered off
-            self._attr_group_members = self._attr_static_group_members.copy()
-        self.update_state()
+    async def power_for_playback(self) -> None:
+        """Capture group members without implicitly waking protected receivers."""
+        await self._set_power(True, automatic=True)
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
         # form on play: cancel any pending idle-grace release, then capture the
         # configured members and free them of any conflicting prior allegiance.
         self._cancel_idle_grace_timer()
-        await self._capture_members()
+        await self._capture_members(automatic=True)
 
         if self.stream and not self.stream.done:
             # stop any existing stream first
@@ -446,7 +423,35 @@ class UniversalGroupPlayer(Player):
         async with self.mass.players.get_player_lock(player_id, PlayerLockPurpose.PLAYBACK):
             await self.mass.players._handle_play_media(player_id, media)
 
-    async def _capture_members(self) -> None:
+    async def _set_power(self, powered: bool, *, automatic: bool) -> None:
+        """Set group power and capture members with the command's provenance."""
+        self._cancel_idle_grace_timer()
+
+        # always stop at power off
+        if not powered and self._attr_playback_state in (
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        ):
+            await self.stop()
+
+        prev_power = self._attr_powered
+        self._attr_powered = powered
+        if powered:
+            await self._capture_members(automatic=automatic)
+        elif prev_power:
+            # handle TURN_OFF of the group player by turning off all members
+            for member in self.mass.players.iter_group_members(
+                self, only_powered=True, active_only=True
+            ):
+                if member.powered and member.power_control != PLAYER_CONTROL_NONE:
+                    with suppress(PlayerUnavailableError):
+                        await self.mass.players.cmd_power(member.player_id, False)
+        if not powered:
+            # reset the original group members when powered off
+            self._attr_group_members = self._attr_static_group_members.copy()
+        self.update_state()
+
+    async def _capture_members(self, *, automatic: bool) -> None:
         """
         Resolve collisions and prepare the configured members for grouping.
 
@@ -455,6 +460,8 @@ class UniversalGroupPlayer(Player):
         that are currently captured by another group / sync session, and
         leaves the group ready for playback. Idempotent: safe to call on an
         already-prepared group.
+
+        :param automatic: Member power-on is a side effect of playback or grouping.
         """
         # rebuild the effective member list from the configured static set
         self._attr_group_members = []
@@ -507,9 +514,22 @@ class UniversalGroupPlayer(Player):
             if member.synced_to:
                 # member is part of a syncgroup — release it first
                 await member.ungroup()
-            if not member.powered and member.power_control != PLAYER_CONTROL_NONE:
+            if automatic and member.state.powered is False and not member.allow_implicit_power_on:
+                self.logger.warning(
+                    "Skipping %s in group %s: automatic power on is disabled and the player is off",
+                    member.display_name,
+                    self.display_name,
+                )
+            if (
+                not member.powered
+                and (not automatic or member.allow_implicit_power_on)
+                and member.power_control != PLAYER_CONTROL_NONE
+            ):
                 with suppress(PlayerUnavailableError):
-                    await self.mass.players.cmd_power(member.player_id, True)
+                    if automatic:
+                        await self.mass.players.cmd_power_for_playback(member.player_id)
+                    else:
+                        await self.mass.players.cmd_power(member.player_id, True)
 
     def _set_attributes(self) -> None:
         """Set attributes of the group player."""

@@ -90,6 +90,7 @@ class MockPlayers:
         self.cmd_stop = AsyncMock()
         self.cmd_pause = AsyncMock()
         self.cmd_power = AsyncMock()
+        self.cmd_power_for_playback = AsyncMock()
         self.cmd_volume_set = AsyncMock()
         self.cmd_volume_mute = AsyncMock()
         self.cmd_group_volume = AsyncMock()
@@ -976,7 +977,7 @@ class TestPlaylistInputSources:
         result = await execute_capability_action(
             mass, "p1", action, playlist_uris=["library://playlist/jazz"]
         )
-        mass.players.cmd_power.assert_awaited_once_with("p1", True)
+        mass.players.cmd_power_for_playback.assert_awaited_once_with("p1")
         mass.player_queues.play_media.assert_awaited_once_with(
             queue_id="p1", media="library://playlist/jazz"
         )

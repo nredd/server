@@ -86,6 +86,7 @@ def _make_player() -> MagicMock:
     # A real None: a stream only speaks for the player while it is the published
     # one, and a bare MagicMock reads as some other stream having taken over.
     player.stream = None
+    player.implicit_receiver_writes_blocked = False
 
     airplay_info = MagicMock()
     airplay_info.port = 7000
@@ -2714,6 +2715,94 @@ async def test_wait_for_connection_sends_volume_when_muted_without_ownership() -
         await stream.wait_for_connection()
 
     send_command.assert_awaited_with("VOLUME=0")
+
+
+async def _connect_with_pipe_spy(
+    stream: AirPlayStream, player: MagicMock
+) -> tuple[AsyncMock, MagicMock]:
+    """Run `wait_for_connection` with a real command path and spy on the pipe writes."""
+    stream._connected.set()
+    stream._cli_proc = _make_cli_proc()
+    player.provider.mass.call_later = MagicMock()
+    pipe_write = AsyncMock(return_value=True)
+    with (
+        patch.object(stream.commands_pipe, "wait_for_reader", new=AsyncMock(return_value=True)),
+        patch.object(stream, "_send_current_metadata", new_callable=AsyncMock),
+        patch.object(stream.commands_pipe, "write", new=pipe_write),
+    ):
+        await stream.wait_for_connection()
+    return pipe_write, player.provider.mass.call_later
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("muted", [False, True])
+@pytest.mark.parametrize("owns_volume", [False, True])
+async def test_blocked_receiver_writes_never_put_volume_on_the_wire(
+    muted: bool, owns_volume: bool
+) -> None:
+    """The private Apple TV trial sends no VOLUME on connect, not even for a latched mute."""
+    player = _make_player()
+    player.implicit_receiver_writes_blocked = True
+    player.owns_volume = owns_volume
+    player.volume_muted = muted
+    stream = AirPlayStream(player)
+
+    pipe_write, call_later = await _connect_with_pipe_spy(stream, player)
+
+    pipe_write.assert_not_awaited()
+    # ...so there is no delayed repeat either
+    call_later.assert_not_called()
+    # a stray delayed or retried push is a no-op as well
+    await stream._send_current_volume()
+    pipe_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_blocked_receiver_writes_never_apply_the_checked_volume() -> None:
+    """The bridge's initial-volume retry reaches `_send_current_volume`; it must stay silent."""
+    player = _make_player()
+    player.implicit_receiver_writes_blocked = True
+    stream = AirPlayStream(player)
+    stream.session_volume_requested = True
+    stream.session_volume = MagicMock(supported=True, apply=AsyncMock())
+
+    await stream._send_current_volume()
+
+    stream.session_volume.apply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblocked_connect_still_puts_volume_on_the_wire_twice() -> None:
+    """Normal and HomePod behavior is unchanged: VOLUME at connect and again after 2 seconds."""
+    player = _make_player()
+    player.implicit_receiver_writes_blocked = False
+    player.owns_volume = True
+    player.volume_muted = False
+    stream = AirPlayStream(player)
+
+    pipe_write, call_later = await _connect_with_pipe_spy(stream, player)
+
+    pipe_write.assert_awaited_once()
+    assert pipe_write.await_args_list[0].args[0] == b"VOLUME=40\n"
+    assert call_later.call_args_list[0].args[0] == 2
+    with patch.object(stream.commands_pipe, "write", new=pipe_write):
+        await call_later.call_args_list[0].args[1]()
+    assert pipe_write.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_volume_command_still_reaches_the_wire_when_blocked() -> None:
+    """Blocking is for implicit writes only: an explicit stream command is delivered."""
+    player = _make_player()
+    player.implicit_receiver_writes_blocked = True
+    stream = AirPlayStream(player)
+    stream._cli_proc = _make_cli_proc()
+    pipe_write = AsyncMock(return_value=True)
+
+    with patch.object(stream.commands_pipe, "write", new=pipe_write):
+        assert await stream.send_cli_command("VOLUME=30") is True
+
+    assert pipe_write.await_args_list[0].args[0] == b"VOLUME=30\n"
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,279 @@
+"""Controller regression tests for automatic power-on policy."""
+
+from __future__ import annotations
+
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from music_assistant_models.constants import PLAYER_CONTROL_FAKE, PLAYER_CONTROL_NATIVE
+from music_assistant_models.enums import MediaType, PlayerFeature, PlayerType
+from music_assistant_models.player import PlayerMedia
+from pyatv.interface import AppleTV
+
+from music_assistant.constants import CONF_POWER_CONTROL
+from music_assistant.controllers.players import PlayerController
+from tests.common import use_real_create_task
+from tests.controllers.players.test_player_controller import _player_config_stub
+from tests.controllers.players.test_player_controller import mock_mass as controller_mock_mass
+from tests.providers.airplay.test_control_player import _make_control_player
+from tests.providers.universal_group.test_universal_group import _make_ugp
+
+mock_mass = controller_mock_mass
+
+
+@pytest.mark.parametrize("command", ["play_media", "cmd_play", "cmd_resume"])
+@pytest.mark.parametrize(
+    ("trial", "model", "expect_power"),
+    [(True, "Apple TV 4K", False), (False, "Apple TV 4K", True), (True, "HomePod", True)],
+)
+async def test_controller_playback_auto_power(
+    mock_mass: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    trial: bool,
+    model: str,
+    expect_power: bool,
+) -> None:
+    """Playback reaches the controller while a private TV stays truthfully off."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: trial,
+    )
+    mock_mass.config.get_raw_player_config_value.side_effect = _player_config_stub(
+        {CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE}
+    )
+    controller = PlayerController(mock_mass)
+    player = _make_control_player(model=model, setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    player._attr_supported_features.add(PlayerFeature.POWER)
+    controller._players = {player.player_id: player}
+    mock_mass.players = controller
+    mock_mass.player_queues.get.return_value = None
+    mock_mass.player_queues.resume = AsyncMock()
+    player.set_initialized()
+    player.update_state(signal_event=False)
+    assert player.state.powered is False
+    assert player.state.power_control == PLAYER_CONTROL_NATIVE
+    media = PlayerMedia(uri="http://example.test/audio", media_type=MediaType.ANNOUNCEMENT)
+    power = AsyncMock()
+    with (
+        patch.object(player, "power_for_playback", power),
+        patch.object(player, "play_media", new=AsyncMock()),
+        patch.object(player, "play", new=AsyncMock()),
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+    ):
+        if command == "play_media":
+            await controller.play_media(player.player_id, media)
+        elif command == "cmd_play":
+            await controller.cmd_play(player.player_id)
+        else:
+            await controller.cmd_resume(player.player_id, media=media)
+    assert power.await_count == int(expect_power)
+    assert player.state.powered is False
+
+
+async def test_controller_explicit_power_still_reaches_tv(
+    mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The private policy does not suppress an explicit power command."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    mock_mass.config.get_raw_player_config_value.side_effect = _player_config_stub(
+        {CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE}
+    )
+    controller = PlayerController(mock_mass)
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    player._attr_supported_features.add(PlayerFeature.POWER)
+    controller._players = {player.player_id: player}
+    mock_mass.players = controller
+    player.set_initialized()
+    player.update_state(signal_event=False)
+    with (
+        patch.object(player, "power", new=AsyncMock()) as power,
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+    ):
+        await controller.cmd_power(player.player_id, True)
+    power.assert_awaited_once_with(True)
+
+
+async def test_controller_playlist_auto_power_is_blocked(
+    mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Yandex playlist power route does not wake the private TV."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    mock_mass.config.get_raw_player_config_value.side_effect = _player_config_stub(
+        {CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE}
+    )
+    controller = PlayerController(mock_mass)
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    controller._players = {player.player_id: player}
+    mock_mass.players = controller
+    player.set_initialized()
+    player.update_state(signal_event=False)
+    with patch.object(player, "power", new=AsyncMock()) as power:
+        await controller.cmd_power_for_playback(player.player_id)
+    power.assert_not_awaited()
+    assert player.state.powered is False
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+async def test_controller_group_power_provenance(
+    mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch, automatic: bool
+) -> None:
+    """Explicit group power wakes the TV, while automatic group power does not."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    config_value = _player_config_stub({CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE})
+    mock_mass.config.get_raw_player_config_value.side_effect = lambda player_id, key, default=None: (
+        PLAYER_CONTROL_FAKE
+        if player_id == "ugp_test" and key == CONF_POWER_CONTROL
+        else config_value(player_id, key, default)
+    )
+    controller = PlayerController(mock_mass)
+    mock_mass.players = controller
+    group = _make_ugp(mock_mass)
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    controller._players = {group.player_id: group, player.player_id: player}
+    group._attr_powered = False
+    mock_mass.player_queues.resume = AsyncMock()
+    for item in (group, player):
+        item.set_initialized()
+        item.update_state(signal_event=False)
+    with (
+        patch.object(
+            controller, "iter_group_members", side_effect=lambda *_args, **_kwargs: iter([player])
+        ),
+        patch.object(player, "power", new=AsyncMock()) as power,
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+    ):
+        if automatic:
+            await controller.cmd_power_for_playback(group.player_id)
+        else:
+            await controller.cmd_power(group.player_id, True)
+    assert power.await_count == int(not automatic)
+
+
+@pytest.mark.parametrize("explicit_power", [False, True])
+async def test_ugp_playback_skips_sleeping_tv_without_wake(
+    mock_mass: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    explicit_power: bool,
+) -> None:
+    """A sleeping trial TV is excluded unless explicitly powered on first."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    config_value = _player_config_stub({CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE})
+    mock_mass.config.get_raw_player_config_value.side_effect = lambda player_id, key, default=None: (
+        PLAYER_CONTROL_FAKE
+        if player_id == "ugp_test" and key == CONF_POWER_CONTROL
+        else config_value(player_id, key, default)
+    )
+    controller = PlayerController(mock_mass)
+    mock_mass.players = controller
+    group = _make_ugp(mock_mass)
+    group.logger = logging.getLogger("test.ugp.implicit_power")
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    device = MagicMock(spec=AppleTV)
+    device.features.in_state.return_value = True
+    device.power.turn_on = AsyncMock()
+    player._companion_device = device
+    player.config.name = None
+    player.config.default_name = "Test TV"
+    group._attr_static_group_members = [player.player_id]
+    group._attr_group_members = [player.player_id]
+    group._attr_powered = False
+    controller._players = {group.player_id: group, player.player_id: player}
+    for item in (group, player):
+        item.set_initialized()
+        item.update_state(signal_event=False)
+    assert list(controller.iter_group_members(group, only_powered=True)) == []
+
+    async def report_awake() -> None:
+        player._attr_powered = True
+        player.update_state(signal_event=False)
+
+    device.power.turn_on.side_effect = report_awake
+    media = PlayerMedia(uri="http://example.test/audio", media_type=MediaType.TRACK)
+    mock_mass.streams.base_url = "http://example.test"
+    mock_mass.player_queues.resume = AsyncMock()
+    use_real_create_task(mock_mass)
+    with (
+        patch.object(group, "_play_media_on_member", new=AsyncMock()) as fanout,
+        patch.object(controller, "_fetch_palette", new=AsyncMock()),
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+        caplog.at_level(logging.WARNING),
+    ):
+        if explicit_power:
+            await controller.cmd_power(group.player_id, True)
+        await group.play_media(media)
+
+    assert device.power.turn_on.await_count == int(explicit_power)
+    assert fanout.await_count == int(explicit_power)
+    if not explicit_power:
+        assert player.state.powered is False
+        assert player.display_name in caplog.text
+        assert "automatic power" in caplog.text
+    else:
+        assert player.state.powered is True
+        assert fanout.await_args is not None
+        assert fanout.await_args.args[0] == player.player_id
+
+
+@pytest.mark.parametrize("explicit_power", [False, True])
+async def test_controller_group_member_power_provenance(
+    mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch, explicit_power: bool
+) -> None:
+    """Sync-group membership only wakes a TV as part of explicit group power."""
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+        lambda: True,
+    )
+    mock_mass.config.get_raw_player_config_value.side_effect = _player_config_stub(
+        {CONF_POWER_CONTROL: PLAYER_CONTROL_NATIVE}
+    )
+    controller = PlayerController(mock_mass)
+    mock_mass.players = controller
+    player = _make_control_player(setup_data={"companion_credentials": "credentials"})
+    player.provider.mass = mock_mass
+    player._attr_powered = False
+    controller._players = {player.player_id: player}
+    player.set_initialized()
+    player.update_state(signal_event=False)
+    leader = MagicMock()
+    leader.player_id = "leader"
+    leader.type = PlayerType.PLAYER
+    leader.state.can_group_with = {player.player_id}
+    leader.state.group_members = []
+    with (
+        patch.object(controller, "_dissolve_own_group", new=AsyncMock(return_value=True)),
+        patch.object(controller, "_handle_set_members_with_protocols", new=AsyncMock()) as join,
+        patch.object(player, "power", new=AsyncMock()) as power,
+        patch("music_assistant.controllers.players.controller.wait_for_power_on", new=AsyncMock()),
+    ):
+        await controller._handle_set_members(
+            leader, player_ids_to_add=[player.player_id], explicit_power=explicit_power
+        )
+    assert power.await_count == int(explicit_power)
+    join.assert_awaited_once()
+    assert join.await_args is not None
+    assert join.await_args.args[1] == [player.player_id]

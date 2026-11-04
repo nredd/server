@@ -52,3 +52,29 @@ This is controller infrastructure, not receiver acceptance or a deployment recip
 Run it only from the intended private host after the parent has supplied the
 lifecycle run, inventory, explicit bind/advertised addresses, API endpoint, and
 short-lived credential. Do not add household identifiers to this repository.
+
+## No implicit receiver writes
+
+For ordinary playback startup and automatic group power-on on the private trial target,
+the Apple TV guard suppresses these receiver writes:
+
+- The connect-time `VOLUME` push, its 2 second repeat and the bridge's initial-volume retry are
+  suppressed, including a latched mute, so the receiver's own level is never persisted over.
+- Playback no longer wakes the device through Companion `turn_on`, and a `stop` with no active
+  stream no longer sends Home. Explicit `power`, `wake`, `volume_set` and `volume_mute`
+  are unchanged. Explicit `play` is still sent but no longer wakes a sleeping TV first.
+- The receiver's DACP volume echo is already ignored for every Apple device
+  (`AirPlayPlayer.ignore_volume_reports`), so it never writes `VOLUME` back to a TV.
+- HomePods, other receivers and non-trial profiles keep today's behavior.
+
+Direct ordinary playback may attempt an AirPlay stream while the TV remains asleep, without
+sending a Companion wake. Universal Group playback excludes a member reported powered off and
+logs a warning when this policy prevents its automatic wake. Explicit group power-on still
+wakes the member; no acoustic outcome is asserted.
+
+Announcements are outside this trial contract and must not be used during the trial. They retain
+their normal behavior, including possible volume, mute and power changes and restoration.
+
+Limit: a latched mute is not sent, so a stream can start silent while the player state still
+says muted, and the receiver's mute state can remain unknown. The caller must abort actual
+transport when the player is known to be muted.

@@ -1129,7 +1129,19 @@ class TestPowerLifecycle:
         ):
             await sgp.power(True)
 
-        form.assert_awaited_once_with(new_content=False)
+        form.assert_awaited_once_with(new_content=False, explicit_power=True)
+
+    async def test_automatic_power_does_not_mark_members_explicit(self) -> None:
+        """Power-on for playback must not become an explicit member wake."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        sgp._attr_group_members = ["leader"]
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "_form_syncgroup", new=AsyncMock()) as form,
+        ):
+            await sgp.power_for_playback()
+        form.assert_awaited_once_with(new_content=False, explicit_power=False)
         assert sgp._attr_powered is True
 
     @pytest.mark.asyncio
@@ -2474,6 +2486,24 @@ class TestFormWaitsForLeaderUnsynced:
 
 class TestFormReconcilesIncompatibleMembers:
     """The form checks the tracked members against the settled leader."""
+
+    @pytest.mark.parametrize("explicit_power", [False, True])
+    async def test_form_forwards_power_provenance(self, explicit_power: bool) -> None:
+        """Forming a sync group preserves whether member power was explicit."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        leader = _make_mock_player("leader", provider_domain="sonos")
+        leader.state.can_group_with = {"m2"}
+        member = _make_mock_player("m2", provider_domain="sonos")
+        mass.players.get_player = _player_lookup({"leader": leader, "m2": member})
+        sgp.sync_leader = leader
+        sgp._attr_group_members = ["leader", "m2"]
+
+        await sgp._form_syncgroup(explicit_power=explicit_power)
+
+        kwargs = mass.players._handle_set_members.await_args.kwargs
+        assert kwargs.get("explicit_power", False) is explicit_power
+        assert kwargs["player_ids_to_add"] == ["m2"]
 
     @pytest.mark.asyncio
     async def test_form_drops_member_leader_cannot_group_with(
