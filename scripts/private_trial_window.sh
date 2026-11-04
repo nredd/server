@@ -199,8 +199,8 @@ mkdir -p "$(dirname "$ENV_FILE")"; chmod 700 "$(dirname "$ENV_FILE")"
 
 # Pins are hardcoded or derived from this checkout on purpose: a stale .env value
 # can never select another asset or source.
-PINNED_CLI_SHA=bdbece07a15eca764c84a83eac4e6dc4bacc3770370df891b20e869db66e51f1
-PINNED_CLI_LABEL=ve255a82
+PINNED_CLI_SHA=fc77ceec40e796fffa89a06b95c384f5838d6308bdedda3cc2491d3a53cf7fb8
+PINNED_CLI_LABEL=vcd7d36b
 SERVER_SHA=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
 DEV=d5369777_music_assistant_dev
 TRIAL_API="http://${HAOS_IP}:18095"
