@@ -502,7 +502,8 @@ an append-only continuation of that baseline and contains a new exact
 
 The observer's runtime pin is the merge `a6382b99fad1603176fe89daf0a233406e77f5ad` (PR #48), whose tree equals
 the reviewed `95de38700` tree. It was previously `0f7b543127f71c5639d55d4e0e34168ba92d0c33`; that is observer
-history only. The CLI pins (`429c5670` source, `cd7d36b` CI label, `fc77ceec` ELF) did not change in that range.
+history only. The CLI pins (`429c5670` source, `cd7d36b` CI label, `fc77ceec` ELF) did not change between
+`0f7b543` and `a6382b99`.
 The pin is a code constant with no argument, so a later merge deliberately differs from it until a new
 reviewed runtime is chosen.
 
