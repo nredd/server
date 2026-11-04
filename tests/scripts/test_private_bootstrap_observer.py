@@ -937,6 +937,33 @@ NEAR_MISSES = [
 ]
 
 
+RUNTIME_SHA = "a6382b99fad1603176fe89daf0a233406e77f5ad"
+PREVIOUS_RUNTIME_SHA = "0f7b543127f71c5639d55d4e0e34168ba92d0c33"
+
+
+def test_runtime_pin_is_the_reviewed_merge() -> None:
+    """The pin is the literal reviewed runtime merge, not a symbolic self-reference."""
+    assert observer.EXPECTED_SOURCE == RUNTIME_SHA
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Building from source using server_repo: nredd/server@{}",
+        "Server repository: nredd/server@{}",
+        "Server URL: git+https://github.com/nredd/server@{}",
+        "Updating https://github.com/nredd/server ({})",
+    ],
+)
+def test_real_runtime_sha_anchors_and_previous_sha_does_not(template: str) -> None:
+    """Each canonical line anchors only for the literal runtime SHA, never the old pin."""
+    old = current("old boot line")
+    good = old + current(template.format(RUNTIME_SHA))
+    stale = old + current(template.format(PREVIOUS_RUNTIME_SHA))
+    assert observer._find_anchor(good, len(old)) == len(old)
+    assert observer._find_anchor(stale, len(old)) is None
+
+
 @pytest.mark.parametrize("line", NEAR_MISSES)
 def test_near_misses_never_anchor(line: str) -> None:
     """Other repos, SHAs, prefix or suffix collisions and generic lines stay `unknown`."""
