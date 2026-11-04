@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
 from collections import deque
 from collections.abc import Callable
@@ -104,6 +105,7 @@ from .helpers import (
 from .player import AirPlayPlayer, GenericAirPlayPlayer
 from .private_volume_capture import PrivateVolumeCapture, classify_dacp
 from .sendspin_bridge import SendspinBridgeManager
+from .server_code_evidence import server_code_evidence
 from .stream import AirPlayStream, PrivateCaptureRequest
 
 if TYPE_CHECKING:
@@ -595,6 +597,7 @@ class AirPlayProvider(PlayerProvider):
             msg = "Private native-volume capture is unavailable outside the trial target"
             raise RuntimeError(msg)
         provenance = await asyncio.to_thread(installer_provenance)
+        code_evidence = await asyncio.to_thread(server_code_evidence, sys.modules[__name__])
         daemon, ptp_event = self._ptp_daemon, self._ptp_daemon_ready
         streams = [
             (
@@ -657,6 +660,7 @@ class AirPlayProvider(PlayerProvider):
         return {
             "schema_version": 1,
             "installer_provenance": provenance,
+            "server_code_evidence": code_evidence,
             "expected_sha256": encode_public_digest(trial_binary.EXPECTED_SHA),
             "startup_validation": deepcopy(self._trial_identity),
             "owned_children": children,

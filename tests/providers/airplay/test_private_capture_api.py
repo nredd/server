@@ -291,6 +291,7 @@ async def test_readiness_handler_returns_only_required_live_receipts(
         "playing_ready": False,
         "streams": [],
         "installer_provenance": provenance,
+        "server_code_evidence": {"schema_version": 1, "status": "unverified"},
         "expected_sha256": {"encoding": "u32be-v1", "words": [0xAAAAAAAA] * 8},
         "startup_validation": {"check_outcome": "passed"},
         "owned_children": [{"role": "ptp", "outcome": "match"}],
