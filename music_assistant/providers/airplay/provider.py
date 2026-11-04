@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 import time
 from collections import deque
@@ -24,7 +25,10 @@ from zeroconf import NonUniqueNameException, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceInfo
 
 from music_assistant.constants import (
+    CONF_CORE,
     CONF_LOG_LEVEL,
+    CONF_MAX_VOLUME,
+    CONF_MIN_VOLUME,
     CONF_PLAYERS,
     CONF_PROVIDERS,
     VERBOSE_LOG_LEVEL,
@@ -37,6 +41,7 @@ from music_assistant.helpers.config_entries import (
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.private_trial import (
+    CONF_PRIVATE_TRIAL_TARGET,
     admits_player_id,
     encode_public_digest,
     installer_provenance,
@@ -58,13 +63,19 @@ from .constants import (
     AIRPLAY_VOLUME_MUTE,
     CLI_PROBLEM_MARKERS,
     COMPANION_DISCOVERY_TYPE,
+    CONF_AIRPLAY_CREDENTIALS,
+    CONF_COMPANION_CREDENTIALS,
     CONF_COMPAT_PINS_REVIEWED,
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_EXPERIMENTAL_SESSION_VOLUME,
+    CONF_MRP_CREDENTIALS,
+    CONF_NATIVE_MRP_CREDENTIALS,
+    CONF_PASSWORD,
     CONF_PASSWORD_INVALID,
     CONF_PASSWORD_MARKERS_REVIEWED,
     CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
     CONF_RADIO_STATION_FIRST,
+    CONF_RAOP_CREDENTIALS,
     CONF_STORED_VOLUME,
     CONF_STREAMING_MODE,
     CONF_VERBOSE_PTP_LOGGING,
@@ -118,6 +129,17 @@ DACP_RECLAIM_DELAY: Final[float] = 1.0
 # Opt-in for pyatv's own debug logging. Set to any non-empty value to trace the
 # pyatv protocol traffic itself.
 ENV_PYATV_DEBUG: Final[str] = "MASS_PYATV_DEBUG"
+_PRIVATE_PLAYER_ID = re.compile(r"ap[0-9a-f]{12}")
+_PRIVATE_CREDENTIAL_KEYS = frozenset(
+    {
+        CONF_AIRPLAY_CREDENTIALS,
+        CONF_RAOP_CREDENTIALS,
+        CONF_COMPANION_CREDENTIALS,
+        CONF_MRP_CREDENTIALS,
+        CONF_NATIVE_MRP_CREDENTIALS,
+        CONF_PASSWORD,
+    }
+)
 
 
 def _has_current_private_receipt(child: AsyncProcess) -> bool:
@@ -198,6 +220,7 @@ class AirPlayProvider(PlayerProvider):
     _ptp_daemon_warn_window_start: float | None = None
     _ptp_daemon_warns_in_window: int = 0
     _ptp_daemon_warns_suppressed: int = 0
+    _unregister_private_admission_api: Callable[[], None] | None = None
     _unregister_private_capture_api: Callable[[], None] | None = None
     _unregister_private_capture_readiness_api: Callable[[], None] | None = None
 
@@ -467,6 +490,9 @@ class AirPlayProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        if unregister := getattr(self, "_unregister_private_admission_api", None):
+            unregister()
+            self._unregister_private_admission_api = None
         if unregister := getattr(self, "_unregister_private_capture_api", None):
             unregister()
             self._unregister_private_capture_api = None
@@ -676,6 +702,63 @@ class AirPlayProvider(PlayerProvider):
             raise MediaNotFoundError("AirPlay artwork is unavailable")
         return await player.async_get_external_artwork(artwork_id)
 
+    async def get_private_trial_admission_preflight(
+        self, player_id: str
+    ) -> dict[str, SerializableType]:
+        """Return secret-free facts about the unmodified private admission state."""
+        if not is_trial_target():
+            raise RuntimeError("Private trial admission is unavailable")
+        if not isinstance(player_id, str) or not _PRIVATE_PLAYER_ID.fullmatch(player_id):
+            raise ValueError("Invalid private trial player ID")
+        players = self.mass.config.get(CONF_PLAYERS)
+        state = "unsafe"
+        setup_empty = credentials_absent = default_bounds = False
+        if isinstance(players, dict):
+            if player_id not in players:
+                state = "absent"
+                setup_empty = credentials_absent = default_bounds = True
+            elif isinstance(raw := players[player_id], dict):
+                values = raw.get("values", {})
+                setup = raw.get("setup_data", {})
+                if isinstance(values, dict) and isinstance(setup, dict):
+                    state = "present"
+                    setup_empty = not setup
+                    credentials_absent = (
+                        all(
+                            key not in values or values[key] is None or values[key] == ""
+                            for key in _PRIVATE_CREDENTIAL_KEYS
+                        )
+                        and setup_empty
+                    )
+                    minimum = values.get(CONF_MIN_VOLUME, 0)
+                    maximum = values.get(CONF_MAX_VOLUME, 100)
+                    default_bounds = (
+                        type(minimum) is int
+                        and minimum == 0
+                        and type(maximum) is int
+                        and maximum == 100
+                    )
+        core = self.mass.config.get(CONF_CORE)
+        target_unset = False
+        if isinstance(core, dict) and isinstance(discovery := core.get("discovery"), dict):
+            values = discovery.get("values")
+            if isinstance(values, dict):
+                entry = self.mass.discovery.config.values.get(CONF_PRIVATE_TRIAL_TARGET)
+                target_unset = (
+                    values.get(CONF_PRIVATE_TRIAL_TARGET) == ""
+                    and entry is not None
+                    and entry.value in (None, "")
+                )
+        return {
+            "version": 1,
+            "config_state": state,
+            "setup_data_empty": setup_empty,
+            "credentials_absent": credentials_absent,
+            "default_volume_bounds": default_bounds,
+            "target_unset": target_unset,
+            "no_current_streams": all(player.stream is None for player in self.get_players()),
+        }
+
     def _register_private_capture_api(self) -> None:
         """Atomically claim both private routes within the load-failing lifecycle."""
         if not is_trial_target():
@@ -691,7 +774,15 @@ class AirPlayProvider(PlayerProvider):
                 self.get_private_native_volume_capture_readiness,
                 required_scope=Scope.SYSTEM_MANAGE,
             )
+            self._unregister_private_admission_api = self.mass.register_api_command(
+                "airplay/private_trial_admission/preflight",
+                self.get_private_trial_admission_preflight,
+                required_scope=Scope.SYSTEM_MANAGE,
+            )
         except BaseException:
+            if self._unregister_private_capture_readiness_api:
+                self._unregister_private_capture_readiness_api()
+                self._unregister_private_capture_readiness_api = None
             self._unregister_private_capture_api()
             self._unregister_private_capture_api = None
             raise

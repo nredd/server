@@ -89,7 +89,12 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     provider, mass = _provider()
     unregister_capture = MagicMock()
     unregister_readiness = MagicMock()
-    mass.register_api_command.side_effect = (unregister_capture, unregister_readiness)
+    unregister_admission = MagicMock()
+    mass.register_api_command.side_effect = (
+        unregister_capture,
+        unregister_readiness,
+        unregister_admission,
+    )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
     provider._register_private_capture_api()
@@ -103,7 +108,15 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
             (_READINESS_COMMAND, provider.get_private_native_volume_capture_readiness),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
+        (
+            (
+                "airplay/private_trial_admission/preflight",
+                provider.get_private_trial_admission_preflight,
+            ),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
     ]
+    assert provider._unregister_private_admission_api is unregister_admission
     assert provider._unregister_private_capture_api is unregister_capture
     assert provider._unregister_private_capture_readiness_api is unregister_readiness
 
