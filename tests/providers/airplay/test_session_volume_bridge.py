@@ -176,6 +176,7 @@ async def test_cold_bridge_retries_checked_initial_volume_after_publishing_owner
     try:
         bridge._airplay_stream = None
         stream.player.stream = None
+        stream.session_volume.confirmed_level = None
         bridge._airplay_stream_start_task = asyncio.current_task()
         rig.commands.clear()
 
@@ -197,17 +198,20 @@ async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
     rig = fixture.rig
     provider = cast("AirPlayProvider", rig.streams[0].prov)
     manager = provider.bridge_manager
-    _, second = fixture.bridges
+    first, second = fixture.bridges
     try:
+        rig.streams[0].session_volume.confirmed_level = None
         second._airplay_stream = None
         second.airplay_player.stream = None
+        second_stream = rig.streams[1]
+        second_stream.session_volume.confirmed_level = None
         rig.commands.clear()
-        await manager.retry_initial_checked_volumes()
+        await manager.retry_initial_checked_volumes(first)
         assert not rig.commands
 
         second._airplay_stream = rig.streams[1]
         second.airplay_player.stream = rig.streams[1]
-        await manager.retry_initial_checked_volumes()
+        await manager.retry_initial_checked_volumes(second)
         assert sum("ACTION=STREAM_VOLUME_APPLY" in command for command in rig.commands) == 2
     finally:
         await rig.close()

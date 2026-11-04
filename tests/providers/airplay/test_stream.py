@@ -817,7 +817,11 @@ async def test_stdout_reader_ignores_remote_event_during_stop() -> None:
         finally:
             release_close.set()
             output.feed_eof()
-            await asyncio.gather(stream._stdout_reader_task, stop_task, return_exceptions=True)
+            results = await asyncio.gather(
+                stream._stdout_reader_task, stop_task, return_exceptions=True
+            )
+            assert not isinstance(results[1], BaseException)
+            assert stream._cleanup_complete
 
 
 def test_command_pipe_paths_are_unique_per_stream() -> None:

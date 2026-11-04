@@ -66,7 +66,13 @@ invalidatable delivery token through the FIFO writer: after its writer lock and 
 worker retries it must still match the owner, alongside the private-child receipt
 guard. This also covers startup and post-failure unknown state, which retains the
 pending transaction's ownership snapshot until delivery settles. Stops, reconnects and
-observed topology or ownership changes invalidate bindings. Retirement synchronously
+observed topology or ownership changes invalidate bindings. A retired generation resets
+its native request ordinal, so a replacement process may begin again at ordinal one.
+Cold Sendspin owners publish their stream before checked startup volume/mute commits;
+when the final member of that Sendspin group publishes, only unresolved members of that
+group retry their current volume/mute state. Stream teardown marks the stream stopping
+before awaiting backend cleanup, so delayed remote events cannot dispatch commands.
+Retirement synchronously
 detaches dependencies and sends the retired binding's captured-generation `UNBIND`
 without consulting a replacement binding; the CLI ignores an UNBIND for another
 generation. Binding delivery is transactional: cancellation
