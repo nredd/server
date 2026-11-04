@@ -100,6 +100,28 @@ async def test_legacy_credentials_fail_closed(key: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "key",
+    [
+        "companion_credentials",
+        "mrp_credentials",
+        "native_mrp_credentials",
+        "raop_credentials",
+        "airplay_credentials",
+        "password",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("", True), (False, False), (0, False), ([], False), ({}, False)],
+)
+async def test_legacy_credential_value_types(key: str, value: object, expected: bool) -> None:
+    """Only null and empty strings count as absent credentials."""
+    provider, _, _ = _provider({PLAYER_ID: {"values": {key: value}}})
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["credentials_absent"] is expected
+
+
+@pytest.mark.parametrize(
     "values",
     [
         {"min_volume": False},
@@ -126,6 +148,18 @@ async def test_target_and_streams_fail_closed() -> None:
     assert result["target_unset"] is False
     assert result["no_current_streams"] is False
     mass.config.set.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [(SimpleNamespace(value="set"), False), (None, False), (SimpleNamespace(value=None), True)],
+)
+async def test_memory_target_state(entry: SimpleNamespace | None, expected: bool) -> None:
+    """The raw reset is insufficient without a matching in-memory target entry."""
+    provider, mass, _ = _provider({})
+    mass.discovery.config.values = {} if entry is None else {"private_trial_target": entry}
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["target_unset"] is expected
 
 
 async def test_missing_raw_target_fails_closed() -> None:
