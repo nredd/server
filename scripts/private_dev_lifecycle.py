@@ -461,6 +461,7 @@ def arm_watchdog(root: Path, run_id: str, timeout: float, *, self_test: bool = F
                     "run_id": snapshot.run_id,
                     "nonce": snapshot.nonce,
                     "deadline": time.time() + timeout,
+                    "monotonic_deadline": time.monotonic() + timeout,
                 },
             )
             if self_test:
@@ -506,10 +507,16 @@ def watchdog(root: Path, run_id: str, transport: Transport | None = None) -> Non
     """
     run_dir, snapshot = load_snapshot(root, run_id)
     watch = _load_watchdog(run_dir, snapshot)
-    # The wall-clock deadline is converted once so a clock step cannot stretch the wait.
+    # New leases persist their monotonic deadline so all same-boot consumers share one
+    # immutable budget. Legacy leases retain their one-time wall-clock conversion.
     # Sleep in slices so a manual `stop` that already verified this run releases the
     # application-wide lease early instead of holding it until the deadline.
-    deadline = time.monotonic() + (watch["deadline"] - time.time())
+    monotonic_deadline = watch.get("monotonic_deadline")
+    deadline = (
+        monotonic_deadline
+        if monotonic_deadline is not None
+        else time.monotonic() + (watch["deadline"] - time.time())
+    )
     while (delay := deadline - time.monotonic()) > 0:
         if _has_verified_receipt(run_dir, snapshot):
             return
@@ -965,12 +972,25 @@ def _load_watchdog(run_dir: Path, snapshot: Snapshot) -> dict[str, Any]:
     """Validate the deadline and nonce belonging to this exact armed run."""
     value = _read_private_json(run_dir / "watchdog.json", "watchdog state")
     if (
-        set(value) != {"run_id", "nonce", "deadline"}
+        not isinstance(value, dict)
+        or set(value)
+        not in (
+            {"run_id", "nonce", "deadline"},
+            {"run_id", "nonce", "deadline", "monotonic_deadline"},
+        )
         or value["run_id"] != snapshot.run_id
         or value["nonce"] != snapshot.nonce
         or type(value["deadline"]) not in (int, float)
         or not math.isfinite(value["deadline"])
         or value["deadline"] > time.time() + MAX_WATCHDOG_TIMEOUT
+        or (
+            "monotonic_deadline" in value
+            and (
+                type(value["monotonic_deadline"]) not in (int, float)
+                or not math.isfinite(value["monotonic_deadline"])
+                or value["monotonic_deadline"] > time.monotonic() + MAX_WATCHDOG_TIMEOUT
+            )
+        )
     ):
         raise LifecycleError("watchdog does not own this lifecycle run")
     return value
