@@ -3806,6 +3806,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         :param player_ids_to_remove: List of player_id's to remove from the parent player.
         :param new_content: Set when the caller is about to publish new content, so the
             protocol owner can clear its stale metadata before the member joins.
+        :param explicit_power: Members are being added by an explicit group power command.
         :return: The opened takeover transaction as a ``(owner, token)`` pair, or None
             when there is nothing to finish. On success the caller owns the returned
             transaction and must call ``on_group_content_takeover_finished`` or

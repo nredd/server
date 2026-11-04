@@ -8,8 +8,9 @@ binary-path setting, downloader, image distribution or production deployment pro
 
 On the private trial target, Apple TV playback and automatic group capture do not issue
 power-on commands. Explicit player or group power-on and explicit wake still work, and the
-reported receiver power state is not changed to simulate a wake. Other AirPlay devices and
-non-trial installations retain automatic power-on. Playback may still fail if the TV is asleep.
+reported receiver power state is not changed to simulate a wake. Adding a member to a group
+is not an explicit power command and does not wake it. Other AirPlay devices and non-trial
+installations retain automatic power-on. Playback may still fail if the TV is asleep.
 
 ## Pins and scope
 
