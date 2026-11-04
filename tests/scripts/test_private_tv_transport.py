@@ -57,14 +57,21 @@ class FakeStopGuard:
 class FakeApi:
     """Record supported MA API calls without a real server or credential."""
 
-    def __init__(self, *, fetch: str | None = None) -> None:
-        """Keep an optional exact local URL which simulates MA's single fetch."""
+    def __init__(
+        self, *, fetch: str | None = None, fetches: int = 1, play_delay: float = 0.0
+    ) -> None:
+        """Keep an optional exact local URL which simulates MA's fetches on play."""
         self.fetch = fetch
+        self.fetches = fetches
+        self.play_delay = play_delay
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.stops: list[tuple[float, float]] = []
 
     def command(self, command: str, args: dict[str, Any], timeout: float = 3.0) -> Any:
         """Return only the exact synthetic player inventory."""
         self.calls.append((command, args))
+        if command == "players/cmd/stop":
+            self.stops.append((time.monotonic(), timeout))
         if command == "players/all":
             return [
                 {
@@ -72,12 +79,14 @@ class FakeApi:
                     "device_info": {"manufacturer": "Apple", "model": "Apple TV 4K"},
                 }
             ]
-        if command == "player_queues/play_media" and self.fetch:
-            parsed = urlsplit(self.fetch)
-            connection = HTTPConnection(parsed.netloc, timeout=1)
-            connection.request("GET", parsed.path)
-            connection.getresponse().read()
-            connection.close()
+        if command == "player_queues/play_media":
+            time.sleep(self.play_delay)
+            for _ in range(self.fetches if self.fetch else 0):
+                parsed = urlsplit(self.fetch or "")
+                connection = HTTPConnection(parsed.netloc, timeout=1)
+                connection.request("GET", parsed.path)
+                connection.getresponse().read()
+                connection.close()
         return {}
 
 
@@ -90,6 +99,22 @@ def test_stimulus_is_deterministic_and_exactly_finite() -> None:
     assert first.payload[:4] == b"RIFF"
 
 
+@pytest.fixture
+def short_budget(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Shrink the observation window, keeping the reserved stop interval real."""
+    observation = 0.5
+    monkeypatch.setattr(transport, "STOP_BUDGET_SECONDS", observation + HTTP_TIMEOUT_SECONDS)
+    return observation
+
+
+def test_default_budget_observes_the_whole_wave_and_reserves_stop() -> None:
+    """Pin the documented window: 4s wave plus slack, then one full HTTP stop interval."""
+    wave_seconds = transport.TONE_SECONDS + transport.SILENCE_SECONDS
+    assert wave_seconds + 2 <= transport.OBSERVATION_SECONDS
+    assert transport.STOP_BUDGET_SECONDS == transport.OBSERVATION_SECONDS + HTTP_TIMEOUT_SECONDS
+
+
+@pytest.mark.usefixtures("short_budget")
 def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
     """Constrain one accepted play request to the generated endpoint and always stop."""
     stimulus = generate_stimulus()
@@ -103,7 +128,7 @@ def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
     finally:
         server.close()
     assert receipt.outcome == "INCOMPLETE"
-    assert receipt.fetched is True
+    assert receipt.completed_fetches == 1
     assert receipt.ma_play_request_accepted is True
     assert receipt.ma_stop_requested is True
     assert receipt.child_connected is None
@@ -119,6 +144,138 @@ def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
     assert guard.calls[0][0] == "ap021122334455"
 
 
+def test_early_and_repeated_fetches_do_not_shorten_observation(short_budget: float) -> None:
+    """Keep observing after a metadata-style first fetch until the reserved stop point."""
+    stimulus = generate_stimulus()
+    server = StimulusServer("127.0.0.1", stimulus)
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/stimulus.wav"
+        api = FakeApi(fetch=url, fetches=3)
+        started = time.monotonic()
+        receipt = run_once(tv_scope(), api, url, server, stimulus, stop_guard=FakeStopGuard())
+    finally:
+        server.close()
+    assert receipt.completed_fetches == 3
+    assert receipt.outcome == "INCOMPLETE"
+    assert receipt.error is None
+    assert len(api.stops) == 1
+    stopped_at, timeout = api.stops[0]
+    assert stopped_at - started >= short_budget
+    assert timeout <= HTTP_TIMEOUT_SECONDS
+
+
+def test_slow_play_response_still_leaves_the_stop_interval(short_budget: float) -> None:
+    """A play call that eats the observation window must not skip or lengthen the stop."""
+    stimulus = generate_stimulus()
+    server = StimulusServer("127.0.0.1", stimulus)
+    server.start()
+    try:
+        api = FakeApi(play_delay=short_budget + 0.2)
+        started = time.monotonic()
+        receipt = run_once(
+            tv_scope(),
+            api,
+            f"http://127.0.0.1:{server.port}/stimulus.wav",
+            server,
+            stimulus,
+            stop_guard=FakeStopGuard(),
+        )
+    finally:
+        server.close()
+    assert receipt.ma_stop_requested is True
+    stopped_at, timeout = api.stops[0]
+    assert timeout < HTTP_TIMEOUT_SECONDS
+    assert stopped_at - started <= short_budget + HTTP_TIMEOUT_SECONDS
+
+
+def test_expired_stop_budget_is_an_error_not_a_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the budget is gone the parent records failure instead of a late stop."""
+    monkeypatch.setattr(transport, "HTTP_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(transport, "STOP_BUDGET_SECONDS", 0.3)
+    stimulus = generate_stimulus()
+    api = FakeApi(play_delay=0.4)
+    receipt = run_once(
+        tv_scope(),
+        api,
+        "http://127.0.0.1:9/stimulus.wav",
+        StimulusServer("127.0.0.1", stimulus),
+        stimulus,
+        stop_guard=FakeStopGuard(),
+    )
+    assert receipt.ma_stop_requested is False
+    assert receipt.error == "stop budget expired"
+    assert api.stops == []
+
+
+@pytest.mark.usefixtures("short_budget")
+def test_cancel_during_observation_still_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt mid-window propagates but the finally block still requests stop."""
+    stimulus = generate_stimulus()
+    api = FakeApi()
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_once(
+            tv_scope(),
+            api,
+            "http://127.0.0.1:9/stimulus.wav",
+            StimulusServer("127.0.0.1", stimulus),
+            stimulus,
+            stop_guard=FakeStopGuard(),
+        )
+    assert api.calls[-1] == ("players/cmd/stop", {"player_id": "ap021122334455"})
+
+
+def test_arming_failure_is_error_and_never_plays() -> None:
+    """A watchdog that cannot arm fails closed before any play request."""
+
+    class BrokenGuard:
+        def arm(self, player: str, deadline: float) -> None:
+            raise TransportError("could not arm independent stop watchdog")
+
+    stimulus = generate_stimulus()
+    api = FakeApi()
+    receipt = run_once(
+        tv_scope(),
+        api,
+        "http://127.0.0.1:9/stimulus.wav",
+        StimulusServer("127.0.0.1", stimulus),
+        stimulus,
+        stop_guard=BrokenGuard(),
+    )
+    assert receipt.error == "could not arm independent stop watchdog"
+    assert all(command != "player_queues/play_media" for command, _ in api.calls)
+    assert receipt.ma_play_request_accepted is False
+
+
+@pytest.mark.usefixtures("short_budget")
+def test_stop_failure_is_recorded_after_full_observation() -> None:
+    """A failed final stop keeps the error and never reports a stop request."""
+
+    class FailingStop(FakeApi):
+        def command(self, command: str, args: dict[str, Any], timeout: float = 3.0) -> Any:
+            if command == "players/cmd/stop":
+                raise TransportError("stop failed")
+            return super().command(command, args, timeout)
+
+    stimulus = generate_stimulus()
+    receipt = run_once(
+        tv_scope(),
+        FailingStop(),
+        "http://127.0.0.1:9/stimulus.wav",
+        StimulusServer("127.0.0.1", stimulus),
+        stimulus,
+        stop_guard=FakeStopGuard(),
+    )
+    assert receipt.ma_stop_requested is False
+    assert receipt.error == "stop failed"
+
+
+@pytest.mark.usefixtures("short_budget")
 def test_missing_fetch_is_incomplete_but_still_stops() -> None:
     """Never promote an accepted MA command into playback evidence without a fetch."""
     stimulus = generate_stimulus()
@@ -136,7 +293,7 @@ def test_missing_fetch_is_incomplete_but_still_stops() -> None:
     finally:
         server.close()
     assert receipt.outcome == "INCOMPLETE"
-    assert receipt.fetched is False
+    assert receipt.completed_fetches == 0
     assert receipt.ma_stop_requested is True
 
 
@@ -199,8 +356,13 @@ def test_slow_drip_api_response_cannot_extend_total_timeout() -> None:
         server.server_close()
 
 
-def test_independent_watchdog_stops_after_slow_play_response() -> None:
+def test_independent_watchdog_stops_after_slow_play_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Keep the stop delivery independent from a slow accepted playback response."""
+    # The parent's play timeout is 3s, so a watchdog stop at T+2 is provably earlier
+    # than any parent cleanup.
+    monkeypatch.setattr(transport, "STOP_BUDGET_SECONDS", 2 + HTTP_TIMEOUT_SECONDS)
     stopped = threading.Event()
     stopped_at: list[float] = []
 
@@ -267,7 +429,7 @@ def test_independent_watchdog_stops_after_slow_play_response() -> None:
         )
         assert receipt.ma_play_request_accepted is False
         assert stopped.wait(2)
-        assert stopped_at[0] - started < HTTP_TIMEOUT_SECONDS
+        assert 1.5 <= stopped_at[0] - started < HTTP_TIMEOUT_SECONDS
     finally:
         source.close()
         server.shutdown()
@@ -275,6 +437,7 @@ def test_independent_watchdog_stops_after_slow_play_response() -> None:
         server.server_close()
 
 
+@pytest.mark.usefixtures("short_budget")
 def test_main_returns_incomplete_for_clean_source_and_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -316,9 +479,13 @@ def test_main_returns_incomplete_for_clean_source_and_stop(
     )
 
     assert result == 2
-    assert json.loads(capsys.readouterr().out)["outcome"] == "INCOMPLETE"
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["outcome"] == "INCOMPLETE"
+    assert receipt["schema_version"] == 2
+    assert receipt["completed_fetches"] == 0
 
 
+@pytest.mark.usefixtures("short_budget")
 def test_main_returns_failure_when_cleanup_records_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

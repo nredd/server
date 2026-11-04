@@ -4,7 +4,7 @@ Run one bounded private TV RAOP transport experiment.
 The controller deliberately uses Music Assistant's supported authenticated API.  It is
 private trial tooling, not an AirPlay provider feature or receiver acceptance oracle.
 It serves a deterministic finite WAV stimulus, performs one play request, and arms an
-independent unconditional stop request within a five-second monotonic budget.
+independent unconditional stop request within a nine-second monotonic budget.
 
 References:
 - https://music-assistant.io/
@@ -53,8 +53,11 @@ TONE_SECONDS = 3
 SILENCE_SECONDS = 1
 AMPLITUDE = 10 ** (-45 / 20)
 FREQUENCY_HZ = 440
-STOP_BUDGET_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 3.0
+# Observation window: the 4s wave plus 2s for MA's play latency, any metadata probe fetch,
+# and receiver start. The final HTTP_TIMEOUT_SECONDS stay reserved for the stop request.
+OBSERVATION_SECONDS = 6.0
+STOP_BUDGET_SECONDS = OBSERVATION_SECONDS + HTTP_TIMEOUT_SECONDS
 MAX_RESPONSE_BYTES = 64 * 1024
 
 
@@ -96,7 +99,7 @@ class Receipt(BaseModel):
     target_player: str
     stimulus_sha256: str
     stimulus_bytes: int
-    fetched: bool
+    completed_fetches: int
     ma_play_request_accepted: bool
     ma_stop_requested: bool
     child_route: str | None
@@ -248,7 +251,8 @@ class StimulusServer:
         """Bind an ephemeral private HTTP source for exactly one stimulus payload."""
         _ipv4(bind, "bind address")
         self._stimulus = stimulus
-        self._fetched = threading.Event()
+        self._completed_fetches = 0
+        self._lock = threading.Lock()
         controller = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -262,7 +266,7 @@ class StimulusServer:
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(controller._stimulus.payload)
-                controller._fetched.set()
+                controller._record_completed_fetch()
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -277,9 +281,10 @@ class StimulusServer:
         return int(self._server.server_port)
 
     @property
-    def fetched(self) -> bool:
-        """Return whether a requester fetched the exact content endpoint."""
-        return self._fetched.is_set()
+    def completed_fetches(self) -> int:
+        """Return how many requests had the whole payload written to the socket."""
+        with self._lock:
+            return self._completed_fetches
 
     def start(self) -> None:
         """Start the bounded local source server."""
@@ -292,6 +297,11 @@ class StimulusServer:
             self._server.shutdown()
             self._thread.join(timeout=HTTP_TIMEOUT_SECONDS)
         self._server.server_close()
+
+    def _record_completed_fetch(self) -> None:
+        """Count one request whose full response body was handed to the socket."""
+        with self._lock:
+            self._completed_fetches += 1
 
 
 def run_once(
@@ -309,12 +319,12 @@ def run_once(
     if not advertised_url.startswith("http://"):
         raise TransportError("stimulus URL must be explicit HTTP")
     receipt = Receipt(
-        schema_version=1,
+        schema_version=2,
         outcome="INCOMPLETE",
         target_player=scope.player,
         stimulus_sha256=stimulus.sha256,
         stimulus_bytes=len(stimulus.payload),
-        fetched=False,
+        completed_fetches=0,
         ma_play_request_accepted=False,
         ma_stop_requested=False,
         child_route=None,
@@ -339,12 +349,12 @@ def run_once(
             {"queue_id": scope.player, "media": advertised_url, "option": "replace"},
         )
         receipt.ma_play_request_accepted = True
-        # Reserve a full bounded HTTP call for STOP: waiting for a fetch must never
-        # consume the only interval in which the unconditional stop can be delivered.
-        while time.monotonic() < stop_deadline - HTTP_TIMEOUT_SECONDS and not server.fetched:
+        # Observe the whole window, however early a fetch lands: the first fetch may be
+        # a metadata probe. Reserve a full bounded HTTP call for STOP so observing never
+        # consumes the only interval in which the unconditional stop can be delivered.
+        while time.monotonic() < stop_deadline - HTTP_TIMEOUT_SECONDS:
             time.sleep(0.02)
-        receipt.fetched = server.fetched
-        # A fetch is only a source-server fact, never proof of receiver transport.
+        # Fetches are source-server facts, never proof of receiver transport.
     except TransportError as err:
         receipt.error = str(err)
     finally:
@@ -360,8 +370,8 @@ def run_once(
             except TransportError as err:
                 receipt.error = receipt.error or str(err)
         elif stop_deadline is not None:
-            receipt.error = receipt.error or "five-second stop budget expired"
-        receipt.fetched = server.fetched
+            receipt.error = receipt.error or "stop budget expired"
+        receipt.completed_fetches = server.completed_fetches
     return receipt
 
 
@@ -489,12 +499,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (OSError, ValueError, TransportError) as err:
         receipt = Receipt(
-            schema_version=1,
+            schema_version=2,
             outcome="FAILED",
             target_player="unknown",
             stimulus_sha256="",
             stimulus_bytes=0,
-            fetched=False,
+            completed_fetches=0,
             ma_play_request_accepted=False,
             ma_stop_requested=False,
             child_route=None,
