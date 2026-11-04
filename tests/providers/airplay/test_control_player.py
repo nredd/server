@@ -579,6 +579,7 @@ def test_implicit_writes_are_blocked_only_for_the_trial_apple_tv(
     player, _device = trial_tv(model=model, trial=trial)
 
     assert player.implicit_receiver_writes_blocked is blocked
+    assert player.allow_implicit_power_on is not blocked
 
 
 @pytest.mark.parametrize(("model", "trial"), [("Apple TV 4K", False), ("HomePod", True)])

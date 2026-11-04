@@ -1129,7 +1129,19 @@ class TestPowerLifecycle:
         ):
             await sgp.power(True)
 
-        form.assert_awaited_once_with(new_content=False)
+        form.assert_awaited_once_with(new_content=False, explicit_power=True)
+
+    async def test_automatic_power_does_not_mark_members_explicit(self) -> None:
+        """Power-on for playback must not become an explicit member wake."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        sgp._attr_group_members = ["leader"]
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "_form_syncgroup", new=AsyncMock()) as form,
+        ):
+            await sgp.power_for_playback()
+        form.assert_awaited_once_with(new_content=False, explicit_power=False)
         assert sgp._attr_powered is True
 
     @pytest.mark.asyncio

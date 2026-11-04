@@ -394,7 +394,7 @@ async def _execute_input_source(
     if _has_feature(p_state, "power"):
         powered = getattr(p_state, "powered", None)
         if powered is False:
-            await mass.players.cmd_power(player_id, True)
+            await mass.players.cmd_power_for_playback(player_id)
     await play_playlist(mass, player_id, target)
     return None
 

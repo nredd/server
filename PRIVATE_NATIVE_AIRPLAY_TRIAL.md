@@ -4,6 +4,13 @@ NOT ready to deploy. NEVER include this overlay, its tests or this runbook in th
 native-controls feature PR. This is deliberate private source selection, not a supported
 binary-path setting, downloader, image distribution or production deployment procedure.
 
+## Implicit receiver power
+
+On the private trial target, Apple TV playback and automatic group capture do not issue
+power-on commands. Explicit player or group power-on and explicit wake still work, and the
+reported receiver power state is not changed to simulate a wake. Other AirPlay devices and
+non-trial installations retain automatic power-on. Playback may still fail if the TV is asleep.
+
 ## Pins and scope
 
 `private-native-airplay-trial-pin.json` records the accepted CLI source SHA, ELF digest,

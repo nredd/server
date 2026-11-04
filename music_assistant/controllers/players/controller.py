@@ -917,6 +917,15 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         async with lock:
             await self._handle_cmd_power(player_id, powered)
 
+    @handle_player_command
+    async def cmd_power_for_playback(self, player_id: str) -> None:
+        """Power on for playback without waking receivers that forbid implicit power."""
+        async with self.get_player_lock(player_id, PlayerLockPurpose.PLAYBACK):
+            player = self.get_player(player_id, raise_unavailable=True)
+            assert player is not None
+            if player.allow_implicit_power_on:
+                await self._handle_cmd_power(player_id, True, automatic=True)
+
     @api_command("players/cmd/volume_set", required_scope=Scope.PLAYERS_CONTROL)
     @handle_player_command
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
@@ -3785,6 +3794,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         player_ids_to_remove: list[str] | None = None,
         *,
         new_content: bool = False,
+        explicit_power: bool = False,
     ) -> tuple[Player, object] | None:
         """
         Handle the actual set_members logic.
@@ -3898,9 +3908,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             # power on the player if needed
             if (
                 not child_player.state.powered
+                and (explicit_power or child_player.allow_implicit_power_on)
                 and child_player.state.power_control != PLAYER_CONTROL_NONE
             ):
-                await self._handle_cmd_power(child_player.player_id, True)
+                await self._handle_cmd_power(
+                    child_player.player_id, True, automatic=not explicit_power
+                )
             # if we reach here, all checks passed
             final_player_ids_to_add.append(child_player_id)
 
@@ -4232,8 +4245,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         source = source or player.state.active_source
         media = media or player.state.current_media
         # power on the player if needed
-        if not player.state.powered and player.state.power_control != PLAYER_CONTROL_NONE:
-            await self._handle_cmd_power(player.player_id, True)
+        if (
+            not player.state.powered
+            and player.allow_implicit_power_on
+            and player.state.power_control != PLAYER_CONTROL_NONE
+        ):
+            await self._handle_cmd_power(player.player_id, True, automatic=True)
         # Redirect to queue controller if it is active
         if active_queue := self.mass.player_queues.get(source or player_id):
             await self.mass.player_queues.resume(active_queue.queue_id)
@@ -4261,7 +4278,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         await self.mass.player_queues.resume(player.player_id)
 
     async def _handle_cmd_power(
-        self, player_id: str, powered: bool, skip_auto_play: bool = False
+        self,
+        player_id: str,
+        powered: bool,
+        skip_auto_play: bool = False,
+        *,
+        automatic: bool = False,
     ) -> None:
         """
         Handle player power on/off command.
@@ -4271,6 +4293,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         :param player_id: The player ID to power on/off.
         :param powered: True to power on, False to power off.
         :param skip_auto_play: If True, skip auto-play on power on.
+        :param automatic: Power-on is a side effect of playback or grouping.
         """
         player = self.get_player(player_id, True)
         assert player is not None  # for type checking
@@ -4322,7 +4345,10 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             return
         if player_state.power_control == PLAYER_CONTROL_NATIVE:
             # player supports power command natively: forward to player provider
-            await player.power(powered)
+            if powered and automatic:
+                await player.power_for_playback()
+            else:
+                await player.power(powered)
             if powered:
                 await wait_for_power_on(self.logger, player)
         elif player_state.power_control == PLAYER_CONTROL_FAKE:
@@ -4333,7 +4359,10 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             # user toggles fake power — otherwise the toggle would only update the
             # cosmetic state without ever capturing or releasing the members.
             if player_state.type == PlayerType.GROUP:
-                await player.power(powered)
+                if powered and automatic:
+                    await player.power_for_playback()
+                else:
+                    await player.power(powered)
             player.update_state()  # trigger update of the player state
             if player_state.type != PlayerType.GROUP:
                 # see register(): group fake-power is intentionally not persisted
@@ -4715,8 +4744,14 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
 
         async with player.prepare_play_media():
             # power on the player if needed (skip auto-play since we're about to start playback)
-            if not player.state.powered and player.state.power_control != PLAYER_CONTROL_NONE:
-                await self._handle_cmd_power(player.player_id, True, skip_auto_play=True)
+            if (
+                not player.state.powered
+                and player.allow_implicit_power_on
+                and player.state.power_control != PLAYER_CONTROL_NONE
+            ):
+                await self._handle_cmd_power(
+                    player.player_id, True, skip_auto_play=True, automatic=True
+                )
             await target_player.play_media(media)
             if target_player.player_id != player.player_id:
                 # notify the native player that protocol playback started
@@ -5169,8 +5204,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         )
         media = player.state.current_media
         # power on the player if needed
-        if not player.state.powered and player.state.power_control != PLAYER_CONTROL_NONE:
-            await self._handle_cmd_power(player.player_id, True)
+        if (
+            not player.state.powered
+            and player.allow_implicit_power_on
+            and player.state.power_control != PLAYER_CONTROL_NONE
+        ):
+            await self._handle_cmd_power(player.player_id, True, automatic=True)
         if active_source and not active_source.passive:
             await self._handle_select_source(player_id, active_source.id)
             return

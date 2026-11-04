@@ -866,10 +866,19 @@ class Player(ABC):
         """
         return self._attr_supported_sample_rates
 
+    @property
+    def allow_implicit_power_on(self) -> bool:
+        """Return whether playback and grouping may automatically power on this player."""
+        return True
+
     @asynccontextmanager
     async def prepare_play_media(self) -> AsyncIterator[None]:
         """Scope provider preparation across auto-power and the ensuing playback."""
         yield
+
+    async def power_for_playback(self) -> None:
+        """Power on automatically for playback or grouping."""
+        await self.power(True)
 
     async def power(self, powered: bool) -> None:
         """

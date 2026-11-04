@@ -34,6 +34,7 @@ def _make_mock_mass() -> MagicMock:
     mass.players._handle_cmd_stop = AsyncMock()
     mass.players._handle_play_media = AsyncMock()
     mass.players.cmd_power = AsyncMock()
+    mass.players.cmd_power_for_playback = AsyncMock()
     mass.players.iter_group_members = MagicMock(return_value=[])
 
     lock_ctx = AsyncMock()
@@ -132,6 +133,25 @@ def _make_mock_player(
     player.state.elapsed_time_last_updated = None
     player.ungroup = AsyncMock()
     return player
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_group_capture_power_provenance(automatic: bool, allowed: bool) -> None:
+    """Explicit group power remains explicit; playback respects the member policy."""
+    mass = _make_mock_mass()
+    group = _make_ugp(mass)
+    member = _make_mock_player("tv", powered=False)
+    member.allow_implicit_power_on = allowed
+    mass.players.iter_group_members.return_value = [member]
+
+    if automatic:
+        await group.power_for_playback()
+    else:
+        await group.power(True)
+
+    assert mass.players.cmd_power.await_count == int(not automatic)
+    assert mass.players.cmd_power_for_playback.await_count == int(automatic and allowed)
 
 
 async def test_config_members_exclude_groups_and_unknown_players() -> None:

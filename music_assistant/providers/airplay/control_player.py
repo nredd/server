@@ -176,6 +176,11 @@ class AirPlayControlPlayer(AirPlayPlayer):
         return trial_binary.is_trial_target() and self._is_apple_tv_device
 
     @property
+    def allow_implicit_power_on(self) -> bool:
+        """Keep automatic playback and grouping from waking a private trial TV."""
+        return not self.implicit_receiver_writes_blocked
+
+    @property
     def companion_pairing_supported(self) -> bool:
         """Return whether this device advertises Companion PIN pairing."""
         return supports_companion_pairing(self.companion_discovery_info)
