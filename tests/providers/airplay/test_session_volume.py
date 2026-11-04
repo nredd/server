@@ -6,10 +6,11 @@ import asyncio
 import os
 import sys
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import AsyncExitStack, ExitStack, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Self, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,6 +23,7 @@ from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.players.constants import PlayerLockPurpose
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
+from music_assistant.providers.airplay import session_volume
 from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_EXPERIMENTAL_SESSION_VOLUME,
@@ -72,6 +74,8 @@ class VolumeRig:
     fail_member: int | None = None
     delay: asyncio.Event | None = None
     reached: asyncio.Event = field(default_factory=asyncio.Event)
+    patches: ExitStack = field(default_factory=ExitStack)
+    cleanup: AsyncExitStack = field(default_factory=AsyncExitStack)
 
     async def write(
         self, index: int, data: bytes, *, guard: Callable[[], bool] | None = None
@@ -109,14 +113,34 @@ class VolumeRig:
         assert backend._runner is not None
         await backend._runner
 
+    def use_offline_timeouts(self) -> None:
+        """Disable only this fixture's transaction wall-clock budget."""
+        scoped_asyncio = SimpleNamespace(vars(asyncio) | {"timeout": _offline_timeout})
+        self.patches.enter_context(patch.object(session_volume, "asyncio", scoped_asyncio))
+
+    async def open_fifo(self, directory: Path) -> tuple[AsyncNamedPipeWriter, int]:
+        """Create a real command FIFO and reader whose cleanup is owned by `close()`."""
+        writer = AsyncNamedPipeWriter(str(directory / "commands"))
+        self.cleanup.push_async_callback(writer.remove)
+        await writer.create()
+        reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.cleanup.callback(os.close, reader)
+        return writer, reader
+
     async def close(self) -> None:
-        """Detach callbacks and settle locally scheduled feedback."""
-        for stream in self.streams:
-            await stream.session_volume.close()
-        await asyncio.sleep(0)
+        """Release owned FIFOs, detach callbacks and settle locally scheduled feedback."""
+        try:
+            try:
+                await self.cleanup.aclose()
+            finally:
+                for stream in self.streams:
+                    await stream.session_volume.close()
+                await asyncio.sleep(0)
+        finally:
+            self.patches.close()
 
 
-def make_rig(count: int = 2) -> VolumeRig:
+def make_rig(count: int = 2, *, real_deadlines: bool = False) -> VolumeRig:
     """Build a real native sync group without starting playback or contacting devices."""
     mass = MagicMock()
     mass.closing = False
@@ -176,7 +200,17 @@ def make_rig(count: int = 2) -> VolumeRig:
         )
     for stream in streams:
         stream.session_volume._receipt_snapshot = stream.session_volume.snapshot()
+    if not real_deadlines:
+        # These fixtures test receipts, routing and balance, not physical elapsed time.
+        # Replace only this module's asyncio reference, never asyncio.timeout globally.
+        # Explicit deadline tests opt out and retain the real cancellation machinery.
+        rig.use_offline_timeouts()
     return rig
+
+
+def _offline_timeout(_delay: float | None) -> asyncio.Timeout:
+    """Keep real cancellation semantics without a wall-clock timer in non-timing tests."""
+    return asyncio.timeout(None)
 
 
 @pytest.mark.parametrize(
@@ -329,7 +363,7 @@ async def test_owner_changed_while_waiting_for_real_lock(purpose: PlayerLockPurp
 
 async def test_late_completion_after_takeover_is_never_success() -> None:
     """A receipt cannot revive a stale stream even if the device accepted the command."""
-    rig = make_rig(1)
+    rig = make_rig(1, real_deadlines=True)
     try:
         await rig.bind()
         rig.delay = asyncio.Event()
@@ -563,40 +597,38 @@ async def test_retired_pending_snapshot_cannot_poison_successor_transaction(
 ) -> None:
     """A stale event cannot retire the successor waiting behind an old FIFO write."""
     rig = make_rig(1)
-    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    await writer.create()
-    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
-    stream = rig.streams[0]
-    backend = stream.session_volume
-    lock = ObservedLock()
-    monkeypatch.setattr(backend, "_actuator_lock", lock)
-    stream.commands_pipe = writer
-    reached = asyncio.Event()
-    release = asyncio.Event()
-    write_atomic = writer.write_atomic
-    writes = 0
-
-    async def write_with_delayed_old_transaction(
-        data: bytes, *, guard: Callable[[], bool] | None = None
-    ) -> bool:
-        nonlocal writes
-        writes += 1
-        if writes == 1:
-            reached.set()
-            await release.wait()
-        delivered = await write_atomic(data, guard=guard)
-        if delivered:
-            fields = dict(
-                line.split("=", 1) for line in os.read(reader, 4096).decode().splitlines()
-            )
-            backend.handle_stdout(
-                f"[EVENT] stream_volume_result generation={fields['STREAM_VOLUME_GENERATION']} "
-                f"ordinal={fields['STREAM_VOLUME_ORDINAL']} status=committed level=80"
-            )
-        return delivered
-
-    monkeypatch.setattr(writer, "write_atomic", write_with_delayed_old_transaction)
     try:
+        writer, reader = await rig.open_fifo(tmp_path)
+        stream = rig.streams[0]
+        backend = stream.session_volume
+        lock = ObservedLock()
+        monkeypatch.setattr(backend, "_actuator_lock", lock)
+        stream.commands_pipe = writer
+        reached = asyncio.Event()
+        release = asyncio.Event()
+        write_atomic = writer.write_atomic
+        writes = 0
+
+        async def write_with_delayed_old_transaction(
+            data: bytes, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                reached.set()
+                await release.wait()
+            delivered = await write_atomic(data, guard=guard)
+            if delivered:
+                fields = dict(
+                    line.split("=", 1) for line in os.read(reader, 4096).decode().splitlines()
+                )
+                backend.handle_stdout(
+                    f"[EVENT] stream_volume_result generation={fields['STREAM_VOLUME_GENERATION']} "
+                    f"ordinal={fields['STREAM_VOLUME_ORDINAL']} status=committed level=80"
+                )
+            return delivered
+
+        monkeypatch.setattr(writer, "write_atomic", write_with_delayed_old_transaction)
         old = asyncio.create_task(backend.apply(80))
         await asyncio.wait_for(reached.wait(), 1)
         if retirement == "owner_changed":
@@ -612,15 +644,15 @@ async def test_retired_pending_snapshot_cannot_poison_successor_transaction(
         assert await successor == 80
         assert (backend._pending, backend._pending_snapshot) == (None, None)
     finally:
-        for task_name in ("old", "successor"):
-            task = locals().get(task_name)
-            if task is not None and not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-        os.close(reader)
-        await writer.remove()
-        await rig.close()
+        try:
+            for task_name in ("old", "successor"):
+                task = locals().get(task_name)
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            await rig.close()
 
 
 async def test_unknown_startup_state_retires_queued_transaction_on_membership_change(
@@ -628,30 +660,30 @@ async def test_unknown_startup_state_retires_queued_transaction_on_membership_ch
 ) -> None:
     """Unknown startup state still binds a queued checked write to its membership."""
     rig = make_rig()
-    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    await writer.create()
-    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
-    stream = rig.streams[0]
-    backend = stream.session_volume
-    backend._discard_receipt()
-    stream.commands_pipe = writer
-    queued = asyncio.Event()
-    delivered = asyncio.Event()
-    send = stream.send_cli_command
-    write_atomic = writer.write_atomic
-
-    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        queued.set()
-        return await send(command, guard=guard)
-
-    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
-        result = await write_atomic(data, guard=guard)
-        delivered.set()
-        return result
-
-    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
-    monkeypatch.setattr(writer, "write_atomic", record_delivery)
     try:
+        writer, reader = await rig.open_fifo(tmp_path)
+        stream = rig.streams[0]
+        backend = stream.session_volume
+        backend._discard_receipt()
+        stream.commands_pipe = writer
+        queued = asyncio.Event()
+        delivered = asyncio.Event()
+        send = stream.send_cli_command
+        write_atomic = writer.write_atomic
+
+        async def send_after_queue(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            queued.set()
+            return await send(command, guard=guard)
+
+        async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+            result = await write_atomic(data, guard=guard)
+            delivered.set()
+            return result
+
+        monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+        monkeypatch.setattr(writer, "write_atomic", record_delivery)
         async with writer._write_lock:
             transaction = asyncio.create_task(backend.apply(80))
             await asyncio.wait_for(queued.wait(), 1)
@@ -665,13 +697,13 @@ async def test_unknown_startup_state_retires_queued_transaction_on_membership_ch
             os.read(reader, 4096)
         assert backend.confirmed_level is None
     finally:
-        if "transaction" in locals() and not transaction.done():
-            transaction.cancel()
-            with suppress(asyncio.CancelledError):
-                await transaction
-        os.close(reader)
-        await writer.remove()
-        await rig.close()
+        try:
+            if "transaction" in locals() and not transaction.done():
+                transaction.cancel()
+                with suppress(asyncio.CancelledError):
+                    await transaction
+        finally:
+            await rig.close()
 
 
 async def test_current_checked_transaction_delivers_to_real_fifo(
@@ -679,28 +711,28 @@ async def test_current_checked_transaction_delivers_to_real_fifo(
 ) -> None:
     """A current checked transaction still reaches the FIFO after lock contention."""
     rig = make_rig(1)
-    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    await writer.create()
-    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
-    stream = rig.streams[0]
-    stream.commands_pipe = writer
-    queued = asyncio.Event()
-    delivered = asyncio.Event()
-    send = stream.send_cli_command
-    write_atomic = writer.write_atomic
-
-    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        queued.set()
-        return await send(command, guard=guard)
-
-    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
-        result = await write_atomic(data, guard=guard)
-        delivered.set()
-        return result
-
-    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
-    monkeypatch.setattr(writer, "write_atomic", record_delivery)
     try:
+        writer, reader = await rig.open_fifo(tmp_path)
+        stream = rig.streams[0]
+        stream.commands_pipe = writer
+        queued = asyncio.Event()
+        delivered = asyncio.Event()
+        send = stream.send_cli_command
+        write_atomic = writer.write_atomic
+
+        async def send_after_queue(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            queued.set()
+            return await send(command, guard=guard)
+
+        async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+            result = await write_atomic(data, guard=guard)
+            delivered.set()
+            return result
+
+        monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+        monkeypatch.setattr(writer, "write_atomic", record_delivery)
         async with writer._write_lock:
             transaction = asyncio.create_task(stream.session_volume.apply(80))
             await asyncio.wait_for(queued.wait(), 1)
@@ -712,13 +744,13 @@ async def test_current_checked_transaction_delivers_to_real_fifo(
         assert stream.session_volume._pending is None
         assert stream.session_volume._pending_snapshot is None
     finally:
-        if "transaction" in locals() and not transaction.done():
-            transaction.cancel()
-            with suppress(asyncio.CancelledError):
-                await transaction
-        os.close(reader)
-        await writer.remove()
-        await rig.close()
+        try:
+            if "transaction" in locals() and not transaction.done():
+                transaction.cancel()
+                with suppress(asyncio.CancelledError):
+                    await transaction
+        finally:
+            await rig.close()
 
 
 async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fifo(
@@ -726,28 +758,28 @@ async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fi
 ) -> None:
     """A retired owner cannot dispatch after the FIFO writer lock becomes available."""
     rig = make_rig(1)
-    writer = AsyncNamedPipeWriter(str(tmp_path / "commands"))
-    await writer.create()
-    reader = os.open(writer.path, os.O_RDONLY | os.O_NONBLOCK)
-    stream = rig.streams[0]
-    stream.commands_pipe = writer
-    queued = asyncio.Event()
-    delivered = asyncio.Event()
-    send = stream.send_cli_command
-    write_atomic = writer.write_atomic
-
-    async def send_after_queue(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        queued.set()
-        return await send(command, guard=guard)
-
-    async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
-        result = await write_atomic(data, guard=guard)
-        delivered.set()
-        return result
-
-    monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
-    monkeypatch.setattr(writer, "write_atomic", record_delivery)
     try:
+        writer, reader = await rig.open_fifo(tmp_path)
+        stream = rig.streams[0]
+        stream.commands_pipe = writer
+        queued = asyncio.Event()
+        delivered = asyncio.Event()
+        send = stream.send_cli_command
+        write_atomic = writer.write_atomic
+
+        async def send_after_queue(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            queued.set()
+            return await send(command, guard=guard)
+
+        async def record_delivery(data: bytes, *, guard: Callable[[], bool] | None = None) -> bool:
+            result = await write_atomic(data, guard=guard)
+            delivered.set()
+            return result
+
+        monkeypatch.setattr(stream, "send_cli_command", send_after_queue)
+        monkeypatch.setattr(writer, "write_atomic", record_delivery)
         async with writer._write_lock:
             command = asyncio.create_task(
                 rig.controller.cmd_volume_set(stream.player.player_id, 80)
@@ -773,42 +805,42 @@ async def test_owner_change_drops_ordinary_checked_transaction_queued_on_real_fi
         assert stream.session_volume._pending is None
         assert stream.session_volume._pending_snapshot is None
     finally:
-        if "command" in locals() and not command.done():
-            command.cancel()
-            with suppress(asyncio.CancelledError):
-                await command
-        os.close(reader)
-        await writer.remove()
-        await rig.close()
+        try:
+            if "command" in locals() and not command.done():
+                command.cancel()
+                with suppress(asyncio.CancelledError):
+                    await command
+        finally:
+            await rig.close()
 
 
 async def test_real_child_stdout_fifo_round_trip(tmp_path: Path) -> None:
     """Exercise real process/stdout/FIFO plus real controller, without a receiver or network."""
     rig = make_rig(1)
-    stream = rig.streams[0]
-    pipe = tmp_path / "commands"
-    stream.commands_pipe = AsyncNamedPipeWriter(str(pipe))
-    cast("MagicMock", stream.prov.config).get_value.return_value = True
-    capabilities_seen = asyncio.Event()
-    script = (
-        "import sys\n"
-        "print('[STATUS] session_volume version=1', flush=True)\n"
-        "print('[STATUS] capabilities live_metadata=1', flush=True)\n"
-        "print('[STATUS] connected', file=sys.stderr, flush=True)\n"
-        f"with open({str(pipe)!r}) as commands:\n"
-        " fields = {}\n"
-        " for line in commands:\n"
-        "  key, value = line.strip().split('=', 1)\n"
-        "  fields[key] = value\n"
-        "  if key != 'ACTION': continue\n"
-        "  if value == 'STREAM_VOLUME_APPLY':\n"
-        "   print('[EVENT] stream_volume_result generation=' + fields['STREAM_VOLUME_GENERATION']"
-        " + ' ordinal=' + fields['STREAM_VOLUME_ORDINAL'] + ' status=committed level='"
-        " + str(min(61, int(fields['STREAM_VOLUME_LEVEL']))), flush=True)\n"
-        "  if value == 'STOP': break\n"
-        "  fields = {}\n"
-    )
     try:
+        stream = rig.streams[0]
+        pipe = tmp_path / "commands"
+        stream.commands_pipe = AsyncNamedPipeWriter(str(pipe))
+        cast("MagicMock", stream.prov.config).get_value.return_value = True
+        capabilities_seen = asyncio.Event()
+        script = (
+            "import sys\n"
+            "print('[STATUS] session_volume version=1', flush=True)\n"
+            "print('[STATUS] capabilities live_metadata=1', flush=True)\n"
+            "print('[STATUS] connected', file=sys.stderr, flush=True)\n"
+            f"with open({str(pipe)!r}) as commands:\n"
+            " fields = {}\n"
+            " for line in commands:\n"
+            "  key, value = line.strip().split('=', 1)\n"
+            "  fields[key] = value\n"
+            "  if key != 'ACTION': continue\n"
+            "  if value == 'STREAM_VOLUME_APPLY':\n"
+            "   print('[EVENT] stream_volume_result generation=' + fields['STREAM_VOLUME_GENERATION']"
+            " + ' ordinal=' + fields['STREAM_VOLUME_ORDINAL'] + ' status=committed level='"
+            " + str(min(61, int(fields['STREAM_VOLUME_LEVEL']))), flush=True)\n"
+            "  if value == 'STOP': break\n"
+            "  fields = {}\n"
+        )
         with (
             patch.object(
                 stream,
@@ -829,6 +861,8 @@ async def test_real_child_stdout_fifo_round_trip(tmp_path: Path) -> None:
             await rig.request(630)
             assert stream.player.volume_level == 61
     finally:
-        await stream.stop(force=True)
-        await rig.close()
+        try:
+            await stream.stop(force=True)
+        finally:
+            await rig.close()
     assert not pipe.exists()

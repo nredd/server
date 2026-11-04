@@ -50,9 +50,9 @@ async def test_failed_bind_fences_generation_and_can_retry(
 ) -> None:
     """An uncertain bind cannot survive or reuse its generation on a retry."""
     rig = make_rig(1)
-    backend = rig.streams[0].session_volume
-    generation = backend.generation
     try:
+        backend = rig.streams[0].session_volume
+        generation = backend.generation
         with (
             patch.object(
                 rig.streams[0],
@@ -74,18 +74,18 @@ async def test_failed_bind_fences_generation_and_can_retry(
 async def test_bind_revalidates_owner_after_delivery() -> None:
     """An owner lost while binding cannot install dependencies or return success."""
     rig = make_rig(1)
-    stream = rig.streams[0]
-    backend = stream.session_volume
-    reached = asyncio.Event()
-    release = asyncio.Event()
-
-    async def delayed_write(_command: str) -> bool:
-        """Pause the real bind await boundary without performing any actuator work."""
-        reached.set()
-        await release.wait()
-        return True
-
     try:
+        stream = rig.streams[0]
+        backend = stream.session_volume
+        reached = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_write(_command: str) -> bool:
+            """Pause the real bind await boundary without performing any actuator work."""
+            reached.set()
+            await release.wait()
+            return True
+
         with patch.object(stream, "send_cli_command", side_effect=delayed_write):
             task = asyncio.create_task(backend.bind(b"offline-output", b"", verified_identity=True))
             await asyncio.wait_for(reached.wait(), 1)
@@ -97,5 +97,7 @@ async def test_bind_revalidates_owner_after_delivery() -> None:
         assert backend not in backend._dependents
         assert not any("STREAM_VOLUME_APPLY" in command for command in rig.commands)
     finally:
-        release.set()
-        await rig.close()
+        try:
+            release.set()
+        finally:
+            await rig.close()

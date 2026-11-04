@@ -144,7 +144,7 @@ async def test_ordinary_failure_publishes_unknown_to_binding_owner(
     timeout: bool, count: int, owner: int
 ) -> None:
     """Failure/partial group/timeout clears the owner's state without extra actuation."""
-    rig = make_rig(count)
+    rig = make_rig(count, real_deadlines=timeout)
     try:
         backend = await rig.bind(owner)
         rig.commands.clear()
@@ -328,23 +328,25 @@ async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
 ) -> None:
     """An old exact-generation UNBIND cannot detach a replacement binding."""
     rig = make_rig(1)
-    stream = rig.streams[0]
-    backend = stream.session_volume
-    old_unbind_reached = asyncio.Event()
-    release_old_unbind = asyncio.Event()
-    old_unbind_done = asyncio.Event()
-    send = stream.send_cli_command
-
-    async def delay_old_unbind(command: str, *, guard: Callable[[], bool] | None = None) -> bool:
-        if "ACTION=SESSION_VOLUME_UNBIND" in command:
-            old_unbind_reached.set()
-            await release_old_unbind.wait()
-            result = await send(command, guard=guard)
-            old_unbind_done.set()
-            return result
-        return await send(command, guard=guard)
-
     try:
+        stream = rig.streams[0]
+        backend = stream.session_volume
+        old_unbind_reached = asyncio.Event()
+        release_old_unbind = asyncio.Event()
+        old_unbind_done = asyncio.Event()
+        send = stream.send_cli_command
+
+        async def delay_old_unbind(
+            command: str, *, guard: Callable[[], bool] | None = None
+        ) -> bool:
+            if "ACTION=SESSION_VOLUME_UNBIND" in command:
+                old_unbind_reached.set()
+                await release_old_unbind.wait()
+                result = await send(command, guard=guard)
+                old_unbind_done.set()
+                return result
+            return await send(command, guard=guard)
+
         assert await backend.bind(b"old-output", b"", verified_identity=True)
         old_generation = backend.generation
         rig.commands.clear()
@@ -368,8 +370,10 @@ async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
             for command in rig.commands
         )
     finally:
-        release_old_unbind.set()
-        await rig.close()
+        try:
+            release_old_unbind.set()
+        finally:
+            await rig.close()
 
 
 async def test_rebinding_accepts_low_ordinal_after_generation_retirement() -> None:
@@ -422,7 +426,7 @@ async def test_queued_actuator_rechecks_owner_after_its_lock() -> None:
 
 async def test_timeout_and_late_receipt_cannot_initialize_known_state() -> None:
     """A delayed command may have applied, but its late response is never a success."""
-    rig = make_rig(1)
+    rig = make_rig(1, real_deadlines=True)
     try:
         stream = rig.streams[0]
         backend = stream.session_volume
