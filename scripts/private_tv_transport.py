@@ -354,7 +354,6 @@ def run_once(
         # consumes the only interval in which the unconditional stop can be delivered.
         while time.monotonic() < stop_deadline - HTTP_TIMEOUT_SECONDS:
             time.sleep(0.02)
-        # Fetches are source-server facts, never proof of receiver transport.
     except TransportError as err:
         receipt.error = str(err)
     finally:

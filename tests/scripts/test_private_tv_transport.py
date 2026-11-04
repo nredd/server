@@ -26,6 +26,9 @@ from scripts.private_tv_transport import (
     run_once,
 )
 
+PLAY_SLACK_SECONDS = 2
+WATCHDOG_STOP_OFFSET_SECONDS = 2
+
 
 def tv_scope() -> TrialScope:
     """Return a synthetic, explicitly scoped TV inventory."""
@@ -57,12 +60,9 @@ class FakeStopGuard:
 class FakeApi:
     """Record supported MA API calls without a real server or credential."""
 
-    def __init__(
-        self, *, fetch: str | None = None, fetches: int = 1, play_delay: float = 0.0
-    ) -> None:
-        """Keep an optional exact local URL which simulates MA's fetches on play."""
-        self.fetch = fetch
-        self.fetches = fetches
+    def __init__(self, *, fetch_urls: list[str] | None = None, play_delay: float = 0.0) -> None:
+        """Keep the exact local URLs MA is simulated to fetch, in order, on play."""
+        self.fetch_urls = fetch_urls or []
         self.play_delay = play_delay
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.stops: list[tuple[float, float]] = []
@@ -81,8 +81,8 @@ class FakeApi:
             ]
         if command == "player_queues/play_media":
             time.sleep(self.play_delay)
-            for _ in range(self.fetches if self.fetch else 0):
-                parsed = urlsplit(self.fetch or "")
+            for fetch_url in self.fetch_urls:
+                parsed = urlsplit(fetch_url)
                 connection = HTTPConnection(parsed.netloc, timeout=1)
                 connection.request("GET", parsed.path)
                 connection.getresponse().read()
@@ -110,7 +110,7 @@ def short_budget(monkeypatch: pytest.MonkeyPatch) -> float:
 def test_default_budget_observes_the_whole_wave_and_reserves_stop() -> None:
     """Pin the documented window: 4s wave plus slack, then one full HTTP stop interval."""
     wave_seconds = transport.TONE_SECONDS + transport.SILENCE_SECONDS
-    assert wave_seconds + 2 <= transport.OBSERVATION_SECONDS
+    assert wave_seconds + PLAY_SLACK_SECONDS <= transport.OBSERVATION_SECONDS
     assert transport.STOP_BUDGET_SECONDS == transport.OBSERVATION_SECONDS + HTTP_TIMEOUT_SECONDS
 
 
@@ -122,7 +122,7 @@ def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
     server.start()
     try:
         url = f"http://127.0.0.1:{server.port}/stimulus.wav"
-        api = FakeApi(fetch=url)
+        api = FakeApi(fetch_urls=[url])
         guard = FakeStopGuard()
         receipt = run_once(tv_scope(), api, url, server, stimulus, stop_guard=guard)
     finally:
@@ -151,7 +151,7 @@ def test_early_and_repeated_fetches_do_not_shorten_observation(short_budget: flo
     server.start()
     try:
         url = f"http://127.0.0.1:{server.port}/stimulus.wav"
-        api = FakeApi(fetch=url, fetches=3)
+        api = FakeApi(fetch_urls=[url] * 3)
         started = time.monotonic()
         receipt = run_once(tv_scope(), api, url, server, stimulus, stop_guard=FakeStopGuard())
     finally:
@@ -360,9 +360,11 @@ def test_independent_watchdog_stops_after_slow_play_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep the stop delivery independent from a slow accepted playback response."""
-    # The parent's play timeout is 3s, so a watchdog stop at T+2 is provably earlier
-    # than any parent cleanup.
-    monkeypatch.setattr(transport, "STOP_BUDGET_SECONDS", 2 + HTTP_TIMEOUT_SECONDS)
+    # The parent's play timeout is HTTP_TIMEOUT_SECONDS, so a watchdog stop earlier than
+    # that is provably not parent cleanup.
+    monkeypatch.setattr(
+        transport, "STOP_BUDGET_SECONDS", WATCHDOG_STOP_OFFSET_SECONDS + HTTP_TIMEOUT_SECONDS
+    )
     stopped = threading.Event()
     stopped_at: list[float] = []
 
