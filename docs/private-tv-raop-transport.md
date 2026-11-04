@@ -32,10 +32,12 @@ independent lifecycle watchdog remains the recovery authority if either
 transport process fails.
 
 The receipt remains `INCOMPLETE`: MA acceptance, a constrained-source fetch, and
-a stop request are independently recorded facts, not transport acceptance. It never
-claims child `connected`, PCM arrival, RTP, receiver group membership, audible
-output, or iPhone controls. No packet capture is created, accepted, or synthesized
-by this tool.
+a stop request are independently recorded facts, not transport acceptance. A clean
+incomplete receipt exits `2`; `FAILED`, any recorded error, or a missing stop request
+exits `1`. The controller has no `0` acceptance exit while receiver evidence is
+missing. It never claims child `connected`, PCM arrival, RTP, receiver group
+membership, audible output, or iPhone controls. No packet capture is created,
+accepted, or synthesized by this tool.
 
 This is controller infrastructure, not receiver acceptance or a deployment recipe.
 Run it only from the intended private host after the parent has supplied the

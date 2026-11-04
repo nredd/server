@@ -510,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(receipt.model_dump_json(exclude_none=False) + "\n")
     # This controller cannot establish receiver acceptance: clean source/stop facts are
     # deliberately incomplete, while a setup, request, or cleanup failure is failed.
-    return 1 if receipt.outcome == "FAILED" or not receipt.ma_stop_requested else 2
+    return 1 if receipt.outcome == "FAILED" or receipt.error or not receipt.ma_stop_requested else 2
 
 
 if __name__ == "__main__":

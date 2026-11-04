@@ -319,6 +319,60 @@ def test_main_returns_incomplete_for_clean_source_and_stop(
     assert json.loads(capsys.readouterr().out)["outcome"] == "INCOMPLETE"
 
 
+def test_main_returns_failure_when_cleanup_records_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Do not classify a failed stop request as clean infrastructure observation."""
+    inventory = tmp_path / "scope.json"
+    inventory.write_text(
+        json.dumps(
+            {
+                "target": "021122334455@test-tv",
+                "target_ip": "192.0.2.10",
+                "target_link_mac": "02:11:22:33:44:55",
+                "excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}],
+                "host_ip": "203.0.113.30",
+                "ssh_host": "trial-host",
+                "mode": "tv-raop",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class ApiWithFailedStop(FakeApi):
+        """Fail only the mandatory cleanup request."""
+
+        def command(self, command: str, args: dict[str, Any], timeout: float = 3.0) -> Any:
+            """Raise the transport error after the one playback command."""
+            if command == "players/cmd/stop":
+                raise TransportError("stop failed")
+            return super().command(command, args, timeout)
+
+    monkeypatch.setattr(transport, "validate_lifecycle_run", lambda *_args: None)
+    monkeypatch.setattr(transport, "MusicAssistantApi", lambda *_args: ApiWithFailedStop())
+    monkeypatch.setattr(transport, "StopWatchdog", lambda *_args: FakeStopGuard())
+
+    result = transport.main(
+        [
+            "--inventory",
+            str(inventory),
+            "--ma-url",
+            "http://127.0.0.1:8095",
+            "--bind",
+            "127.0.0.1",
+            "--advertised-host",
+            "127.0.0.1",
+            "--lifecycle-root",
+            str(tmp_path),
+            "--lifecycle-run",
+            "00000000-0000-0000-0000-000000000000",
+        ]
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "stop failed"
+
+
 def test_main_returns_failure_for_preflight_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
