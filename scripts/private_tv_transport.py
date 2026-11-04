@@ -26,7 +26,7 @@ import wave
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -34,10 +34,12 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 try:
+    from scripts import private_dev_lifecycle as lifecycle
     from scripts.private_trial_scope import TrialMode, TrialScope, check_players
 except ModuleNotFoundError:
     # The copied private tool is invoked as a script on the SSH add-on.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts import private_dev_lifecycle as lifecycle
     from scripts.private_trial_scope import TrialMode, TrialScope, check_players
 
 SAMPLE_RATE = 44_100
@@ -130,8 +132,11 @@ class MusicAssistantApi:
                     "Content-Type": "application/json",
                 },
             )
-            raw = connection.getresponse().read(MAX_RESPONSE_BYTES + 1)
-        except (TimeoutError, OSError) as err:
+            response = connection.getresponse()
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if not 200 <= response.status < 300:
+                raise TransportError("MA API returned unsuccessful HTTP status")
+        except (HTTPException, TimeoutError, OSError, ValueError) as err:
             raise TransportError("MA API request failed") from err
         finally:
             connection.close()
@@ -303,6 +308,12 @@ def _ipv4(value: str, label: str) -> str:
     return str(address)
 
 
+def validate_lifecycle_run(root: Path, run_id: str) -> None:
+    """Require the existing independent DEV watchdog lease before transport dispatch."""
+    run_dir, snapshot = lifecycle.load_snapshot(root, run_id)
+    lifecycle._require_armed(root, run_dir, snapshot)
+
+
 def _credential_from_env(name: str) -> str:
     """Read an inherited ephemeral credential without writing or displaying it."""
     if not name.isidentifier():
@@ -318,11 +329,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bind", required=True)
     parser.add_argument("--advertised-host", required=True)
     parser.add_argument("--credential-env", default="MA_TOKEN")
+    parser.add_argument("--lifecycle-root", type=Path, required=True)
+    parser.add_argument("--lifecycle-run", required=True)
     parser.add_argument("--packet-receipt")
     args = parser.parse_args(argv)
     server: StimulusServer | None = None
     try:
         scope = TrialScope.parse(json.loads(args.inventory.read_text(encoding="utf-8")))
+        validate_lifecycle_run(args.lifecycle_root, args.lifecycle_run)
         stimulus = generate_stimulus()
         server = StimulusServer(_ipv4(args.bind, "bind address"), stimulus)
         host = _ipv4(args.advertised_host, "advertised host")
