@@ -19,7 +19,9 @@ from pathlib import Path
 TARGET = re.compile(r"([0-9a-fA-F]{12})@([A-Za-z0-9][A-Za-z0-9_.-]{0,62})")
 MAC = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}")
 SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}")
-FIELDS = {"target", "target_ip", "target_link_mac", "excluded", "host_ip", "ssh_host", "mode"}
+REQUIRED_FIELDS = {"target", "target_ip", "excluded", "host_ip", "ssh_host", "mode"}
+VISIBILITY_FIELD = "capture_visibility"
+LINK_MAC_FIELD = "target_link_mac"
 
 
 class TrialMode(StrEnum):
@@ -27,6 +29,21 @@ class TrialMode(StrEnum):
 
     HOME_POD_PTP = "homepod-ptp"
     TV_RAOP = "tv-raop"
+
+
+class CaptureVisibility(StrEnum):
+    """
+    What the HAOS capture interface can observe for this trial.
+
+    `on-link` (the default) requires a target link MAC and matches the target and
+    excluded endpoints by IP and by link MAC. `routed-ip` is for a target reached
+    through a router: its MAC never appears on the HAOS link, so the capture is
+    restricted to IPv4 between the HAOS host and each declared endpoint. L2, non-IP
+    and IPv6 traffic are then *not measured*.
+    """
+
+    ON_LINK = "on-link"
+    ROUTED_IP = "routed-ip"
 
 
 @dataclass(frozen=True)
@@ -41,12 +58,14 @@ class TrialScope:
     ssh_host: str
     capture_filter: str
     excluded_filter: str
+    visibility: CaptureVisibility = CaptureVisibility.ON_LINK
 
     @classmethod
     def parse(cls, data: object) -> TrialScope:
         """Validate a complete explicit inventory, rejecting ambiguous scope."""
-        if not isinstance(data, dict) or set(data) != FIELDS:
-            raise ValueError("Scope requires exactly the documented inventory fields")
+        visibility = _checked_visibility(data)
+        routed = visibility == CaptureVisibility.ROUTED_IP
+        assert isinstance(data, dict)
         target = data["target"]
         if not isinstance(target, str) or not (match := TARGET.fullmatch(target)):
             raise ValueError("Target must be a MAC@name with a safe DNS instance name")
@@ -56,7 +75,7 @@ class TrialScope:
             raise ValueError("ssh_host must be a plain SSH host alias")
         target_ip = _ipv4(data["target_ip"])
         host_ip = _ipv4(data["host_ip"])
-        target_mac = _mac(data["target_link_mac"])
+        target_mac = None if routed else _mac(data[LINK_MAC_FIELD])
         if target_ip == host_ip:
             raise ValueError("Target and host addresses overlap")
         excluded = data["excluded"]
@@ -64,6 +83,7 @@ class TrialScope:
             raise ValueError("Excluded inventory must be explicit and nonempty")
         seen = {target_ip, host_ip}
         terms: list[str] = []
+        hosts: list[str] = []
         for entry in excluded:
             if not isinstance(entry, dict) or set(entry) not in ({"ip"}, {"ip", "mac"}):
                 raise ValueError("Each excluded endpoint requires ip and optional mac")
@@ -72,6 +92,9 @@ class TrialScope:
                 raise ValueError("Duplicate or overlapping inventory addresses")
             seen.add(address)
             terms.append(f"host {address}")
+            hosts.append(f"host {address}")
+            if "mac" in entry and routed:
+                raise ValueError("routed-ip scope forbids excluded link MACs")
             if "mac" in entry:
                 mac = _mac(entry["mac"])
                 if mac in (
@@ -80,6 +103,23 @@ class TrialScope:
                 ):
                     raise ValueError("Target and excluded link-layer identities overlap")
                 terms.append(f"ether host {mac}")
+        if routed:
+            # Only IPv4 between the HAOS host and each declared endpoint, nothing else.
+            pairs = f"host {host_ip} and"
+            excluded_filter = f"ip and {pairs} ({' or '.join(hosts)})"
+            capture_filter = f"ip and {pairs} ({' or '.join([*hosts, f'host {target_ip}'])})"
+            return cls(
+                f"{match[1].lower()}@{match[2]}",
+                f"ap{match[1].lower()}",
+                mode,
+                target_ip,
+                host_ip,
+                ssh_host,
+                capture_filter,
+                excluded_filter,
+                visibility,
+            )
+        assert target_mac is not None  # on-link scope always supplies it
         excluded_filter = f"({' or '.join(terms)}) and not multicast and not broadcast"
         capture_filter = (
             f"({' or '.join([*terms, f'host {target_ip}', f'ether host {target_mac}'])})"
@@ -107,6 +147,7 @@ class TrialScope:
             "HOST": self.ssh_host,
             "CAP_FILTER": self.capture_filter,
             "EXCLUDED_FILTER": self.excluded_filter,
+            "CAPTURE_VISIBILITY": self.visibility,
         }
         return "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
 
@@ -160,6 +201,33 @@ def _trial_mode(value: object) -> TrialMode:
         return TrialMode(value)
     except ValueError as err:
         raise ValueError(f"Invalid trial mode: {err}; expected homepod-ptp or tv-raop") from err
+
+
+def _checked_visibility(data: object) -> CaptureVisibility:
+    """Validate the field set for the declared visibility and return it."""
+    if not isinstance(data, dict):
+        raise TypeError("Scope must be a JSON object")
+    visibility = _visibility(data.get(VISIBILITY_FIELD, CaptureVisibility.ON_LINK))
+    routed = visibility == CaptureVisibility.ROUTED_IP
+    if routed and LINK_MAC_FIELD in data:
+        raise ValueError(
+            "routed-ip scope forbids target_link_mac: the routed target's MAC is not "
+            "visible on the host link (a gateway MAC would widen the capture)"
+        )
+    required = REQUIRED_FIELDS | (set() if routed else {LINK_MAC_FIELD})
+    if not required <= set(data) <= required | {VISIBILITY_FIELD}:
+        raise ValueError("Scope requires exactly the documented inventory fields")
+    return visibility
+
+
+def _visibility(value: object) -> CaptureVisibility:
+    """Require an explicit supported capture visibility."""
+    if not isinstance(value, str):
+        raise TypeError("capture_visibility must be a string")
+    try:
+        return CaptureVisibility(value)
+    except ValueError as err:
+        raise ValueError("Invalid capture_visibility: expected on-link or routed-ip") from err
 
 
 def _ipv4(value: object) -> str:

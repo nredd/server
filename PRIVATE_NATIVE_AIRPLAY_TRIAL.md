@@ -280,6 +280,33 @@ address overlap and excluded/target identity overlap refuse before remote I/O.
 Names use ASCII letters, digits, dots, underscores and hyphens; SSH aliases cannot contain
 options, usernames or shell syntax. No excluded endpoint is pinged or queried for ARP.
 
+Optional `capture_visibility` selects what the HAOS capture interface can observe.
+Absent or `"on-link"` is the contract above (requires `target_link_mac`). `"routed-ip"`
+is for a target reached through a router, whose MAC never appears on the HAOS link; a
+gateway MAC would widen capture to unrelated ether-host traffic. In that mode
+`target_link_mac` and excluded `mac` are *refused* (never silently dropped), and the
+capture and verdict filters are exactly `ip and host HOST_IP and (host ...)`: IPv4
+between the HAOS host and each declared target/excluded address, nothing else (nearby
+IPs, other peers, multicast, non-IP excluded). Synthetic example:
+
+```json
+{
+  "target": "021122334455@test-tv",
+  "target_ip": "192.0.2.10",
+  "excluded": [{"ip": "198.51.100.20"}],
+  "host_ip": "203.0.113.30",
+  "ssh_host": "trial-host",
+  "mode": "tv-raop",
+  "capture_visibility": "routed-ip"
+}
+```
+
+Routed visibility is IPv4 only. L2, non-IP and IPv6 traffic are *not measured*: the
+verdict reports non-IP as `UNKNOWN`, and a clean result prints `ROUTED-IP SCOPE: no IPv4
+violation observed ... NOT an isolation pass`, never `ISOLATION PASS`. Schema success is
+not identity proof: a fresh target identity and route preflight remains a separate
+required gate before any window.
+
 The validated scope supplies admission, player checks, capture and excluded-only verdict
 filters. A one-ping positive control to the *admitted* target proves capture visibility;
 it does not claim to prove reachability of excluded devices. Baseline and verdict use

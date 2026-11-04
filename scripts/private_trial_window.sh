@@ -191,7 +191,7 @@ SCOPE_HELPER="$(cd "$(dirname "$0")" && pwd)/private_trial_scope.py"
 [[ $# == 1 ]] || { printf 'Usage: %s SCOPE.json\n' "$0" >&2; exit 2; }
 SCOPE_ASSIGNMENTS=$(python3 "$SCOPE_HELPER" --scope "$1") || exit 2
 eval "$SCOPE_ASSIGNMENTS"
-readonly TRIAL_TARGET TRIAL_PLAYER TRIAL_MODE TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER
+readonly TRIAL_TARGET TRIAL_PLAYER TRIAL_MODE TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER CAPTURE_VISIBILITY
 
 TOTAL_STAGES=12
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
@@ -274,6 +274,10 @@ stage "Review the validated scope (no excluded-device discovery)"
 say "Admitted target: $TRIAL_TARGET ($TRIAL_PLAYER) at $TARGET_IP in $TRIAL_MODE mode"
 say "Capture: $CAP_FILTER"
 say "Excluded-only verdict: $EXCLUDED_FILTER"
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  warn "routed-ip capture: only IPv4 between the HAOS host and the declared endpoints is observed."
+  warn "L2, non-IP and IPv6 traffic are NOT MEASURED; this window cannot prove full isolation."
+fi
 say "No ping, ARP or neighbor lookup of excluded endpoints is performed."
 say "IP-only exclusions cover listed IPv4 only; supply link MACs for IPv6 coverage."
 pause
@@ -423,7 +427,16 @@ echo NEW_EXCLUDED_FLOWS \$(awk '{\$1=\"\"; sub(/^ /,\"\"); print}' $CAP_FILE.flo
 printf '%s\n' "$VERDICT"
 H2E=$(printf '%s\n' "$VERDICT" | awk '/^HOST_TO_EXCLUDED /{print $2}'); AP=$(printf '%s\n' "$VERDICT" | awk '/^AIRPLAY_PORTS /{print $2}'); NEW=$(printf '%s\n' "$VERDICT" | awk '/^NEW_EXCLUDED_FLOWS /{print $2}')
 NON_IP=$(printf '%s\n' "$VERDICT" | awk '/^NON_IP /{print $2}')
-if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && "$NON_IP" == 0 && $ABORTED == 0 ]]; then
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  # The filter is IPv4-only, so a zero NON_IP count is unobservable, never evidence.
+  NON_IP=UNKNOWN
+  if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
+    printf '  %sROUTED-IP SCOPE: no IPv4 violation observed%s (non-IP/L2/IPv6 UNKNOWN, not measured; NOT an isolation pass)\n' "$GREEN" "$RESET"
+  else
+    printf '  %sROUTED-IP SCOPE FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
+    VERDICT_FAILED=1
+  fi
+elif [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && "$NON_IP" == 0 && $ABORTED == 0 ]]; then
   printf '  %sISOLATION PASS%s\n' "$GREEN" "$RESET"
 else
   printf '  %sISOLATION FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
