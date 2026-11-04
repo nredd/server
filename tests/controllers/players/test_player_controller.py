@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import sys
 import time
 from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from music_assistant_models.constants import (
 from music_assistant_models.enums import (
     ConfigEntryType,
     EventType,
+    IdentifierType,
     MediaType,
     PlaybackState,
     PlayerFeature,
@@ -80,6 +82,12 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 from music_assistant.helpers.tts import TTS_QUERY_TIMEOUT_SECONDS, TTSLanguageNotSupportedError
 from music_assistant.models.player import AnnouncementFeature, LinkedOutputProtocol, Player
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.providers.airplay.constants import AIRPLAY_PCM_FORMAT
+from music_assistant.providers.airplay.control_player import AirPlayControlPlayer
+from music_assistant.providers.airplay.provider import AirPlayProvider
+from music_assistant.providers.airplay.sendspin_bridge import SendspinAirPlayBridge
+from music_assistant.providers.airplay.stream import AirPlayStream
+from music_assistant.providers.airplay.stream_session import AirPlayStreamSession
 from music_assistant.providers.universal_player.player import UniversalPlayer
 from tests.common import MockPlayer, MockProvider, create_mock_config, use_real_create_task
 
@@ -1156,6 +1164,101 @@ class TestRegisterUnregisterRace:
             call_args.args and call_args.args[0] == EventType.PLAYER_ADDED
             for call_args in mock_mass.signal_event.call_args_list
         )
+
+    @pytest.mark.parametrize(
+        ("model", "trial", "passive", "cached"),
+        [
+            ("Apple TV 4K", True, True, False),
+            ("Apple TV 4K", True, True, True),
+            ("Apple TV 4K", False, False, False),
+            ("HomePod", True, False, False),
+        ],
+    )
+    async def test_registration_mac_policy(
+        self, mock_mass: MagicMock, model: str, trial: bool, passive: bool, cached: bool
+    ) -> None:
+        """Registration keeps private TV identity separate from cached or probed MACs."""
+        controller = PlayerController(mock_mass)
+        self._stub_register_calls(mock_mass)
+        provider = MockProvider("airplay", instance_id="airplay", mass=mock_mass)
+        player = AirPlayControlPlayer(
+            provider=cast("AirPlayProvider", provider),
+            player_id="ap021122334455",
+            raop_discovery_info=None,
+            airplay_discovery_info=None,
+            companion_discovery_info=None,
+            mrp_discovery_info=None,
+            address="192.0.2.10",
+            display_name="Device",
+            manufacturer="Apple",
+            model=model,
+            initial_volume=25,
+        )
+        assert player.device_info.identifiers[IdentifierType.MAC_ADDRESS] == "02:11:22:33:44:55"
+        gateway = "AA:BB:CC:DD:EE:FF"
+        mock_mass.config.get.side_effect = lambda key, default=None: (
+            gateway if key.endswith("/cached_arp_mac") and cached else default
+        )
+        player.extra_data["reported_mac"] = gateway
+        lookup = MagicMock(return_value="10:20:30:40:50:60")
+        with (
+            patch(
+                "music_assistant.providers.airplay.control_player.trial_binary.is_trial_target",
+                return_value=trial,
+            ),
+            patch.dict(sys.modules, {"getmac": SimpleNamespace(get_mac_address=lookup)}),
+            patch.object(player, "on_config_updated", AsyncMock()),
+            patch.object(
+                AirPlayControlPlayer,
+                "can_group_with",
+                new_callable=PropertyMock,
+                return_value=set(),
+            ),
+        ):
+            await controller.register(player)
+
+        assert player.initialized.is_set()
+        assert player.device_info.identifiers[IdentifierType.AIRPLAY_ID] == player.player_id
+        if passive:
+            lookup.assert_not_called()
+            assert not player.device_info.identifiers.get(IdentifierType.MAC_ADDRESS)
+            assert "reported_mac" not in player.extra_data
+            stream = AirPlayStream(player)
+            assert stream.active_remote_id == "573785173"
+            session = AirPlayStreamSession(
+                cast("AirPlayProvider", provider), [player], AIRPLAY_PCM_FORMAT, MagicMock()
+            )
+            with (
+                patch.object(AirPlayStream, "connect", AsyncMock()),
+                patch.object(session, "_start_player_ffmpeg", AsyncMock()),
+            ):
+                await session._start_client(player, False)
+            assert player.stream is not None
+            assert player.stream.active_remote_id == "573785173"
+            player.stream = None
+            bridge = SendspinAirPlayBridge(cast("AirPlayProvider", provider), player, MagicMock())
+            bridge._airplay_stream_start_task = asyncio.current_task()
+            with patch.object(bridge, "_start_cold_stream", AsyncMock()) as cold_start:
+                await bridge._start_protocol_from_chunk()
+            cold_start.assert_awaited_once()
+            assert cold_start.await_args is not None
+            bridge_stream = cold_start.await_args.args[0]
+            assert isinstance(bridge_stream, AirPlayStream)
+            assert bridge_stream.active_remote_id == "573785173"
+            assert not any(
+                str(args.args[0]).endswith("/cached_arp_mac")
+                for args in mock_mass.config.get.call_args_list
+                + mock_mass.config.set.call_args_list
+            )
+            for mac in (gateway, "00:11:22:33:44:55"):
+                other = MockPlayer(provider, "other", "Other")
+                other.device_info.add_identifier(IdentifierType.MAC_ADDRESS, mac)
+                other.device_info.add_identifier(IdentifierType.IP_ADDRESS, "192.0.2.11")
+                assert not controller._identifiers_match(player, other)
+        else:
+            lookup.assert_called_once_with(ip="192.0.2.10")
+            assert player.device_info.identifiers[IdentifierType.MAC_ADDRESS] == "10:20:30:40:50:60"
+            assert AirPlayStream(player).active_remote_id == "809521248"
 
     async def test_register_aborts_when_unregistered_during_config_load(
         self, mock_mass: MagicMock

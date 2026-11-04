@@ -2766,6 +2766,13 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
 
         :param player: The player to resolve the MAC address(es) for.
         """
+        if not player.allow_automatic_mac_resolution:
+            # The provider identity remains available under its protocol identifier;
+            # an unverified MAC must not participate in hardware MAC matching.
+            player.device_info.add_identifier(IdentifierType.MAC_ADDRESS, None)
+            player.extra_data.pop("reported_mac", None)
+            return
+
         conf_base = f"{CONF_PLAYERS}/{player.player_id}/values"
         # Save the original MAC reported by the provider (before ARP enrichment)
         reported_mac = player.device_info.identifiers.get(IdentifierType.MAC_ADDRESS)

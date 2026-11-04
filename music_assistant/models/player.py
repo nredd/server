@@ -867,6 +867,11 @@ class Player(ABC):
         return self._attr_supported_sample_rates
 
     @property
+    def allow_automatic_mac_resolution(self) -> bool:
+        """Return whether registration may resolve and cache a hardware MAC."""
+        return True
+
+    @property
     def allow_implicit_power_on(self) -> bool:
         """Return whether playback and grouping may automatically power on this player."""
         return True
