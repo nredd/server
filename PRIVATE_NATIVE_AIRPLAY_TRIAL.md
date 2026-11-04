@@ -694,8 +694,8 @@ verify any explicitly authorized native-peer restoration.
 
 The fake transport is available to a detached `self-test-child` only when that exact armed
 run has an owner-only simulation marker bound to its UUID and nonce. An ordinary production
-snapshot cannot select fake transport. Snapshot schema 1 remains valid for emergency
-restores. The `self-test` parent polls for the child's receipt, which the child creates
+snapshot cannot select fake transport. Only snapshot schema `3` is accepted; recapture
+after upgrading. The `self-test` parent polls for the child's receipt, which the child creates
 exclusively and then writes, so it may briefly see it empty or partial. Only unparsable JSON
 is retried, within the 5-second budget; a receipt that stays malformed, has unsafe
 permissions or is not an object fails the self-test.

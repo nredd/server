@@ -357,8 +357,8 @@ def test_normal_capture_rejects_error() -> None:
 @pytest.mark.parametrize(
     ("state", "field", "value", "message"),
     [
-        ("started", "protected", True, "not confirmed"),
-        ("stopped", "protected", True, "not confirmed"),
+        ("started", "boot", "manual", "not confirmed"),
+        ("stopped", "boot", "manual", "not confirmed"),
         ("error", "protected", False, "protection mode is off"),
         ("error", "watchdog", True, "Supervisor watchdog is on"),
         ("error", "boot", "auto", "boot mode is not manual"),
@@ -1205,9 +1205,7 @@ def test_self_test_persistently_malformed_receipt_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A receipt that never becomes valid JSON fails at the budget, never passes."""
-    real_monotonic = time.monotonic
-    start = real_monotonic()
-    monkeypatch.setattr(time, "monotonic", lambda: (real_monotonic() - start) * 100)
+    monkeypatch.setattr(lifecycle, "SELF_TEST_TIMEOUT", 0.3)
 
     def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
         _private_write(root / run_id / "receipt.json", "{")
@@ -1218,18 +1216,24 @@ def test_self_test_persistently_malformed_receipt_fails_closed(
         lifecycle.self_test(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("text", "mode", "message"),
+    [("[]", 0o600, "receipt is malformed"), ("{}", 0o644, "permissions are unsafe")],
+)
 def test_self_test_does_not_retry_non_malformed_receipt_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, mode: int, message: str
 ) -> None:
     """Unsafe permissions or a wrong JSON type fail at once instead of being retried."""
 
     def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
         receipt = root / run_id / "receipt.json"
-        _private_write(receipt, "[]")
+        receipt.write_text(text)
+        receipt.chmod(mode)
         return 0
 
+    monkeypatch.setattr(lifecycle, "SELF_TEST_TIMEOUT", 30.0)
     monkeypatch.setattr(lifecycle, "arm_watchdog", arm)
-    with pytest.raises(lifecycle.LifecycleError, match="receipt is malformed") as info:
+    with pytest.raises(lifecycle.LifecycleError, match=message) as info:
         lifecycle.self_test(tmp_path)
     assert not isinstance(info.value, lifecycle.MalformedStateError)
 

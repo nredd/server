@@ -56,6 +56,7 @@ SCHEMA = 3
 MAX_RUN_AGE = 600.0
 MAX_WATCHDOG_TIMEOUT = 3600.0
 LOCK_TIMEOUT = 600.0
+SELF_TEST_TIMEOUT = 5.0
 POLL_INTERVAL = 1.0
 STOP_RESEND_INTERVAL = 5.0
 WATCHDOG_WAKE_INTERVAL = 5.0
@@ -574,7 +575,7 @@ def self_test(root: Path) -> None:
     run_dir = save_snapshot(root, snapshot)
     arm_watchdog(root, snapshot.run_id, 0.05, self_test=True)
     receipt = run_dir / "receipt.json"
-    until = time.monotonic() + 5.0
+    until = time.monotonic() + SELF_TEST_TIMEOUT
     while time.monotonic() < until:
         if receipt.exists():
             try:
