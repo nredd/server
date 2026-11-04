@@ -199,7 +199,7 @@ async def exercise(harness: Path, directory: Path) -> Report:
     """Run the real encrypted cross-process case, cleaning every owned resource."""
     fifo = AsyncNamedPipeWriter(str(directory / "commands"))
     with patch.object(session_volume, "_GENERATIONS", itertools.count(7)):
-        rig = make_rig(2)
+        rig = make_rig(2, real_deadlines=True)
         child = WitnessProcess(harness, Path(fifo.path))
         mux = Transactions(rig, fifo)
         reader: asyncio.Task[None] | None = None

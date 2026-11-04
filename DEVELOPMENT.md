@@ -53,6 +53,14 @@ wire frame sizes and byte rates are derived immediately, so configuring a mock a
 cannot repair them. Late-join tests freeze the CLI timeline and cover anchors ahead of,
 at, and inside the buffered write head with frame-aligned PCM and exact prime/skip counts.
 
+Offline session-volume rigs use module-local timeout control for receipt, identity,
+clamp and balance tests: a scheduler suspension must not turn those semantic checks into
+wall-clock deadline tests. `VolumeRig.close()` restores the module reference; the global
+`asyncio` module and other providers are untouched. Tests that exercise deadline expiry
+must use `make_rig(..., real_deadlines=True)`. The explicit real-budget regression retains
+the production 2.5-second deadline and checks whole-group unknown state plus rejection of
+late receipts. The executable volume-contract checker also opts into real deadlines.
+
 ### Using Devcontainer/Codespace
 We removed support for devcontainers because we do not have anyone willing to maintain it.
 It also is not very convenient due to all the port requirements, binaries etc.

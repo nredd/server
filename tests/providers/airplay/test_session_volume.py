@@ -6,10 +6,11 @@ import asyncio
 import os
 import sys
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Self, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,6 +23,7 @@ from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.players.constants import PlayerLockPurpose
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
+from music_assistant.providers.airplay import session_volume
 from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
     CONF_EXPERIMENTAL_SESSION_VOLUME,
@@ -72,6 +74,7 @@ class VolumeRig:
     fail_member: int | None = None
     delay: asyncio.Event | None = None
     reached: asyncio.Event = field(default_factory=asyncio.Event)
+    patches: ExitStack = field(default_factory=ExitStack)
 
     async def write(
         self, index: int, data: bytes, *, guard: Callable[[], bool] | None = None
@@ -109,14 +112,22 @@ class VolumeRig:
         assert backend._runner is not None
         await backend._runner
 
+    def use_offline_timeouts(self) -> None:
+        """Disable only this fixture's transaction wall-clock budget."""
+        scoped_asyncio = SimpleNamespace(vars(asyncio) | {"timeout": _offline_timeout})
+        self.patches.enter_context(patch.object(session_volume, "asyncio", scoped_asyncio))
+
     async def close(self) -> None:
         """Detach callbacks and settle locally scheduled feedback."""
-        for stream in self.streams:
-            await stream.session_volume.close()
-        await asyncio.sleep(0)
+        try:
+            for stream in self.streams:
+                await stream.session_volume.close()
+            await asyncio.sleep(0)
+        finally:
+            self.patches.close()
 
 
-def make_rig(count: int = 2) -> VolumeRig:
+def make_rig(count: int = 2, *, real_deadlines: bool = False) -> VolumeRig:
     """Build a real native sync group without starting playback or contacting devices."""
     mass = MagicMock()
     mass.closing = False
@@ -176,7 +187,17 @@ def make_rig(count: int = 2) -> VolumeRig:
         )
     for stream in streams:
         stream.session_volume._receipt_snapshot = stream.session_volume.snapshot()
+    if not real_deadlines:
+        # These fixtures test receipts, routing and balance, not physical elapsed time.
+        # Replace only this module's asyncio reference, never asyncio.timeout globally.
+        # Explicit deadline tests opt out and retain the real cancellation machinery.
+        rig.use_offline_timeouts()
     return rig
+
+
+def _offline_timeout(_delay: float | None) -> asyncio.Timeout:
+    """Keep real cancellation semantics without a wall-clock timer in non-timing tests."""
+    return asyncio.timeout(None)
 
 
 @pytest.mark.parametrize(
@@ -329,7 +350,7 @@ async def test_owner_changed_while_waiting_for_real_lock(purpose: PlayerLockPurp
 
 async def test_late_completion_after_takeover_is_never_success() -> None:
     """A receipt cannot revive a stale stream even if the device accepted the command."""
-    rig = make_rig(1)
+    rig = make_rig(1, real_deadlines=True)
     try:
         await rig.bind()
         rig.delay = asyncio.Event()

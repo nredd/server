@@ -49,58 +49,66 @@ class BridgeRig:
 async def make_bridge_rig(count: int = 2) -> BridgeRig:
     """Register real in-process SDK clients without starting a server or device transport."""
     rig = make_rig(count)
-    provider = cast("AirPlayProvider", rig.streams[0].prov)
-    cast("MagicMock", provider.mass.create_task).side_effect = lambda coro, **_kwargs: (
-        asyncio.create_task(coro)
-    )
-    server = SendspinServer(
-        asyncio.get_running_loop(), MagicMock(), "offline", MagicMock(), pairing_store=MagicMock()
-    )
-    manager = SendspinBridgeManager(provider)
-    cast("MagicMock", provider).bridge_manager = manager
-    sendspin = MagicMock()
-    sendspin.mass = provider.mass
-    sendspin.domain = "sendspin"
-    sendspin.instance_id = "sendspin-test"
-    sendspin.server_api = server
-    cast("MagicMock", provider.mass.get_provider).return_value = sendspin
-    bridges: list[SendspinAirPlayBridge] = []
-    roles: list[BridgePlayerRole] = []
-    players: list[SendspinPlayer] = []
-    for stream in rig.streams:
-        stream.session = None
-        stream.player._attr_group_members = []
-        stream.player.update_state()
-        bridge = SendspinAirPlayBridge(provider, stream.player, server)
-        await bridge.start()
-        bridge._airplay_stream = stream
-        manager._bridges[stream.player.player_id] = bridge
-        assert bridge.bridge_client_id is not None
-        server._external_stream_start_cbs[bridge.bridge_client_id] = lambda _request: None
-        player = SendspinPlayer(cast("SendspinProvider", sendspin), bridge.bridge_client_id)
-        cast("MagicMock", player).send_current_media_metadata = AsyncMock()
-        rig.controller._players[player.player_id] = player
-        player._attr_powered = True
-        player.set_initialized()
-        player.update_state(force_update=True, signal_event=False)
-        assert bridge._bridge_role is not None
-        bridges.append(bridge)
-        bridge._bridge_role._on_stream_start_cb = None
-        bridge._bridge_role._on_stream_end_cb = None
-        roles.append(bridge._bridge_role)
-        players.append(player)
-    group = players[0].api.group
-    for player in players[1:]:
-        await group.add_client(player.api)
-    group.start_stream()
-    # Explicit state refreshes substitute for the server's ordinary debounced update loop.
-    for player in players:
-        player.update_state(force_update=True, signal_event=False)
-    for index, bridge in enumerate(bridges):
-        await bridge.apply_volume_confirmed(60 if index == 0 else 30)
-    rig.commands.clear()
-    rig.reached.clear()
-    return BridgeRig(rig, bridges, players, roles)
+    try:
+        provider = cast("AirPlayProvider", rig.streams[0].prov)
+        cast("MagicMock", provider.mass.create_task).side_effect = lambda coro, **_kwargs: (
+            asyncio.create_task(coro)
+        )
+        server = SendspinServer(
+            asyncio.get_running_loop(),
+            MagicMock(),
+            "offline",
+            MagicMock(),
+            pairing_store=MagicMock(),
+        )
+        manager = SendspinBridgeManager(provider)
+        cast("MagicMock", provider).bridge_manager = manager
+        sendspin = MagicMock()
+        sendspin.mass = provider.mass
+        sendspin.domain = "sendspin"
+        sendspin.instance_id = "sendspin-test"
+        sendspin.server_api = server
+        cast("MagicMock", provider.mass.get_provider).return_value = sendspin
+        bridges: list[SendspinAirPlayBridge] = []
+        roles: list[BridgePlayerRole] = []
+        players: list[SendspinPlayer] = []
+        for stream in rig.streams:
+            stream.session = None
+            stream.player._attr_group_members = []
+            stream.player.update_state()
+            bridge = SendspinAirPlayBridge(provider, stream.player, server)
+            await bridge.start()
+            bridge._airplay_stream = stream
+            manager._bridges[stream.player.player_id] = bridge
+            assert bridge.bridge_client_id is not None
+            server._external_stream_start_cbs[bridge.bridge_client_id] = lambda _request: None
+            player = SendspinPlayer(cast("SendspinProvider", sendspin), bridge.bridge_client_id)
+            cast("MagicMock", player).send_current_media_metadata = AsyncMock()
+            rig.controller._players[player.player_id] = player
+            player._attr_powered = True
+            player.set_initialized()
+            player.update_state(force_update=True, signal_event=False)
+            assert bridge._bridge_role is not None
+            bridges.append(bridge)
+            bridge._bridge_role._on_stream_start_cb = None
+            bridge._bridge_role._on_stream_end_cb = None
+            roles.append(bridge._bridge_role)
+            players.append(player)
+        group = players[0].api.group
+        for player in players[1:]:
+            await group.add_client(player.api)
+        group.start_stream()
+        # Explicit state refreshes substitute for the server's ordinary debounced update loop.
+        for player in players:
+            player.update_state(force_update=True, signal_event=False)
+        for index, bridge in enumerate(bridges):
+            await bridge.apply_volume_confirmed(60 if index == 0 else 30)
+        rig.commands.clear()
+        rig.reached.clear()
+        return BridgeRig(rig, bridges, players, roles)
+    except BaseException:
+        await rig.close()
+        raise
 
 
 @pytest.mark.parametrize("count", [1, 2])

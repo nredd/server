@@ -144,7 +144,7 @@ async def test_ordinary_failure_publishes_unknown_to_binding_owner(
     timeout: bool, count: int, owner: int
 ) -> None:
     """Failure/partial group/timeout clears the owner's state without extra actuation."""
-    rig = make_rig(count)
+    rig = make_rig(count, real_deadlines=timeout)
     try:
         backend = await rig.bind(owner)
         rig.commands.clear()
@@ -422,7 +422,7 @@ async def test_queued_actuator_rechecks_owner_after_its_lock() -> None:
 
 async def test_timeout_and_late_receipt_cannot_initialize_known_state() -> None:
     """A delayed command may have applied, but its late response is never a success."""
-    rig = make_rig(1)
+    rig = make_rig(1, real_deadlines=True)
     try:
         stream = rig.streams[0]
         backend = stream.session_volume
