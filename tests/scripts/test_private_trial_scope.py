@@ -126,7 +126,7 @@ def test_player_scope_rechecks_receiver_class_by_mode() -> None:
         "player_id": "ap021122334455",
         "device_info": {"manufacturer": "Apple", "model": "HomePod Mini"},
     }
-    tv = homepod | {"device_info": {"manufacturer": "Apple", "model": "AppleTV14,1"}}
+    tv = homepod | {"device_info": {"manufacturer": "Apple", "model": "Apple TV 4K Gen3"}}
     check_players([homepod], "ap021122334455", "homepod-ptp")
     check_players([tv], "ap021122334455", "tv-raop")
     for players, mode in (

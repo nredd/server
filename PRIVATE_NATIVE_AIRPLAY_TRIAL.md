@@ -288,7 +288,7 @@ link-MAC correctness are operator responsibilities, not facts inferred by a zero
 
 Two explicit modes are implemented. `homepod-ptp` rechecks the exact admitted Apple HomePod
 model before reading the PTP receipt or offering playback. `tv-raop` rechecks the exact admitted
-Apple TV model (`AppleTV*`) and ends after the stable single-player admission and isolation
+Apple TV model (`Apple TV*`) and ends after the stable single-player admission and isolation
 checks. It does not query PTP readiness or request playback, capture, a native volume rail, or
 session volume. A TV scope does not change stream configuration: its default receiver policy
 remains CLI `--protocol auto` with the discovered RAOP compatibility metadata, while

@@ -121,7 +121,7 @@ def check_players(data: object, player_id: str, mode: str) -> None:
     model = info.get("model")
     if mode == HOME_POD_MODE and model in ("HomePod", "HomePod Mini", "HomePod 2"):
         return
-    if mode == TV_RAOP_MODE and isinstance(model, str) and model.startswith("AppleTV"):
+    if mode == TV_RAOP_MODE and isinstance(model, str) and model.startswith("Apple TV"):
         return
     raise ValueError(f"Unsupported target class for mode: {mode}")
 
