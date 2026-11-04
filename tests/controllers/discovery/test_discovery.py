@@ -289,35 +289,51 @@ async def test_async_find_mdns_service_tries_past_a_stale_record(mass: MusicAssi
 async def test_async_find_mdns_service_rescans_after_a_stale_request(
     mass: MusicAssistant,
 ) -> None:
-    """An instance announcing itself while a stale record is being resolved must still be found."""
+    """
+    An instance announcing itself while a stale record is being resolved must still be found.
+
+    The stale request burns its whole share on a virtual loop clock rather than a real sleep:
+    the budget split is what is under test, so the verdict must not depend on how promptly a
+    loaded host wakes the event loop, nor on which order the cache set yields its candidates.
+    """
     cache = mass.discovery.aiozc.zeroconf.cache.cache = {
         "amplipi-stale._amplipi._tcp.local.": {},
     }
     attempts: list[str] = []
+    loop = asyncio.get_running_loop()
+    elapsed = 0.0
+    start = loop.time()
 
     class _Info:
         def __init__(self, _service_type: str, name: str) -> None:
             self.name = name
 
         async def async_request(self, _zeroconf: object, timeout: float) -> bool:
+            nonlocal elapsed
             attempts.append(self.name)
             if "stale" in self.name:
                 # the live instance announces itself midway through the stale request
                 cache["amplipi-live._amplipi._tcp.local."] = {}
                 for waiter in mass.discovery._mdns_waiters:
                     waiter.set()
-                await asyncio.sleep(timeout / 1000)
+                # an unanswered request holds out for its full timeout
+                elapsed += timeout / 1000
+                await asyncio.sleep(0)
                 return False
             return True
 
-    with patch(
-        "music_assistant.controllers.discovery.controller.AsyncServiceInfo",
-        new=_Info,
+    with (
+        patch(
+            "music_assistant.controllers.discovery.controller.AsyncServiceInfo",
+            new=_Info,
+        ),
+        patch.object(loop, "time", lambda: start + elapsed),
     ):
         result = await mass.discovery.async_find_mdns_service("_amplipi._tcp.local.", timeout=0.2)
 
     assert result is not None
     assert result.name == "amplipi-live._amplipi._tcp.local."
+    assert attempts[0] == "amplipi-stale._amplipi._tcp.local."
 
 
 async def test_async_find_mdns_service_preserves_at_sign_in_name(mass: MusicAssistant) -> None:
