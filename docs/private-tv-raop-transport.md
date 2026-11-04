@@ -63,6 +63,8 @@ explicitly commanded:
 - Playback no longer wakes the device through Companion `turn_on`, and a `stop` with no active
   stream no longer sends Home. Explicit `power`, `wake`, `play`, `volume_set` and
   `volume_mute` are unchanged.
+- The receiver's DACP volume echo is already ignored for every Apple device
+  (`AirPlayPlayer.ignore_volume_reports`), so it never writes `VOLUME` back to a TV.
 - HomePods, other receivers and non-trial profiles keep today's behavior.
 
 Limit: a latched mute is not sent, so a stream can start silent while the player state still

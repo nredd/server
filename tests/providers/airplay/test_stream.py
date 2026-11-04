@@ -86,6 +86,7 @@ def _make_player() -> MagicMock:
     # A real None: a stream only speaks for the player while it is the published
     # one, and a bare MagicMock reads as some other stream having taken over.
     player.stream = None
+    player.implicit_receiver_writes_blocked = False
 
     airplay_info = MagicMock()
     airplay_info.port = 7000

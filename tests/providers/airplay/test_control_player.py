@@ -489,6 +489,7 @@ def trial_tv(
     def factory(
         *, model: str = "Apple TV 4K", trial: bool = True
     ) -> tuple[AirPlayControlPlayer, MagicMock]:
+        """Build a control player and the device mock behind its Companion connection."""
         player = _make_control_player(model=model)
         player._attr_powered = False
         device = MagicMock(spec=AppleTV)
@@ -568,18 +569,25 @@ async def test_trial_tv_stops_a_live_stream_and_keeps_explicit_volume(
         ("HomePod", False, False),
     ],
 )
-async def test_implicit_writes_are_blocked_only_for_the_trial_apple_tv(
+def test_implicit_writes_are_blocked_only_for_the_trial_apple_tv(
     trial_tv: Callable[..., tuple[AirPlayControlPlayer, MagicMock]],
     model: str,
     trial: bool,
     blocked: bool,
 ) -> None:
-    """Non-trial profiles and HomePods keep wake and the home-screen stop."""
-    player, device = trial_tv(model=model, trial=trial)
+    """Only an Apple TV on the trial target blocks implicit receiver writes."""
+    player, _device = trial_tv(model=model, trial=trial)
 
     assert player.implicit_receiver_writes_blocked is blocked
-    if blocked:
-        return
+
+
+@pytest.mark.parametrize(("model", "trial"), [("Apple TV 4K", False), ("HomePod", True)])
+async def test_unblocked_players_keep_wake_and_home_stop(
+    trial_tv: Callable[..., tuple[AirPlayControlPlayer, MagicMock]], model: str, trial: bool
+) -> None:
+    """Non-trial profiles and HomePods keep the wake and the home-screen stop."""
+    player, device = trial_tv(model=model, trial=trial)
+
     with patch.object(player, "_wait_for_wake", new=AsyncMock()):
         await player._wake_for_playback()
     device.power.turn_on.assert_awaited_once()
