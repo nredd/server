@@ -468,6 +468,12 @@ install without permitting an unbounded readiness loop. No observer result autho
 mutation; the single designated live-run owner (named by the parent for that run) remains the
 exclusive recovery owner.
 
+The observer rechecks the live lease on every poll and reports `unknown` once it is gone. The
+Supervisor log endpoint is a bounded tail: if the window slides past the captured baseline or
+the 256 KiB cap, the observer reports `unknown` rather than guessing. The lease probe takes a
+non-blocking shared lock only, so arm the watchdog before observing. Capture the baseline while
+DEV is stopped; this is an operator step and is not enforced by code.
+
 ## Gates before any launch
 
 - Preserve a verified backup and restore route for protected official MA 2.10.7, including

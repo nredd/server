@@ -511,12 +511,7 @@ def watchdog(root: Path, run_id: str, transport: Transport | None = None) -> Non
     # immutable budget. Legacy leases retain their one-time wall-clock conversion.
     # Sleep in slices so a manual `stop` that already verified this run releases the
     # application-wide lease early instead of holding it until the deadline.
-    monotonic_deadline = watch.get("monotonic_deadline")
-    deadline = (
-        monotonic_deadline
-        if monotonic_deadline is not None
-        else time.monotonic() + (watch["deadline"] - time.time())
-    )
+    deadline = _watchdog_monotonic_deadline(watch)
     while (delay := deadline - time.monotonic()) > 0:
         if _has_verified_receipt(run_dir, snapshot):
             return
@@ -968,6 +963,25 @@ def _write_json_exclusive(path: Path, value: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def load_watchdog_deadline(root: Path, run_id: str) -> float:
+    """
+    Return the armed run's absolute `time.monotonic()` cleanup deadline.
+
+    :param root: Lifecycle state root.
+    :param run_id: Run whose watchdog lease to read.
+    :raises LifecycleError: If the run or its watchdog state is not valid.
+    """
+    run_dir, snapshot = load_snapshot(root, run_id)
+    return _watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot))
+
+
+def _watchdog_monotonic_deadline(watch: dict[str, Any]) -> float:
+    """Bound the persisted monotonic deadline by the wall deadline so a reboot cannot stretch it."""
+    wall = time.monotonic() + (watch["deadline"] - time.time())
+    persisted = watch.get("monotonic_deadline")
+    return wall if persisted is None else min(float(persisted), wall)
+
+
 def _load_watchdog(run_dir: Path, snapshot: Snapshot) -> dict[str, Any]:
     """Validate the deadline and nonce belonging to this exact armed run."""
     value = _read_private_json(run_dir / "watchdog.json", "watchdog state")
@@ -988,7 +1002,6 @@ def _load_watchdog(run_dir: Path, snapshot: Snapshot) -> dict[str, Any]:
             and (
                 type(value["monotonic_deadline"]) not in (int, float)
                 or not math.isfinite(value["monotonic_deadline"])
-                or value["monotonic_deadline"] > time.monotonic() + MAX_WATCHDOG_TIMEOUT
             )
         )
     ):

@@ -1423,3 +1423,18 @@ def test_main_reports_failures_as_exit_code(
     assert lifecycle.main(["arm", "--root", str(tmp_path)]) == 1
     assert lifecycle.main(["start", "--root", str(tmp_path), "--run", "nope"]) == 1
     assert lifecycle.main(["self-test", "--root", str(tmp_path)]) == 0
+
+
+def test_watchdog_deadline_is_bounded_by_the_wall_deadline() -> None:
+    """A stale or oversized persisted monotonic value cannot stretch cleanup."""
+    wall = time.time() + 30
+    legacy = lifecycle._watchdog_monotonic_deadline({"deadline": wall})
+    assert 29 < legacy - time.monotonic() <= 30
+    far = lifecycle._watchdog_monotonic_deadline(
+        {"deadline": wall, "monotonic_deadline": time.monotonic() + 10_000}
+    )
+    assert far - time.monotonic() <= 30
+    near = lifecycle._watchdog_monotonic_deadline(
+        {"deadline": wall, "monotonic_deadline": time.monotonic() + 5}
+    )
+    assert near - time.monotonic() <= 5

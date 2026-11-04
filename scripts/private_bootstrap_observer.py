@@ -122,6 +122,7 @@ class SupervisorLogReader:
         config = (
             "\n".join(
                 (
+                    "fail",
                     'header = "Accept: text/plain"',
                     f'url = "{_curl_value(url)}"',
                     f"max-time = {remaining:.6f}",
@@ -204,6 +205,7 @@ def observe(
     *,
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    lease_live: Callable[[], bool] = lambda: True,
 ) -> BootstrapObservation:
     """
     Observe only the current boot inside the watchdog's fixed cleanup reserve.
@@ -214,6 +216,7 @@ def observe(
     :param watchdog_deadline: Monotonic deadline inherited from the armed lifecycle lease.
     :param now: Monotonic clock seam for tests.
     :param sleep: Bounded sleep seam for tests.
+    :param lease_live: Called every poll; a false result means the owner tore the run down.
     """
     _validate_baseline(baseline)
     started = now()
@@ -224,6 +227,8 @@ def observe(
     anchor_offset: int | None = None
     last_phase = BootstrapPhase.UNKNOWN
     while now() < deadline:
+        if not lease_live():
+            return _unknown(False)
         try:
             raw = reader.read(deadline)
         except ObserverError:
@@ -296,12 +301,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.run is None or args.baseline is None:
             parser.error("observe requires --run and --baseline")
         baseline = LogBaseline(**json.loads(args.baseline))
+        deadline = _watchdog_deadline(args.root, args.run)
         result = observe(
-            reader, LoopbackApiProbe(), baseline, _watchdog_deadline(args.root, args.run)
+            reader,
+            LoopbackApiProbe(),
+            baseline,
+            deadline,
+            lease_live=lambda: _lease_is_live(args.root, args.run),
         )
         sys.stdout.write(json.dumps(asdict(result), sort_keys=True) + "\n")
         return 0
-    except (lifecycle.LifecycleError, ObserverError, TypeError, ValueError, json.JSONDecodeError):
+    except (lifecycle.LifecycleError, ObserverError, OSError, KeyError, TypeError, ValueError):
         sys.stderr.write("Bootstrap observer refused\n")
         return 1
 
@@ -313,7 +323,9 @@ def _classify(current_boot: bytes) -> BootstrapPhase:
         return BootstrapPhase.FAILURE
     if _RUNTIME_STARTED.search(text):
         return BootstrapPhase.RUNTIME
-    if _SOURCE_INSTALLED.search(text) or _DEPENDENCY_FETCH.search(text):
+    if _SOURCE_INSTALLED.search(text):
+        return BootstrapPhase.SOURCE_INSTALL
+    if _DEPENDENCY_FETCH.search(text):
         return BootstrapPhase.FETCHING_DEPS
     return BootstrapPhase.SOURCE_INSTALL
 
@@ -347,7 +359,7 @@ def _remaining(deadline: float) -> float:
 def _validate_baseline(baseline: LogBaseline) -> None:
     """Require exactly one safe bounded pre-start prefix identity."""
     if (
-        not isinstance(baseline.bytes, int)
+        type(baseline.bytes) is not int
         or baseline.bytes < 0
         or baseline.bytes > MAX_LOG_BYTES
         or not re.fullmatch(r"[0-9a-f]{64}", baseline.sha256)
@@ -364,15 +376,24 @@ def _curl_value(value: str) -> str:
 
 def _watchdog_deadline(root: Path, run_id: str) -> float:
     """Read only a live armed lease deadline; this observer never arms or mutates it."""
-    run_dir, snapshot = lifecycle.load_snapshot(root, run_id)
-    watch = lifecycle._load_watchdog(run_dir, snapshot)
+    _, snapshot = lifecycle.load_snapshot(root, run_id)
+    deadline = lifecycle.load_watchdog_deadline(root, run_id)
     _require_live_lease(root, snapshot.run_id, snapshot.nonce)
-    deadline = watch.get("monotonic_deadline")
-    if not isinstance(deadline, float) or not math.isfinite(deadline):
+    if not math.isfinite(deadline):
         raise ObserverError("watchdog lease deadline is invalid")
     if deadline - time.monotonic() <= CLEANUP_RESERVE:
         raise ObserverError("watchdog lease has no cleanup reserve")
     return deadline
+
+
+def _lease_is_live(root: Path, run_id: str) -> bool:
+    """Return whether the run's watchdog lease is still live and owned by it."""
+    try:
+        _, snapshot = lifecycle.load_snapshot(root, run_id)
+        _require_live_lease(root, snapshot.run_id, snapshot.nonce)
+    except (lifecycle.LifecycleError, ObserverError, OSError, KeyError):
+        return False
+    return True
 
 
 def _require_live_lease(root: Path, run_id: str, nonce: str) -> None:
@@ -386,7 +407,7 @@ def _require_live_lease(root: Path, run_id: str, nonce: str) -> None:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ObserverError("watchdog lease is unsafe")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             pass
         else:

@@ -355,3 +355,101 @@ def test_invalid_baseline_is_refused(baseline_data: observer.LogBaseline) -> Non
             now=lambda: 0.0,
             sleep=lambda _seconds: None,
         )
+
+
+def test_lease_loss_mid_run_fails_unknown() -> None:
+    """A torn-down owner run must not keep yielding bootstrap results."""
+    log = current("start")
+    reader = SequenceReader([log, log + current(f"Installing nredd/server@{SOURCE}")])
+    clock = Clock()
+    leases = iter([True, False])
+    result = observer.observe(
+        reader,
+        SequenceProbe([False]),
+        baseline(log),
+        1000.0,
+        now=clock.now,
+        sleep=clock.sleep,
+        lease_live=lambda: next(leases),
+    )
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
+    assert not result.log_continuity
+
+
+def test_bool_baseline_size_is_refused() -> None:
+    """`True` is an int subclass but not a byte length."""
+    with pytest.raises(observer.ObserverError, match="baseline"):
+        observer.observe(
+            SequenceReader([b""]),
+            SequenceProbe([False]),
+            observer.LogBaseline(True, "0" * 64),  # type: ignore[arg-type]
+            10.0,
+            now=lambda: 0.0,
+            sleep=lambda _seconds: None,
+        )
+
+
+def test_installed_marker_is_source_install_and_fetch_is_deps() -> None:
+    """Phase names follow the evidence they describe."""
+    assert observer._classify(b"Fetching wheel\n") is observer.BootstrapPhase.FETCHING_DEPS
+    assert (
+        observer._classify(b"Installed music-assistant\n") is observer.BootstrapPhase.SOURCE_INSTALL
+    )
+
+
+class _Completed:
+    def __init__(self, returncode: int, stdout: bytes) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"), [(63, b""), (22, b"error"), (0, b"x" * (observer.MAX_LOG_BYTES + 1))]
+)
+def test_log_reader_fails_closed_without_leaking_token(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: bytes
+) -> None:
+    """Non-200, oversize and curl failures are sanitized errors; the token stays off argv."""
+    seen: dict[str, Any] = {}
+
+    def run(argv: list[str], **kwargs: Any) -> _Completed:
+        seen["argv"] = argv
+        seen["input"] = kwargs["input"]
+        return _Completed(returncode, stdout)
+
+    monkeypatch.setattr(observer.subprocess, "run", run)
+    reader = observer.SupervisorLogReader("a" * 40)
+    with pytest.raises(observer.ObserverError):
+        reader.read(time.monotonic() + 5)
+    assert not any("a" * 40 in arg for arg in seen["argv"])
+    assert seen["input"].startswith(b"fail\n")
+
+
+@pytest.mark.parametrize(
+    "stdout", [b'{"a":1}\n500', b"[]\n200", b"not-json\n200", b"{}", b"x" * 5000 + b"\n200"]
+)
+def test_api_probe_rejects_bad_responses(monkeypatch: pytest.MonkeyPatch, stdout: bytes) -> None:
+    """Only a bounded JSON object with HTTP 200 is api-ready."""
+    monkeypatch.setattr(observer.subprocess, "run", lambda *_a, **_k: _Completed(0, stdout))
+    assert not observer.LoopbackApiProbe().ready(time.monotonic() + 5)
+
+
+def test_api_probe_accepts_json_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bounded JSON object with 200 is ready."""
+    monkeypatch.setattr(
+        observer.subprocess, "run", lambda *_a, **_k: _Completed(0, b'{"a":1}\n200')
+    )
+    assert observer.LoopbackApiProbe().ready(time.monotonic() + 5)
+
+
+def test_lease_rejects_other_owner_and_unsafe_mode(tmp_path: Path) -> None:
+    """Another run's lease or a group-readable lock file is refused."""
+    lock = tmp_path / "watchdog.lock"
+    lock.write_text(json.dumps({"run_id": "r", "nonce": "n"}))
+    lock.chmod(0o666)
+    with pytest.raises(observer.ObserverError, match="unsafe"):
+        observer._require_live_lease(tmp_path, "r", "n")
+    lock.chmod(0o600)
+    with pytest.raises(observer.ObserverError, match="not live"):
+        observer._require_live_lease(tmp_path, "r", "n")
+    assert not observer._lease_is_live(tmp_path, "r")
