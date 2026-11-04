@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.private_trial_scope import TrialScope, check_players
+from scripts.private_trial_scope import TrialMode, TrialScope, check_players
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -78,7 +78,7 @@ def test_invalid_fields() -> None:
     for field, values in cases.items():
         for value in values:
             data = inventory() | {field: value}
-            with pytest.raises(ValueError, match=r".+"):
+            with pytest.raises((TypeError, ValueError), match=r".+"):
                 TrialScope.parse(data)
 
 
@@ -127,14 +127,14 @@ def test_player_scope_rechecks_receiver_class_by_mode() -> None:
         "device_info": {"manufacturer": "Apple", "model": "HomePod Mini"},
     }
     tv = homepod | {"device_info": {"manufacturer": "Apple", "model": "Apple TV 4K Gen3"}}
-    check_players([homepod], "ap021122334455", "homepod-ptp")
-    check_players([tv], "ap021122334455", "tv-raop")
+    check_players([homepod], "ap021122334455", TrialMode.HOME_POD_PTP)
+    check_players([tv], "ap021122334455", TrialMode.TV_RAOP)
     for players, mode in (
-        ([], "homepod-ptp"),
-        ([homepod, homepod], "homepod-ptp"),
-        ([homepod | {"player_id": "apaaaaaaaaaaaa"}], "homepod-ptp"),
-        ([tv], "homepod-ptp"),
-        ([homepod], "tv-raop"),
+        ([], TrialMode.HOME_POD_PTP),
+        ([homepod, homepod], TrialMode.HOME_POD_PTP),
+        ([homepod | {"player_id": "apaaaaaaaaaaaa"}], TrialMode.HOME_POD_PTP),
+        ([tv], TrialMode.HOME_POD_PTP),
+        ([homepod], TrialMode.TV_RAOP),
     ):
         with pytest.raises(ValueError, match=r".+"):
             check_players(players, "ap021122334455", mode)
