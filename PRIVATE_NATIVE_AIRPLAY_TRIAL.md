@@ -286,10 +286,16 @@ of baseline membership. New unrelated excluded traffic can conservatively fail t
 The capture is passive except for that target-only control; inventory completeness and
 link-MAC correctness are operator responsibilities, not facts inferred by a zero count.
 
-Only `homepod-ptp` mode is implemented. Readiness rechecks the exact admitted player and
-requires an Apple HomePod model before reading the PTP receipt or offering playback.
-TV/RAOP modes and unknown models refuse rather than reporting PTP readiness for them.
-This does not establish or rule out native receiver-side groups.
+Two explicit modes are implemented. `homepod-ptp` rechecks the exact admitted Apple HomePod
+model before reading the PTP receipt or offering playback. `tv-raop` rechecks the exact admitted
+Apple TV model (`Apple TV*`) and ends after the stable single-player admission and isolation
+checks. It does not query PTP readiness or request playback, capture, a native volume rail, or
+session volume. A TV scope does not change stream configuration: its default receiver policy
+remains CLI `--protocol auto` with the discovered RAOP compatibility metadata, while
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE`, `CLIAIRPLAY_NATIVE_VOLUME_RAIL`,
+`CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE`, and `CLIAIRPLAY_SESSION_VOLUME` remain off.
+Unknown modes and receiver classes refuse. This does not establish or rule out native
+receiver-side groups, live TV compatibility, or native controls.
 
 CLI pin/source attestation, manual sibling-stop/catalog preflight, independent lifecycle
 lease/watchdog, no-target hold, stable single-player admission checks and receipted

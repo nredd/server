@@ -191,7 +191,7 @@ SCOPE_HELPER="$(cd "$(dirname "$0")" && pwd)/private_trial_scope.py"
 [[ $# == 1 ]] || { printf 'Usage: %s SCOPE.json\n' "$0" >&2; exit 2; }
 SCOPE_ASSIGNMENTS=$(python3 "$SCOPE_HELPER" --scope "$1") || exit 2
 eval "$SCOPE_ASSIGNMENTS"
-readonly TRIAL_TARGET TRIAL_PLAYER TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER
+readonly TRIAL_TARGET TRIAL_PLAYER TRIAL_MODE TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER
 
 TOTAL_STAGES=12
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
@@ -271,7 +271,7 @@ remote "python3 $LIFECYCLE_SCRIPT preflight" || fail "preflight refused: the cat
 
 # ── 3 ─────────────────────────────────────────────────────────────────────
 stage "Review the validated scope (no excluded-device discovery)"
-say "Admitted target: $TRIAL_TARGET ($TRIAL_PLAYER) at $TARGET_IP"
+say "Admitted target: $TRIAL_TARGET ($TRIAL_PLAYER) at $TARGET_IP in $TRIAL_MODE mode"
 say "Capture: $CAP_FILTER"
 say "Excluded-only verdict: $EXCLUDED_FILTER"
 say "No ping, ARP or neighbor lookup of excluded endpoints is performed."
@@ -375,22 +375,26 @@ if (( ABORTED )); then say "Skipped (fail-closed already failed)."; else
 fi
 
 # ── 10 ────────────────────────────────────────────────────────────────────
-stage "Readiness receipt and (optional) playback"
+stage "Verify the mode-specific admission boundary"
 if (( ABORTED )); then say "Skipped."; else
-  # Recheck the same admitted player and refuse unsupported receiver classes.
-  api players/all | python3 "$SCOPE_HELPER" --check-players "$TRIAL_PLAYER" \
-    || fail "Readiness refused: target scope or supported HomePod class not established."
-  READY=$(api airplay/private_native_volume_capture/readiness/get)
-  printf '%s\n' "$READY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("ptp_ready","prestream_ready","playing_ready")}); s=d["startup_validation"]; print("check:",s.get("check_label"),s.get("check_outcome"),"provenance:",d["installer_provenance"]["status"])'
-  PTP=$(printf '%s\n' "$READY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ptp_ready"])')
-  if [[ "$PTP" != "True" ]]; then
-    warn "ptp_ready false: the daemon did not attest strict peers. Skipping playback."
-  elif confirm "Play a short stream to $TRIAL_PLAYER at volume 20?"; then
-    api players/cmd/volume_set "{\"player_id\":\"$TRIAL_PLAYER\",\"volume_level\":20}" >/dev/null
-    api player_queues/play_media "{\"queue_id\":\"$TRIAL_PLAYER\",\"media\":\"https://ice1.somafm.com/groovesalad-128-mp3\"}" >/dev/null
-    pause "Playing. Press Enter to stop playback"
-    api players/cmd/stop "{\"player_id\":\"$TRIAL_PLAYER\"}" >/dev/null
-    api airplay/private_native_volume_capture/readiness/get | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after playback:",[{k:r[k] for k in ("protocol","flow","timing","playing","ready")} for r in d["streams"]])'
+  api players/all | python3 "$SCOPE_HELPER" --check-players "$TRIAL_PLAYER" --trial-mode "$TRIAL_MODE" \
+    || fail "Readiness refused: target scope or mode-specific receiver class not established."
+  if [[ "$TRIAL_MODE" == "tv-raop" ]]; then
+    say "TV RAOP mode verifies only the exact admitted TV player and isolation boundary."
+    say "It does not query PTP readiness or request playback, capture, rail, or session volume."
+  else
+    READY=$(api airplay/private_native_volume_capture/readiness/get)
+    printf '%s\n' "$READY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("ptp_ready","prestream_ready","playing_ready")}); s=d["startup_validation"]; print("check:",s.get("check_label"),s.get("check_outcome"),"provenance:",d["installer_provenance"]["status"])'
+    PTP=$(printf '%s\n' "$READY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ptp_ready"])')
+    if [[ "$PTP" != "True" ]]; then
+      warn "ptp_ready false: the daemon did not attest strict peers. Skipping playback."
+    elif confirm "Play a short stream to $TRIAL_PLAYER at volume 20?"; then
+      api players/cmd/volume_set "{\"player_id\":\"$TRIAL_PLAYER\",\"volume_level\":20}" >/dev/null
+      api player_queues/play_media "{\"queue_id\":\"$TRIAL_PLAYER\",\"media\":\"https://ice1.somafm.com/groovesalad-128-mp3\"}" >/dev/null
+      pause "Playing. Press Enter to stop playback"
+      api players/cmd/stop "{\"player_id\":\"$TRIAL_PLAYER\"}" >/dev/null
+      api airplay/private_native_volume_capture/readiness/get | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after playback:",[{k:r[k] for k in ("protocol","flow","timing","playing","ready")} for r in d["streams"]])'
+    fi
   fi
 fi
 

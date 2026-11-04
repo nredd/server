@@ -12,6 +12,7 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass
+from enum import StrEnum
 from ipaddress import IPv4Address
 from pathlib import Path
 
@@ -21,12 +22,20 @@ SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}")
 FIELDS = {"target", "target_ip", "target_link_mac", "excluded", "host_ip", "ssh_host", "mode"}
 
 
+class TrialMode(StrEnum):
+    """One supported receiver trial policy."""
+
+    HOME_POD_PTP = "homepod-ptp"
+    TV_RAOP = "tv-raop"
+
+
 @dataclass(frozen=True)
 class TrialScope:
     """One validated scope shared by admission, capture and verdict."""
 
     target: str
     player: str
+    mode: TrialMode
     target_ip: str
     host_ip: str
     ssh_host: str
@@ -41,8 +50,7 @@ class TrialScope:
         target = data["target"]
         if not isinstance(target, str) or not (match := TARGET.fullmatch(target)):
             raise ValueError("Target must be a MAC@name with a safe DNS instance name")
-        if data["mode"] != "homepod-ptp":
-            raise ValueError("Only homepod-ptp is supported; TV/RAOP readiness is unsupported")
+        mode = _trial_mode(data["mode"])
         ssh_host = data["ssh_host"]
         if not isinstance(ssh_host, str) or not SSH_HOST.fullmatch(ssh_host):
             raise ValueError("ssh_host must be a plain SSH host alias")
@@ -80,6 +88,7 @@ class TrialScope:
         return cls(
             f"{match[1].lower()}@{match[2]}",
             f"ap{match[1].lower()}",
+            mode,
             target_ip,
             host_ip,
             ssh_host,
@@ -92,6 +101,7 @@ class TrialScope:
         values = {
             "TRIAL_TARGET": self.target,
             "TRIAL_PLAYER": self.player,
+            "TRIAL_MODE": self.mode,
             "TARGET_IP": self.target_ip,
             "HAOS_IP": self.host_ip,
             "HOST": self.ssh_host,
@@ -101,22 +111,22 @@ class TrialScope:
         return "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
 
 
-def check_players(data: object, player_id: str) -> None:
-    """Refuse readiness unless exactly the admitted HomePod is registered."""
+def check_players(data: object, player_id: str, mode: TrialMode) -> None:
+    """Refuse readiness unless exactly the admitted mode-specific target is registered."""
     if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
         raise ValueError("Malformed players response")
     players = [item for item in data if str(item.get("player_id", "")).startswith("ap")]
     if len(players) != 1 or players[0].get("player_id") != player_id:
         raise ValueError("Registered AirPlay players differ from the validated scope")
     info = players[0].get("device_info")
-    if (
-        not isinstance(info, dict)
-        or info.get("manufacturer") != "Apple"
-        or info.get("model") not in ("HomePod", "HomePod Mini", "HomePod 2")
-    ):
-        raise ValueError(
-            "Unsupported target class: this wizard only verifies HomePod PTP readiness"
-        )
+    if not isinstance(info, dict) or info.get("manufacturer") != "Apple":
+        raise ValueError("Unsupported target class")
+    model = info.get("model")
+    if mode == TrialMode.HOME_POD_PTP and model in ("HomePod", "HomePod Mini", "HomePod 2"):
+        return
+    if mode == TrialMode.TV_RAOP and isinstance(model, str) and model.startswith("Apple TV"):
+        return
+    raise ValueError(f"Unsupported target class for mode: '{mode}'")
 
 
 def main() -> int:
@@ -125,16 +135,31 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--scope", type=Path)
     mode.add_argument("--check-players", metavar="PLAYER_ID")
+    parser.add_argument("--trial-mode", choices=tuple(TrialMode))
     args = parser.parse_args()
+    if args.check_players is not None and args.trial_mode is None:
+        parser.error("--check-players requires --trial-mode")
     try:
         if args.scope is not None:
             sys.stdout.write(TrialScope.parse(json.loads(args.scope.read_text())).shell() + "\n")
         else:
-            check_players(json.load(sys.stdin), args.check_players)
+            assert args.check_players is not None
+            assert args.trial_mode is not None
+            check_players(json.load(sys.stdin), args.check_players, TrialMode(args.trial_mode))
     except (ValueError, TypeError, OSError) as err:
         sys.stderr.write(f"Scope refused: {err}\n")
         return 2
     return 0
+
+
+def _trial_mode(value: object) -> TrialMode:
+    """Require one explicit supported receiver policy."""
+    if not isinstance(value, str):
+        raise TypeError("Mode must be a string")
+    try:
+        return TrialMode(value)
+    except ValueError as err:
+        raise ValueError(f"Invalid trial mode: {err}; expected homepod-ptp or tv-raop") from err
 
 
 def _ipv4(value: object) -> str:
