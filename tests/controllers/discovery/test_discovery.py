@@ -289,17 +289,13 @@ async def test_async_find_mdns_service_tries_past_a_stale_record(mass: MusicAssi
 async def test_async_find_mdns_service_rescans_after_a_stale_request(
     mass: MusicAssistant,
 ) -> None:
-    """
-    An instance announcing itself while a stale record is being resolved must still be found.
-
-    The stale request burns its whole share on a virtual loop clock rather than a real sleep:
-    the budget split is what is under test, so the verdict must not depend on how promptly a
-    loaded host wakes the event loop, nor on which order the cache set yields its candidates.
-    """
+    """An instance announcing itself while a stale record is being resolved must still be found."""
     cache = mass.discovery.aiozc.zeroconf.cache.cache = {
         "amplipi-stale._amplipi._tcp.local.": {},
     }
     attempts: list[str] = []
+    # The budget split is what is under test, so the stale request spends its share on a virtual
+    # loop clock instead of a real sleep: the verdict must not depend on host scheduling latency.
     loop = asyncio.get_running_loop()
     elapsed = 0.0
     start = loop.time()
@@ -316,7 +312,6 @@ async def test_async_find_mdns_service_rescans_after_a_stale_request(
                 cache["amplipi-live._amplipi._tcp.local."] = {}
                 for waiter in mass.discovery._mdns_waiters:
                     waiter.set()
-                # an unanswered request holds out for its full timeout
                 elapsed += timeout / 1000
                 await asyncio.sleep(0)
                 return False
