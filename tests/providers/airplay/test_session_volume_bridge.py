@@ -217,6 +217,44 @@ async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
         await rig.close()
 
 
+async def test_initial_retry_ignores_distinct_groups_and_confirmed_members() -> None:
+    """A group's publication retries only its unresolved checked streams."""
+    fixture = await make_bridge_rig(1)
+    manager = cast("AirPlayProvider", fixture.rig.streams[0].prov).bridge_manager
+    group_a = object()
+    group_b = object()
+
+    def bridge(group: object, confirmed: int | None) -> MagicMock:
+        """Build a bridge-shaped retry candidate with no real transport."""
+        stream = MagicMock()
+        stream.session_volume_requested = True
+        stream.session_volume.supported = True
+        stream.session_volume.confirmed_level = confirmed
+        stream._send_current_volume = AsyncMock()
+        return MagicMock(sendspin_group=group, _airplay_stream=stream)
+
+    owner = bridge(group_a, None)
+    same_group_confirmed = bridge(group_a, 60)
+    other_group_unresolved = bridge(group_b, None)
+    original = manager._bridges
+    try:
+        manager._bridges = {
+            "owner": cast("SendspinAirPlayBridge", owner),
+            "confirmed": cast("SendspinAirPlayBridge", same_group_confirmed),
+            "other": cast("SendspinAirPlayBridge", other_group_unresolved),
+        }
+        await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
+        owner._airplay_stream._send_current_volume.assert_awaited_once_with()
+        same_group_confirmed._airplay_stream._send_current_volume.assert_not_awaited()
+        other_group_unresolved._airplay_stream._send_current_volume.assert_not_awaited()
+
+        owner.sendspin_group = None
+        await manager.retry_initial_checked_volumes(cast("SendspinAirPlayBridge", owner))
+        owner._airplay_stream._send_current_volume.assert_awaited_once_with()
+    finally:
+        manager._bridges = original
+
+
 @pytest.mark.parametrize(
     "change", ["missing", "mixed", "replaced", "membership", "native", "cycle"]
 )
