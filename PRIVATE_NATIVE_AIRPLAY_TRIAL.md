@@ -454,7 +454,19 @@ are refused). The file holds a length, a SHA-256 prefix identity and a journal c
 contains machine and boot identifiers), never log content, so it is never printed or passed on
 argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
-`nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it. A healthy
+`nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it.
+
+The anchor is a *full line* match, and only these four official-entrypoint formats count:
+
+- `Building from source using server_repo: nredd/server@<sha>`
+- `Server repository: nredd/server@<sha>`
+- `Server URL: git+https://github.com/nredd/server@<sha>`
+- `Updating https://github.com/nredd/server (<sha>)` (the `uv` output line)
+
+Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
+suffix, additional text, a stale-baseline line, or a generic runtime/selector line alone is not
+an anchor. The `expected_source_seen` flag is a log reference to the expected source, *not*
+proof of the installed commit. A healthy
 prior boot of the same pin, stale provider traceback, log rotation, truncation, unreadable logs,
 or a changed baseline is `unknown`, never success or failure evidence for the new boot.
 
