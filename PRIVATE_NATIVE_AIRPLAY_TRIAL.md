@@ -454,7 +454,19 @@ are refused). The file holds a length, a SHA-256 prefix identity and a journal c
 contains machine and boot identifiers), never log content, so it is never printed or passed on
 argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
-`nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it. A healthy
+`nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it.
+
+The anchor is a *full line* match, and only these four formats count (the first three entrypoint lines are primary, the `uv` line is optional):
+
+- `Building from source using server_repo: nredd/server@<sha>`
+- `Server repository: nredd/server@<sha>`
+- `Server URL: git+https://github.com/nredd/server@<sha>`
+- `Updating https://github.com/nredd/server (<sha>)` (the `uv` output line)
+
+The `uv` line is best-effort and may be absent. Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
+suffix, additional text, a stale-baseline line, or a generic runtime/selector line alone is not
+an anchor. The `expected_source_seen` flag is a log reference to the expected source, *not*
+proof of the installed commit. A healthy
 prior boot of the same pin, stale provider traceback, log rotation, truncation, unreadable logs,
 or a changed baseline is `unknown`, never success or failure evidence for the new boot.
 
@@ -462,8 +474,11 @@ The safe result has only `phase`, `expected_source_seen`, `current_boot`, `api_r
 `budget_remaining`, and `log_continuity`. `phase` is one of `fetching-deps`, `source-install`,
 `runtime`, `api-ready`, `failure`, or `unknown`. `api-ready` means only the fixed API returned a
 bounded JSON object. It does not establish AirPlay provider readiness, player admission, installed
-source provenance, binary image identity, receiver contact, playback, or memory state. Current
-errors are recognized only after the new installer anchor.
+source provenance, binary image identity, receiver contact, playback, or memory state. `runtime` requires the
+real post-install startup line from `music_assistant/mass.py`,
+`Starting Music Assistant Server (<id>) version <v> ...`; `Step 1: Installing Music Assistant Server`,
+dependency output, `listening on` and other product-name mentions never count, so the API is not
+probed before it. Current errors are recognized only after the new installer anchor.
 
 The observer derives one absolute monotonic deadline from the existing armed lifecycle lease. It
 uses at most 480 seconds and always reserves the final 120 seconds for the independent watchdog

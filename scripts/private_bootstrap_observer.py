@@ -45,9 +45,21 @@ POLL_INTERVAL = 2.0
 
 _CURSOR = re.compile(r"[A-Za-z0-9=;_.-]{1,512}")
 
+# Real installer lines, from `music_assistant_dev/entrypoint.sh` in
+# https://github.com/music-assistant/home-assistant-addon (sha256 125c6500...40f2) and uv.
+# Each must be an entire line naming exactly `nredd/server` at `EXPECTED_SOURCE`, so another
+# repo, another SHA, or any prefix or suffix of either cannot anchor a boot. Only terminal
+# colour codes and a trailing carriage return may surround a line.
+_SHA = re.escape(EXPECTED_SOURCE.encode())
+_SGR = rb"(?:\x1b\[[0-9;]*m)*"
 _INSTALLER_ANCHOR = re.compile(
-    rb"\b(?:installing|updating)\b.*\bnredd/server@" + EXPECTED_SOURCE.encode() + rb"\b",
-    re.IGNORECASE,
+    rb"^" + _SGR + rb"(?:"
+    rb"Building from source using server_repo: nredd/server@" + _SHA + rb"|"
+    rb"Server repository: nredd/server@" + _SHA + rb"|"
+    rb"Server URL: git\+https://github\.com/nredd/server@" + _SHA + rb"|"
+    rb"Updating https://github\.com/nredd/server \(" + _SHA + rb"\)"
+    rb")" + _SGR + rb"\r?$",
+    re.MULTILINE,
 )
 _DEPENDENCY_FETCH = re.compile(
     r"\b(?:aiolibdatachannel|git update|resolving|fetching)\b", re.IGNORECASE
@@ -55,9 +67,10 @@ _DEPENDENCY_FETCH = re.compile(
 _SOURCE_INSTALLED = re.compile(
     r"\b(?:installed|built)\b.*\b(?:music-assistant|server)\b", re.IGNORECASE
 )
-_RUNTIME_STARTED = re.compile(
-    r"\b(?:starting music assistant|music assistant server|listening on)\b", re.IGNORECASE
-)
+# `music_assistant/mass.py` logs this once, after the install step, as
+# `Starting Music Assistant Server (<id>) version <v> - HA add-on: ...`. The entrypoint's
+# `Step 1: Installing Music Assistant Server`, dependency logs and product mentions never match.
+_RUNTIME_STARTED = re.compile(r"\bStarting Music Assistant Server \([^)\n]*\) version \S")
 _CURRENT_FAILURE = re.compile(
     r"\b(?:traceback|trialbinaryerror|jsondecodeerror|installation failed)\b", re.IGNORECASE
 )
@@ -413,7 +426,7 @@ def _classify(current_boot: bytes) -> BootstrapPhase:
 
 
 def _find_anchor(raw: bytes, offset: int) -> int | None:
-    """Return the first exact expected-source installer anchor after the baseline."""
+    """Return the offset of the first full installer line for `EXPECTED_SOURCE` after the baseline."""
     match = _INSTALLER_ANCHOR.search(raw, offset)
     return match.start() if match else None
 
