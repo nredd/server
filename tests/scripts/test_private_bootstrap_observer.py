@@ -20,11 +20,11 @@ from scripts import private_dev_lifecycle as lifecycle
 SOURCE = observer.EXPECTED_SOURCE
 # First line of the canonical add-on entrypoint (music-assistant/home-assistant-addon,
 # `music_assistant_dev/entrypoint.sh`) when `server_repo` is `nredd/server@<sha>`.
+ANCHOR = f"Building from source using server_repo: nredd/server@{SOURCE}"
 # Real `music_assistant/mass.py` startup line (the only runtime marker).
 STARTED = (
     "Starting Music Assistant Server (abc123) version 2.9.0 - HA add-on: True - Safe mode: False"
 )
-ANCHOR = f"Building from source using server_repo: nredd/server@{SOURCE}"
 
 
 class Clock:
@@ -932,7 +932,7 @@ NEAR_MISSES = [
     pytest.param(
         f"Built music-assistant @ git+https://github.com/nredd/server@{SOURCE}", id="built"
     ),
-    pytest.param(STARTED, id="runtime-alone"),
+    pytest.param(STARTED, id="startup-line-without-anchor"),
     pytest.param("Loaded player provider AirPlay", id="provider-alone"),
 ]
 
@@ -1000,7 +1000,7 @@ def test_pre_runtime_lines_are_not_runtime_and_never_probe(line: str) -> None:
 
 
 def test_truncated_real_transcript_before_built_is_not_api_ready() -> None:
-    """Critic repro: a transcript cut off after `Step 1` must not probe or report ready."""
+    """A transcript cut off after `Step 1` must not probe or report ready."""
     old = current("old boot line")
     log = old + current(
         ANCHOR,
@@ -1019,5 +1019,5 @@ def test_truncated_real_transcript_before_built_is_not_api_ready() -> None:
         sleep=clock.sleep,
     )
     assert not result.api_ready
-    assert result.phase in (observer.BootstrapPhase.SOURCE_INSTALL, observer.BootstrapPhase.UNKNOWN)
+    assert result.phase is observer.BootstrapPhase.SOURCE_INSTALL
     assert probe.deadlines == []

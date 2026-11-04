@@ -456,14 +456,14 @@ argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
 `nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it.
 
-The anchor is a *full line* match, and only these four official-entrypoint formats count:
+The anchor is a *full line* match, and only these four formats count (the first three entrypoint lines are primary, the `uv` line is optional):
 
 - `Building from source using server_repo: nredd/server@<sha>`
 - `Server repository: nredd/server@<sha>`
 - `Server URL: git+https://github.com/nredd/server@<sha>`
 - `Updating https://github.com/nredd/server (<sha>)` (the `uv` output line)
 
-The three entrypoint lines are the primary anchors; the `uv` line is optional, best-effort (it may be absent or differently formatted). Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
+The `uv` line is best-effort and may be absent. Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
 suffix, additional text, a stale-baseline line, or a generic runtime/selector line alone is not
 an anchor. The `expected_source_seen` flag is a log reference to the expected source, *not*
 proof of the installed commit. A healthy
