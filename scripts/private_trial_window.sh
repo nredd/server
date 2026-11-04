@@ -438,7 +438,8 @@ NON_IP=$(printf '%s\n' "$VERDICT" | awk '/^NON_IP /{print $2}')
 if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
   NON_IP=UNKNOWN
   if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
-    printf '  %sROUTED-IP SCOPE: no IPv4 violation observed%s (non-IP/L2/IPv6 UNKNOWN, not measured; NOT an isolation pass)\n' "$GREEN" "$RESET"
+    printf '  %sROUTED-IP SCOPE: no IPv4 violation observed%s (non-IP/L2/IPv6 UNKNOWN, not measured; NOT an isolation pass)\n' "$YELLOW" "$RESET"
+    VERDICT_PARTIAL=1
   else
     printf '  %sROUTED-IP SCOPE FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
     VERDICT_FAILED=1
@@ -452,5 +453,6 @@ fi
 say "The verdict reads only excluded endpoints from the validated inventory."
 warn "Restart sibling apps yourself if desired. The trial never does."
 
+if [[ "${VERDICT_FAILED:-0}" != 0 ]]; then exit 2; fi
+if [[ "${VERDICT_PARTIAL:-0}" != 0 ]]; then exit 3; fi
 finish
-[[ "${VERDICT_FAILED:-0}" == 0 ]] || exit 2

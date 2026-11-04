@@ -303,7 +303,10 @@ IPs, other peers, multicast, non-IP excluded). Synthetic example:
 
 Routed visibility is IPv4 only. L2, non-IP and IPv6 traffic are *not measured*: the
 verdict reports non-IP as `UNKNOWN`, and a clean result prints `ROUTED-IP SCOPE: no IPv4
-violation observed ... NOT an isolation pass`, never `ISOLATION PASS`. Schema success is
+violation observed ... NOT an isolation pass`, never `ISOLATION PASS`. A clean routed
+result exits 3 (partial), a verdict failure or abort exits 2, and an on-link isolation
+pass exits 0. Other operational errors may exit 1 or 2; callers must treat every nonzero
+status as not an isolation pass. Schema success is
 not identity proof: a fresh target identity and route preflight remains a separate
 required gate before any window.
 

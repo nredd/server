@@ -83,7 +83,7 @@ async def test_actual_verdict(tmp_path: Path, destination: str, passed: bool, ki
             TrialScope.parse(inventory()).shell(),
             f"CAP_FILE='{capture}'",
             f"BASE='{tmp_path / 'baseline'}'",
-            "WINDOW_START_EPOCH=0; ABORTED=0; GREEN=; RED=; RESET=",
+            "WINDOW_START_EPOCH=0; ABORTED=0; GREEN=; YELLOW=; RED=; RESET=",
             'remote() { /bin/bash -c "$1"; }',
             "say() { :; }; warn() { :; }; finish() { :; }; fail() { exit 1; }",
             flowkey,
@@ -189,14 +189,25 @@ async def test_routed_filters_match_exact_endpoints_only(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    ("destination", "failed"), [("192.0.2.10", False), ("198.51.100.20", True)]
+    ("visibility", "destination", "aborted", "status"),
+    [
+        ("routed", "192.0.2.10", 0, 3),
+        ("routed", "198.51.100.20", 0, 2),
+        ("routed", "192.0.2.10", 1, 2),
+        ("on-link", "192.0.2.10", 0, 0),
+        ("on-link", "198.51.100.20", 0, 2),
+        ("on-link", "192.0.2.10", 1, 2),
+    ],
 )
-async def test_routed_verdict_never_reads_as_isolation_pass(
-    tmp_path: Path, destination: str, failed: bool
+async def test_verdict_status_and_cleanup(
+    tmp_path: Path, visibility: str, destination: str, aborted: int, status: int
 ) -> None:
-    """Routed verdicts report non-IP as UNKNOWN, never `NON_IP 0` or the isolation pass."""
+    """Return distinct verdict statuses and run exit cleanup in every case."""
     capture = tmp_path / "window.pcap"
-    write_packets(capture, [packet("203.0.113.30", destination)])
+    frame = packet("203.0.113.30", destination)
+    if destination == "192.0.2.10":
+        frame = frame.replace(bytes.fromhex("02aabbccddee"), bytes.fromhex("021122334455"))
+    write_packets(capture, [frame])
     (tmp_path / "baseline.flows").write_text("")
     script = (ROOT / "scripts/private_trial_window.sh").read_text()
     flowkey = next(line for line in script.splitlines() if line.startswith("FLOWKEY="))
@@ -204,11 +215,13 @@ async def test_routed_verdict_never_reads_as_isolation_pass(
     command = "\n".join(
         [
             "set -euo pipefail",
-            TrialScope.parse(routed_inventory()).shell(),
+            TrialScope.parse(routed_inventory() if visibility == "routed" else inventory()).shell(),
             f"CAP_FILE='{capture}'",
             f"BASE='{tmp_path / 'baseline'}'",
-            "WINDOW_START_EPOCH=0; ABORTED=0; GREEN=; RED=; RESET=",
-            'remote() { /bin/bash -c "$1"; }',
+            f"WINDOW_START_EPOCH=0; ABORTED={aborted}; GREEN=green; YELLOW=yellow; RED=red; RESET=reset",
+            f"CAP=capture; RUN_ID=run; LIFECYCLE_SCRIPT=lifecycle; MARKER='{tmp_path / 'cleanup'}'",
+            'remote() { if [[ "$1" == set\\ -eu* ]]; then /bin/bash -c "$1"; else printf "%s\\n" "$1" >> "$MARKER"; fi; }',
+            script[script.index("cleanup() {") : script.index("fail() {")],
             "say() { :; }; warn() { :; }; finish() { :; }; fail() { exit 1; }",
             flowkey,
             verdict,
@@ -223,9 +236,15 @@ async def test_routed_verdict_never_reads_as_isolation_pass(
         env=os.environ | {"PATH": f"{Path(str(TCPDUMP)).parent}:{os.environ['PATH']}"},
     )
     stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-    assert (process.returncode != 0) is failed, stdout + stderr
-    assert b"ISOLATION PASS" not in stdout
-    assert b"NON_IP 0" not in stdout
-    assert b"NON_IP UNKNOWN" in stdout
-    assert (b"ROUTED-IP SCOPE FAIL" in stdout) is failed
-    assert (b"NOT an isolation pass" in stdout) is not failed
+    assert process.returncode == status, stdout + stderr
+    cleanup = (tmp_path / "cleanup").read_text()
+    assert "lifecycle stop --run run" in cleanup
+    assert "kill $(cat capture.pid" in cleanup
+    if visibility == "routed":
+        assert b"ISOLATION PASS" not in stdout
+        assert b"NON_IP 0" not in stdout
+        assert b"NON_IP UNKNOWN" in stdout
+        assert (b"ROUTED-IP SCOPE FAIL" in stdout) is (status == 2)
+        assert (b"yellowROUTED-IP SCOPE:" in stdout) is (status == 3)
+    else:
+        assert (b"greenISOLATION PASS" in stdout) is (status == 0)
