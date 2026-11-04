@@ -33,9 +33,14 @@ the merged `nredd/airplay-cli` commit containing the prior receive-only trial wo
 bounded STOP, resolver, and RTSP response handling repairs. GitHub workflow `41716916801`
 passed its build, sanitizer, and updater jobs. Its aarch64 artifact has ELF SHA256
 `bdbece07a15eca764c84a83eac4e6dc4bacc3770370df891b20e869db66e51f1` (6152968 bytes)
-and expected build label `ve255a82`. Runtime acceptance for this exact artifact remains
-separate and required: it is not staged, deployed, or authorized for a trial. Earlier
-assets stay staged as history.
+and expected build label `ve255a82`. Scoped runtime acceptance is cleared for this exact
+artifact's synthetic loopback lifecycle contract: the natural handshake rejection reached
+EOF with no extra handshake bytes or UDP and cleaned up naturally; the test-only two-second
+deadline rejected as `child_deadline` and cleaned up before rescue. The retained rejection,
+STOP, SIGTERM, and SIGINT cases also pass. This acceptance excludes receiver identity,
+snapshot freshness, receiver admission, playback, native volume behavior, and deployment.
+The candidate remains an immutable acceptance artifact only; `launch_authorized` stays
+false and no trial deployment is authorized. Earlier assets stay staged as history.
 
 ## Private aggregate volume capture
 
