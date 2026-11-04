@@ -447,8 +447,12 @@ never prints raw logs, tokens, option values, paths, identities, response bodies
 measurements.
 
 Capture `baseline` while DEV is confirmed stopped, then arm/start only through the lifecycle
-controller and invoke `observe` with that lifecycle run and the baseline JSON. The baseline is a
-length and SHA-256 prefix identity, not log content. A boot is current only if the current log is
+controller and invoke `observe` with that lifecycle run. `baseline --baseline-file PATH` creates
+the file exclusively with mode 0600 and prints only `Baseline captured`; `observe` reads it with
+the same `--baseline-file PATH` (symlinks, foreign owners, loose permissions and bad payloads
+are refused). The file holds a length, a SHA-256 prefix identity and a journal cursor (which
+contains machine and boot identifiers), never log content, so it is never printed or passed on
+argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
 `nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it. A healthy
 prior boot of the same pin, stale provider traceback, log rotation, truncation, unreadable logs,
@@ -472,11 +476,11 @@ The observer rechecks the live lease on every poll, and again after a blocking l
 probe before it can report `api-ready`; a dead lease or expired deadline yields `unknown`.
 The Supervisor add-on log endpoint defaults to a sliding tail of the last 100 journal entries,
 so the baseline records the journal cursor (`X-First-Cursor`) of its first entry, and later
-reads use the supported `Range: entries=<cursor>::<count>` header to start at that exact entry
+reads use the supported `Range: entries=<cursor>:0:2000` header to start at that exact entry
 (Supervisor 2026.10.5 `api/host.py` `advanced_logs_handler`; systemd journal-gatewayd). The
 baseline cursor must come back as the first entry again; if journald vacuumed it, the result is
-`unknown`. Reads over 256 KiB or at the 2000-entry cap (conservatively, 2000 lines) also yield `unknown`. The live-lease probe takes a
-non-blocking shared flock only, and the lifecycle `start` probe is shared too, so an observer
+`unknown`. Reads over 256 KiB or at the 2000-entry cap (conservatively, 2000 lines) also yield
+`unknown`. The live-lease probe takes a non-blocking shared flock only, and the lifecycle `start` probe is shared too, so an observer
 can never make a dead watchdog look alive; arm the watchdog before observing, because an
 observer's momentary shared lock can make a concurrent `arm` report the lease as taken. Capture
 the baseline while DEV is stopped; this is an operator step and is not enforced by code.

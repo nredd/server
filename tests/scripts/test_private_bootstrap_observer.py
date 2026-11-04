@@ -341,7 +341,10 @@ def test_cli_failure_does_not_echo_lifecycle_exception(
 ) -> None:
     """An invalid lifecycle run produces the fixed refusal line, never its untrusted value."""
     monkeypatch.setenv("SUPERVISOR_TOKEN", "private-token")
-    assert observer.main(["observe", "--run", "token-like-run", "--baseline", "{}"]) == 1
+    assert (
+        observer.main(["observe", "--run", "token-like-run", "--baseline-file", "/nonexistent"])
+        == 1
+    )
     captured = capsys.readouterr()
     assert captured.err == "Bootstrap observer refused\n"
     assert "token-like-run" not in captured.err
@@ -364,7 +367,7 @@ def test_invalid_baseline_is_refused(baseline_data: observer.LogBaseline) -> Non
 
 
 def test_lease_loss_mid_run_fails_unknown() -> None:
-    """A torn-down owner run must not keep yielding bootstrap results."""
+    """A torn-down owner run must not keep yielding bootstrap results at the next poll."""
     log = current("start")
     reader = SequenceReader([log, log + current(f"Installing nredd/server@{SOURCE}")])
     clock = Clock()
@@ -380,6 +383,7 @@ def test_lease_loss_mid_run_fails_unknown() -> None:
     )
     assert result.phase is observer.BootstrapPhase.UNKNOWN
     assert not result.log_continuity
+    assert len(reader.deadlines) == 1
 
 
 def test_bool_baseline_size_is_refused() -> None:
@@ -459,38 +463,57 @@ def test_lease_rejects_other_owner_and_unsafe_mode(tmp_path: Path) -> None:
     assert not observer._lease_is_live(tmp_path, "r")
 
 
-def _api_ready_run(lease_after: bool, clock_jump: float) -> observer.BootstrapObservation:
-    """Run to a `runtime` log with a probe that blocks, then optionally kills lease/budget."""
+class BlockingProbe:
+    """Record invocation and advance the fake clock while "blocking"."""
+
+    def __init__(self, clock: Clock, jump: float) -> None:
+        """Keep the clock to advance and the blocking duration."""
+        self.clock = clock
+        self.jump = jump
+        self.calls = 0
+
+    def ready(self, _deadline: float) -> bool:
+        """Block, then report a ready API."""
+        self.calls += 1
+        self.clock.value += self.jump
+        return True
+
+
+def _api_ready_run(
+    lease_after: bool, clock_jump: float
+) -> tuple[observer.BootstrapObservation, BlockingProbe]:
+    """Reach `runtime` on the FIRST poll so only the post-probe recheck can intervene."""
     clock = Clock()
     log = current("start")
     runtime = log + current(f"Installing nredd/server@{SOURCE}", "Starting Music Assistant")
-
-    class BlockingProbe:
-        def ready(self, deadline: float) -> bool:
-            clock.value += clock_jump
-            return True
-
+    probe = BlockingProbe(clock, clock_jump)
     leases = iter([True, lease_after])
-    return observer.observe(
-        SequenceReader([log, runtime]),
-        BlockingProbe(),
+    result = observer.observe(
+        SequenceReader([runtime]),
+        probe,
         baseline(log),
         1000.0,
         now=clock.now,
         sleep=clock.sleep,
-        lease_live=lambda: next(leases, lease_after),
+        lease_live=lambda: next(leases),
     )
+    return result, probe
 
 
 def test_lease_dying_during_api_probe_is_unknown() -> None:
     """A probe that blocks while the owner tears down must not report api-ready."""
-    assert _api_ready_run(False, 0.0).phase is observer.BootstrapPhase.UNKNOWN
-    assert _api_ready_run(True, 0.0).phase is observer.BootstrapPhase.API_READY
+    result, probe = _api_ready_run(False, 0.0)
+    assert probe.calls == 1
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
+    result, probe = _api_ready_run(True, 0.0)
+    assert probe.calls == 1
+    assert result.phase is observer.BootstrapPhase.API_READY
 
 
 def test_deadline_expiring_during_api_probe_is_not_ready() -> None:
     """A probe returning after the absolute deadline cannot be a ready observation."""
-    result = _api_ready_run(True, 10_000.0)
+    result, probe = _api_ready_run(True, 10_000.0)
+    assert probe.calls == 1
     assert result.phase is observer.BootstrapPhase.UNKNOWN
     assert not result.api_ready
 
@@ -600,14 +623,116 @@ def test_failure_after_lease_loss_is_unknown() -> None:
     """A failure line read just as the owner tears down is not a result."""
     log = current("start")
     bad = log + current(f"Installing nredd/server@{SOURCE}", "Traceback boom")
+    reader = SequenceReader([bad])
     leases = iter([True, False])
     result = observer.observe(
-        SequenceReader([log, bad]),
+        reader,
         SequenceProbe([False]),
         baseline(log),
         1000.0,
         now=Clock().now,
         sleep=lambda _s: None,
-        lease_live=lambda: next(leases, False),
+        lease_live=lambda: next(leases),
     )
+    assert len(reader.deadlines) == 1
     assert result.phase is observer.BootstrapPhase.UNKNOWN
+    live = observer.observe(
+        SequenceReader([bad]),
+        SequenceProbe([False]),
+        baseline(log),
+        1000.0,
+        now=Clock().now,
+        sleep=lambda _s: None,
+    )
+    assert live.phase is observer.BootstrapPhase.FAILURE
+
+
+class _CliReader:
+    """Stand in for the Supervisor reader in CLI tests."""
+
+    def __init__(self, *_args: Any) -> None:
+        self.first_cursor: str | None = "s=SECRETMACHINE;i=1;b=SECRETBOOT"
+
+    def read(self, _deadline: float) -> bytes:
+        return b"line one\nline two\n"
+
+
+def test_baseline_cli_writes_owner_only_file_and_prints_nothing_sensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The raw cursor lives only in a 0600 file; stdout is a fixed line, argv never has it."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
+    monkeypatch.setattr(observer, "SupervisorLogReader", _CliReader)
+    target = tmp_path / "baseline.json"
+    assert observer.main(["baseline", "--baseline-file", str(target)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "Baseline captured\n"
+    assert "SECRET" not in captured.out + captured.err
+    assert str(tmp_path) not in captured.out + captured.err
+    assert target.stat().st_mode & 0o777 == 0o600
+    saved = json.loads(target.read_text())
+    assert saved["cursor"].startswith("s=SECRETMACHINE")
+    # exclusive: a second capture never replaces an existing baseline
+    assert observer.main(["baseline", "--baseline-file", str(target)]) == 1
+    assert capsys.readouterr().err == "Bootstrap observer refused\n"
+
+
+def test_baseline_cli_refuses_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A planted symlink is never followed when creating the baseline."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
+    monkeypatch.setattr(observer, "SupervisorLogReader", _CliReader)
+    victim = tmp_path / "victim"
+    link = tmp_path / "baseline.json"
+    link.symlink_to(victim)
+    assert observer.main(["baseline", "--baseline-file", str(link)]) == 1
+    assert not victim.exists()
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        "[]",
+        '{"bytes":1}',
+        '{"bytes":1,"sha256":"%s","cursor":"bad cursor","x":1}' % ("0" * 64),
+        '{"bytes":1,"sha256":"%s","cursor":"bad cursor"}' % ("0" * 64),
+    ],
+)
+def test_observe_cli_refuses_bad_baseline_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+) -> None:
+    """Malformed, extra-key or injected-cursor baselines are refused with the fixed line."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
+    monkeypatch.setattr(observer, "_watchdog_deadline", lambda *_a: time.monotonic() + 1000)
+    path = tmp_path / "b.json"
+    path.write_text(payload)
+    path.chmod(0o600)
+    assert observer.main(["observe", "--run", "r", "--baseline-file", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "Bootstrap observer refused\n"
+    assert captured.out == ""
+
+
+def test_observe_cli_refuses_loose_permissions_and_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A group-readable or symlinked baseline file is unsafe input."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
+    good = json.dumps({"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(), "cursor": ""})
+    loose = tmp_path / "loose.json"
+    loose.write_text(good)
+    loose.chmod(0o644)
+    assert observer.main(["observe", "--run", "r", "--baseline-file", str(loose)]) == 1
+    link = tmp_path / "link.json"
+    real = tmp_path / "real.json"
+    real.write_text(good)
+    real.chmod(0o600)
+    link.symlink_to(real)
+    assert observer.main(["observe", "--run", "r", "--baseline-file", str(link)]) == 1
+    assert capsys.readouterr().out == ""

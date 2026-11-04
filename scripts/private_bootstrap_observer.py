@@ -139,7 +139,15 @@ class SupervisorLogReader:
         self.first_cursor: str | None = None
 
     def read(self, deadline: float) -> bytes:
-        """Fetch bounded log bytes with no redirect or inherited environment."""
+        """
+        Fetch bounded log bytes.
+
+        :param deadline: Absolute `time.monotonic()` deadline for the request.
+        :return: Raw log bytes: the last two entries when no cursor was given, otherwise
+            every entry from the baseline cursor onward.
+        :raises ObserverError: On an expired deadline, curl or HTTP failure, an oversized
+            or entry-capped body, an invalid cursor, or a baseline cursor no longer present.
+        """
         remaining = _remaining(deadline)
         # Supervisor maps the Range header to journal-gatewayd `entries=cursor[:skip]:count`;
         # the default is a sliding tail of the last 100 entries.
@@ -148,7 +156,7 @@ class SupervisorLogReader:
         else:
             entries = f"entries={self._cursor}:0:{MAX_LOG_ENTRIES}"
         url = f"{lifecycle.SUPERVISOR_BASE_URL}/addons/{DEV}/logs"
-        config = (
+        cfg = (
             "\n".join(
                 (
                     "fail",
@@ -166,7 +174,7 @@ class SupervisorLogReader:
         try:
             result = subprocess.run(
                 ["/usr/bin/curl", "--disable", "--config", "-"],
-                input=config,
+                input=cfg,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=remaining,
@@ -263,7 +271,10 @@ def observe(
     :param watchdog_deadline: Monotonic deadline inherited from the armed lifecycle lease.
     :param now: Monotonic clock seam for tests.
     :param sleep: Bounded sleep seam for tests.
-    :param lease_live: Called every poll; a false result means the owner tore the run down.
+    :param lease_live: Called every poll, after a blocking API probe and before a failure
+        result; a false result means the owner tore the run down.
+    :return: A finite observation; `unknown` whenever continuity, lease or budget is lost.
+    :raises ObserverError: If the baseline is invalid.
     """
     _validate_baseline(baseline)
     started = now()
@@ -341,17 +352,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("baseline", "observe"))
     parser.add_argument("--root", type=Path, default=lifecycle.ROOT)
     parser.add_argument("--run")
-    parser.add_argument("--baseline")
+    parser.add_argument("--baseline-file", type=Path)
     args = parser.parse_args(argv)
     try:
         token = lifecycle.validate_token(os.environ.get("SUPERVISOR_TOKEN", ""))
         if args.command == "baseline":
+            if args.baseline_file is None:
+                parser.error("baseline requires --baseline-file")
             baseline = capture_baseline(SupervisorLogReader(token), time.monotonic() + HTTP_TIMEOUT)
-            sys.stdout.write(json.dumps(asdict(baseline), sort_keys=True) + "\n")
+            # The cursor embeds machine and boot identifiers: keep it in an owner-only file.
+            lifecycle._write_json_exclusive(args.baseline_file, asdict(baseline))
+            sys.stdout.write("Baseline captured\n")
             return 0
-        if args.run is None or args.baseline is None:
-            parser.error("observe requires --run and --baseline")
-        baseline = LogBaseline(**json.loads(args.baseline))
+        if args.run is None or args.baseline_file is None:
+            parser.error("observe requires --run and --baseline-file")
+        baseline = LogBaseline(**lifecycle._read_private_json(args.baseline_file, "baseline"))
         deadline = _watchdog_deadline(args.root, args.run)
         result = observe(
             SupervisorLogReader(token, baseline.cursor),
@@ -412,7 +427,13 @@ def _unknown(current_boot: bool) -> BootstrapObservation:
 
 
 def _remaining(deadline: float) -> float:
-    """Return usable absolute-deadline time, refusing non-finite or exhausted budgets."""
+    """
+    Return the time left before an absolute monotonic deadline.
+
+    :param deadline: Absolute `time.monotonic()` deadline.
+    :return: Positive finite seconds remaining.
+    :raises ObserverError: If the deadline is non-finite or already expired.
+    """
     remaining = deadline - time.monotonic()
     if not math.isfinite(remaining) or remaining <= 0:
         raise ObserverError("observer deadline expired")
@@ -426,6 +447,8 @@ def _validate_baseline(baseline: LogBaseline) -> None:
         or baseline.bytes < 0
         or baseline.bytes > MAX_LOG_BYTES
         or not re.fullmatch(r"[0-9a-f]{64}", baseline.sha256)
+        or type(baseline.cursor) is not str
+        or (baseline.cursor != "" and not _CURSOR.fullmatch(baseline.cursor))
     ):
         raise ObserverError("log baseline is invalid")
 
