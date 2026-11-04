@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import select
 import signal
 import struct
 import sys
@@ -25,7 +26,7 @@ import threading
 import time
 import wave
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +34,8 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
+
+from pydantic import BaseModel, ConfigDict
 
 try:
     from scripts import private_dev_lifecycle as lifecycle
@@ -83,9 +86,10 @@ class Stimulus:
     sha256: str
 
 
-@dataclass
-class Receipt:
+class Receipt(BaseModel):
     """Finite result that separates observed facts from unproven receiver claims."""
+
+    model_config = ConfigDict(extra="forbid")
 
     schema_version: int
     outcome: str
@@ -98,7 +102,6 @@ class Receipt:
     child_route: str | None
     child_connected: bool | None
     child_pcm: bool | None
-    packet_receipt: str | None
     limitations: list[str]
     error: str | None = None
 
@@ -192,27 +195,50 @@ class StopWatchdog:
         self._credential_env = credential_env
 
     def arm(self, player: str, deadline: float) -> None:
-        """Spawn a one-shot stop process with a full HTTP budget before the deadline."""
-        delay = deadline - time.monotonic() - HTTP_TIMEOUT_SECONDS
-        if delay <= 0:
+        """Spawn and prove ready a stop child that shares the absolute deadline."""
+        if deadline - time.monotonic() <= HTTP_TIMEOUT_SECONDS:
             raise TransportError("stop watchdog could not reserve its HTTP budget")
-        argv = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "emergency-stop",
-            "--ma-url",
-            self._api_url,
-            "--player",
-            player,
-            "--delay",
-            f"{delay:.6f}",
-            "--credential-env",
-            self._credential_env,
-        ]
+        ready_read, ready_write = os.pipe()
         try:
-            os.posix_spawn(sys.executable, argv, {self._credential_env: self._token}, setsid=True)
+            argv = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "emergency-stop",
+                "--ma-url",
+                self._api_url,
+                "--player",
+                player,
+                "--deadline",
+                f"{deadline:.6f}",
+                "--credential-env",
+                self._credential_env,
+                "--ready-fd",
+                "198",
+            ]
+            os.posix_spawn(
+                sys.executable,
+                argv,
+                {self._credential_env: self._token},
+                setsid=True,
+                file_actions=[
+                    (os.POSIX_SPAWN_CLOSE, ready_read),
+                    (os.POSIX_SPAWN_DUP2, ready_write, 198),
+                    (os.POSIX_SPAWN_CLOSE, ready_write),
+                ],
+            )
+            os.close(ready_write)
+            ready_write = -1
+            remaining = deadline - time.monotonic() - HTTP_TIMEOUT_SECONDS
+            if remaining <= 0 or not select.select([ready_read], [], [], remaining)[0]:
+                raise TransportError("stop watchdog did not become ready")
+            if os.read(ready_read, 1) != b"1":
+                raise TransportError("stop watchdog did not become ready")
         except OSError as err:
             raise TransportError("could not arm independent stop watchdog") from err
+        finally:
+            os.close(ready_read)
+            if ready_write >= 0:
+                os.close(ready_write)
 
 
 class StimulusServer:
@@ -275,7 +301,6 @@ def run_once(
     server: StimulusServer,
     stimulus: Stimulus,
     *,
-    packet_receipt: str | None = None,
     stop_guard: StopGuard | None = None,
 ) -> Receipt:
     """Run exactly one constrained MA playback request and unconditional bounded stop."""
@@ -295,7 +320,6 @@ def run_once(
         child_route=None,
         child_connected=None,
         child_pcm=None,
-        packet_receipt=packet_receipt,
         limitations=[
             "No native receiver group membership evidence.",
             "No acoustic or iPhone-control evidence.",
@@ -312,7 +336,7 @@ def run_once(
         _require_stop_guard(stop_guard).arm(scope.player, stop_deadline)
         api.command(
             "player_queues/play_media",
-            {"queue_id": scope.player, "media": advertised_url},
+            {"queue_id": scope.player, "media": advertised_url, "option": "replace"},
         )
         receipt.ma_play_request_accepted = True
         # Reserve a full bounded HTTP call for STOP: waiting for a fetch must never
@@ -320,7 +344,7 @@ def run_once(
         while time.monotonic() < stop_deadline - HTTP_TIMEOUT_SECONDS and not server.fetched:
             time.sleep(0.02)
         receipt.fetched = server.fetched
-        receipt.outcome = "OBSERVED" if receipt.fetched else "INCOMPLETE"
+        # A fetch is only a source-server fact, never proof of receiver transport.
     except TransportError as err:
         receipt.error = str(err)
     finally:
@@ -412,13 +436,20 @@ def main(argv: list[str] | None = None) -> int:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--ma-url", required=True)
         parser.add_argument("--player", required=True)
-        parser.add_argument("--delay", type=float, required=True)
+        parser.add_argument("--deadline", type=float, required=True)
         parser.add_argument("--credential-env", required=True)
+        parser.add_argument("--ready-fd", type=int, required=True)
         args = parser.parse_args(argv[1:])
-        if not math.isfinite(args.delay) or args.delay < 0:
+        if (
+            not math.isfinite(args.deadline)
+            or args.deadline - time.monotonic() <= HTTP_TIMEOUT_SECONDS
+        ):
             return 1
-        deadline = time.monotonic() + args.delay
-        while (remaining := deadline - time.monotonic()) > 0:
+        with suppress(OSError):
+            os.write(args.ready_fd, b"1")
+            os.close(args.ready_fd)
+        stop_at = args.deadline - HTTP_TIMEOUT_SECONDS
+        while (remaining := stop_at - time.monotonic()) > 0:
             time.sleep(min(remaining, 0.05))
         try:
             MusicAssistantApi(args.ma_url, _credential_from_env(args.credential_env)).command(
@@ -435,18 +466,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--credential-env", default="MA_TOKEN")
     parser.add_argument("--lifecycle-root", type=Path, required=True)
     parser.add_argument("--lifecycle-run", required=True)
-    parser.add_argument("--packet-receipt")
     args = parser.parse_args(argv)
     server: StimulusServer | None = None
     try:
         scope = TrialScope.parse(json.loads(args.inventory.read_text(encoding="utf-8")))
         validate_lifecycle_run(args.lifecycle_root, args.lifecycle_run)
-        stimulus = generate_stimulus()
-        server = StimulusServer(_ipv4(args.bind, "bind address"), stimulus)
+        bind = _ipv4(args.bind, "bind address")
         host = _ipv4(args.advertised_host, "advertised host")
         token = _credential_from_env(args.credential_env)
         api = MusicAssistantApi(args.ma_url, token)
         stop_guard = StopWatchdog(args.ma_url, token, args.credential_env)
+        stimulus = generate_stimulus()
+        server = StimulusServer(bind, stimulus)
         server.start()
         receipt = run_once(
             scope,
@@ -454,7 +485,6 @@ def main(argv: list[str] | None = None) -> int:
             f"http://{host}:{server.port}/stimulus.wav",
             server,
             stimulus,
-            packet_receipt=args.packet_receipt,
             stop_guard=stop_guard,
         )
     except (OSError, ValueError, TransportError) as err:
@@ -470,7 +500,6 @@ def main(argv: list[str] | None = None) -> int:
             child_route=None,
             child_connected=None,
             child_pcm=None,
-            packet_receipt=None,
             limitations=[],
             error=str(err),
         )
@@ -478,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         if server is not None:
             with suppress(OSError):
                 server.close()
-    sys.stdout.write(json.dumps(asdict(receipt), separators=(",", ":"), sort_keys=True) + "\n")
+    sys.stdout.write(receipt.model_dump_json(exclude_none=False) + "\n")
     return 0 if receipt.outcome == "OBSERVED" and receipt.ma_stop_requested else 1
 
 

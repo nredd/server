@@ -31,12 +31,11 @@ response cannot extend the budget. It requires an already armed
 independent lifecycle watchdog remains the recovery authority if either
 transport process fails.
 
-An `OBSERVED` receipt means only that MA accepted the request, the constrained
-source was fetched, and the controller requested stop. `INCOMPLETE` is expected
-when the fetch was not observed. Neither outcome claims child `connected`, PCM
-arrival, RTP, receiver group membership, audible output, or iPhone controls. Those
-fields stay null unless independently captured evidence is attached by the parent.
-No packet capture is created or synthesized by this tool.
+The receipt remains `INCOMPLETE`: MA acceptance, a constrained-source fetch, and
+a stop request are independently recorded facts, not transport acceptance. It never
+claims child `connected`, PCM arrival, RTP, receiver group membership, audible
+output, or iPhone controls. No packet capture is created, accepted, or synthesized
+by this tool.
 
 This is controller infrastructure, not receiver acceptance or a deployment recipe.
 Run it only from the intended private host after the parent has supplied the

@@ -100,13 +100,17 @@ def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
         receipt = run_once(tv_scope(), api, url, server, stimulus, stop_guard=guard)
     finally:
         server.close()
-    assert receipt.outcome == "OBSERVED"
+    assert receipt.outcome == "INCOMPLETE"
     assert receipt.fetched is True
     assert receipt.ma_play_request_accepted is True
     assert receipt.ma_stop_requested is True
     assert receipt.child_connected is None
     assert receipt.child_pcm is None
-    assert receipt.packet_receipt is None
+    assert "RTP evidence" in receipt.limitations[-1]
+    assert api.calls[1] == (
+        "player_queues/play_media",
+        {"queue_id": "ap021122334455", "media": url, "option": "replace"},
+    )
     assert api.calls[-1] == ("players/cmd/stop", {"player_id": "ap021122334455"})
     assert guard.calls[0][0] == "ap021122334455"
 
