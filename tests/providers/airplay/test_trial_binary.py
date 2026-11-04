@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import cast
@@ -44,6 +45,20 @@ def test_private_manifest_matches_source_pin() -> None:
     )
     assert manifest["private_marker_version"] == private_trial.VERSION
     assert manifest["external_receipt_required"] is True
+
+
+def test_private_window_matches_source_pin() -> None:
+    """Keep the private launch wizard on the runtime asset's exact pin."""
+    window = (
+        Path(__file__).resolve().parents[3] / "scripts" / "private_trial_window.sh"
+    ).read_text()
+    assignments = dict(
+        re.findall(r"^(PINNED_CLI_(?:SHA|LABEL))=([^\n]+)$", window, flags=re.MULTILINE)
+    )
+    assert assignments == {
+        "PINNED_CLI_SHA": trial.EXPECTED_SHA,
+        "PINNED_CLI_LABEL": trial.EXPECTED_BUILD,
+    }
 
 
 def _elf() -> bytes:
