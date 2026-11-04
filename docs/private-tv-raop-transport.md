@@ -52,3 +52,19 @@ This is controller infrastructure, not receiver acceptance or a deployment recip
 Run it only from the intended private host after the parent has supplied the
 lifecycle run, inventory, explicit bind/advertised addresses, API endpoint, and
 short-lived credential. Do not add household identifiers to this repository.
+
+## No implicit receiver writes
+
+On the private trial target an Apple TV player sends nothing to the receiver that was not
+explicitly commanded:
+
+- The connect-time `VOLUME` push, its 2 second repeat and the bridge's initial-volume retry are
+  suppressed, including a latched mute, so the receiver's own level is never persisted over.
+- Playback no longer wakes the device through Companion `turn_on`, and a `stop` with no active
+  stream no longer sends Home. Explicit `power`, `wake`, `play`, `volume_set` and
+  `volume_mute` are unchanged.
+- HomePods, other receivers and non-trial profiles keep today's behavior.
+
+Limit: a latched mute is not sent, so a stream can start silent while the player state still
+says muted, and the receiver's mute state can remain unknown. The caller must abort actual
+transport when the player is known to be muted.

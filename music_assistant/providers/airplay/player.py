@@ -1033,6 +1033,16 @@ class AirPlayPlayer(Player):
             return True
         return self._control_routes_to_self(parent_player.volume_control_for_output(self.player_id))
 
+    @property
+    def implicit_receiver_writes_blocked(self) -> bool:
+        """
+        Return True if nothing may be written to the receiver unless explicitly commanded.
+
+        Only the private Apple TV trial blocks them: the connect-time volume push (and its
+        latched mute) and the implicit wake or home-screen controls.
+        """
+        return False
+
     def release_foreign_mute_latch(self) -> None:
         """Clear our mute latch when another control owns the mute of this output."""
         if not self._attr_volume_muted:

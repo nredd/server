@@ -52,6 +52,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from music_assistant.models.player import PlayerMedia
 from music_assistant.models.setup_flow import AbortFlow
 
+from . import trial_binary
 from .constants import (
     CONF_COMPANION_CREDENTIALS,
     CONF_COMPANION_PAIRING_PIN,
@@ -168,6 +169,11 @@ class AirPlayControlPlayer(AirPlayPlayer):
         # invoked (if set) whenever the Companion connection comes up or goes down,
         # so an observer (e.g. the dashboard adapter) can re-evaluate its state
         self.on_companion_state_change: Callable[[], None] | None = None
+
+    @property
+    def implicit_receiver_writes_blocked(self) -> bool:
+        """Return True for an Apple TV in the private trial, which only obeys explicit commands."""
+        return trial_binary.is_trial_target() and self._is_apple_tv_device
 
     @property
     def companion_pairing_supported(self) -> bool:
@@ -298,6 +304,9 @@ class AirPlayControlPlayer(AirPlayPlayer):
         if self._stream_active:
             await super().stop()
             return
+        if self.implicit_receiver_writes_blocked:
+            # nothing of ours is playing, and Home would act on whatever the TV shows
+            return
         # For external playback there is no real "stop"; returning to the home
         # screen backgrounds the current app, which is the closest equivalent.
         device = self._device_for_feature(FeatureName.Home)
@@ -369,7 +378,7 @@ class AirPlayControlPlayer(AirPlayPlayer):
 
     async def wake(self) -> None:
         """Wake the device from sleep when it exposes power control."""
-        await self._wake_for_playback()
+        await self._wake_for_playback(explicit=True)
 
     async def async_list_installed_app_ids(self) -> set[str] | None:
         """
@@ -806,9 +815,13 @@ class AirPlayControlPlayer(AirPlayPlayer):
         """Return whether pyatv currently exposes a feature."""
         return device.features.in_state(FeatureState.Available, feature)
 
-    async def _wake_for_playback(self) -> None:
-        """Wake the device before starting or resuming playback."""
-        if self.powered is True:
+    async def _wake_for_playback(self, *, explicit: bool = False) -> None:
+        """
+        Wake the device before starting or resuming playback.
+
+        :param explicit: The wake itself was commanded, not a side effect of playback.
+        """
+        if self.powered is True or (self.implicit_receiver_writes_blocked and not explicit):
             return
         device = self._device_for_power_feature(FeatureName.TurnOn)
         if device is None:
