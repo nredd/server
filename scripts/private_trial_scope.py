@@ -159,7 +159,7 @@ def _trial_mode(value: object) -> TrialMode:
     try:
         return TrialMode(value)
     except ValueError as err:
-        raise ValueError("Mode must be homepod-ptp or tv-raop") from err
+        raise ValueError(f"Invalid trial mode: {err}; expected homepod-ptp or tv-raop") from err
 
 
 def _ipv4(value: object) -> str:
