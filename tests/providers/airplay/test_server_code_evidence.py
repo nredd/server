@@ -31,6 +31,14 @@ def test_real_sources_and_raw_hash() -> None:
     )
 
 
+def test_wrong_provider_module() -> None:
+    """A wrong module argument cannot produce verified evidence."""
+    assert evidence.server_code_evidence(control_player) == {
+        "schema_version": 1,
+        "status": "unverified",
+    }
+
+
 def test_stale_code_on_changed_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Changed disk code does not match a previously loaded function."""
     source = Path(provider.__file__).read_bytes()
