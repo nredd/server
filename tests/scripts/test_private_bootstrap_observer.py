@@ -314,6 +314,7 @@ def test_watchdog_deadline_requires_the_live_matching_lease(tmp_path: Path) -> N
         time.time(),
         ("core_ssh", lifecycle.DEV),
         "2.11.0.dev",
+        False,
     )
     run_dir = lifecycle.save_snapshot(tmp_path, snapshot)
     lifecycle._write_json_exclusive(
