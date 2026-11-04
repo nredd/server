@@ -705,7 +705,13 @@ class AirPlayProvider(PlayerProvider):
     async def get_private_trial_admission_preflight(
         self, player_id: str
     ) -> dict[str, SerializableType]:
-        """Return secret-free facts about the unmodified private admission state."""
+        """
+        Return secret-free facts about the unmodified private admission state.
+
+        :param player_id: Canonical AirPlay player identifier.
+        :raises RuntimeError: If the private profile is not active.
+        :raises ValueError: If the identifier is not canonical.
+        """
         if not is_trial_target():
             raise RuntimeError("Private trial admission is unavailable")
         if not isinstance(player_id, str) or not _PRIVATE_PLAYER_ID.fullmatch(player_id):

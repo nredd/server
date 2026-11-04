@@ -32,7 +32,7 @@ def _provider(raw: object) -> tuple[AirPlayProvider, MagicMock, dict[str, Any]]:
     }
     mass.config.get.side_effect = store.get
     mass.discovery.config.values = {"private_trial_target": SimpleNamespace(value="")}
-    setattr(provider, "get_players", MagicMock(return_value=[]))
+    provider.__dict__["get_players"] = MagicMock(return_value=[])
     return provider, mass, store
 
 
@@ -121,7 +121,7 @@ async def test_target_and_streams_fail_closed() -> None:
     """A configured target or any current stream prevents admission."""
     provider, mass, store = _provider({})
     store["core"]["discovery"]["values"]["private_trial_target"] = "set"
-    setattr(provider, "get_players", MagicMock(return_value=[SimpleNamespace(stream=object())]))
+    provider.__dict__["get_players"] = MagicMock(return_value=[SimpleNamespace(stream=object())])
     result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
     assert result["target_unset"] is False
     assert result["no_current_streams"] is False
