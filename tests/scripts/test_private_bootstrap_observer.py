@@ -713,7 +713,7 @@ class _NoNetworkProbe:
 
 @pytest.fixture
 def offline_observe(monkeypatch: pytest.MonkeyPatch) -> list[observer.LogBaseline]:
-    """Stub deadline, lease, probe and observation (the real reader never reads) so CLI tests never touch the network."""
+    """Keep observer CLI tests offline."""
     seen: list[observer.LogBaseline] = []
 
     def fake_observe(
