@@ -62,6 +62,7 @@ from music_assistant.providers.airplay.helpers import (
     generate_active_remote_id,
     get_cli_binary,
     get_decoded_property,
+    player_id_to_mac_address,
     serialize_txt_records,
 )
 from music_assistant.providers.airplay.private_volume_capture import PrivateVolumeCapture
@@ -161,8 +162,10 @@ class AirPlayStream:
         self.mass = player.provider.mass
         self.player = player
         self.pcm_format = pcm_format or AIRPLAY_PCM_FORMAT
-        mac_address = self.player.device_info.mac_address or self.player.player_id
-        self.active_remote_id: str = generate_active_remote_id(mac_address)
+        remote_seed = self.player.device_info.mac_address or player_id_to_mac_address(
+            self.player.player_id
+        )
+        self.active_remote_id: str = generate_active_remote_id(remote_seed)
         self._stream_id = uuid4().hex
         self.prevent_playback: bool = False
         self._cli_proc: AsyncProcess | None = None

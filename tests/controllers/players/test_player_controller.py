@@ -82,8 +82,12 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 from music_assistant.helpers.tts import TTS_QUERY_TIMEOUT_SECONDS, TTSLanguageNotSupportedError
 from music_assistant.models.player import AnnouncementFeature, LinkedOutputProtocol, Player
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.providers.airplay.constants import AIRPLAY_PCM_FORMAT
 from music_assistant.providers.airplay.control_player import AirPlayControlPlayer
 from music_assistant.providers.airplay.provider import AirPlayProvider
+from music_assistant.providers.airplay.sendspin_bridge import SendspinAirPlayBridge
+from music_assistant.providers.airplay.stream import AirPlayStream
+from music_assistant.providers.airplay.stream_session import AirPlayStreamSession
 from music_assistant.providers.universal_player.player import UniversalPlayer
 from tests.common import MockPlayer, MockProvider, create_mock_config, use_real_create_task
 
@@ -1219,6 +1223,28 @@ class TestRegisterUnregisterRace:
             lookup.assert_not_called()
             assert not player.device_info.identifiers.get(IdentifierType.MAC_ADDRESS)
             assert "reported_mac" not in player.extra_data
+            stream = AirPlayStream(player)
+            assert stream.active_remote_id == "573785173"
+            session = AirPlayStreamSession(
+                cast("AirPlayProvider", provider), [player], AIRPLAY_PCM_FORMAT, MagicMock()
+            )
+            with (
+                patch.object(AirPlayStream, "connect", AsyncMock()),
+                patch.object(session, "_start_player_ffmpeg", AsyncMock()),
+            ):
+                await session._start_client(player, False)
+            assert player.stream is not None
+            assert player.stream.active_remote_id == "573785173"
+            player.stream = None
+            bridge = SendspinAirPlayBridge(cast("AirPlayProvider", provider), player, MagicMock())
+            bridge._airplay_stream_start_task = asyncio.current_task()
+            with patch.object(bridge, "_start_cold_stream", AsyncMock()) as cold_start:
+                await bridge._start_protocol_from_chunk()
+            cold_start.assert_awaited_once()
+            assert cold_start.await_args is not None
+            bridge_stream = cold_start.await_args.args[0]
+            assert isinstance(bridge_stream, AirPlayStream)
+            assert bridge_stream.active_remote_id == "573785173"
             assert not any(
                 str(args.args[0]).endswith("/cached_arp_mac")
                 for args in mock_mass.config.get.call_args_list
@@ -1232,6 +1258,7 @@ class TestRegisterUnregisterRace:
         else:
             lookup.assert_called_once_with(ip="192.0.2.10")
             assert player.device_info.identifiers[IdentifierType.MAC_ADDRESS] == "10:20:30:40:50:60"
+            assert AirPlayStream(player).active_remote_id == "809521248"
 
     async def test_register_aborts_when_unregistered_during_config_load(
         self, mock_mass: MagicMock
