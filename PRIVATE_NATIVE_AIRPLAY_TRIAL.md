@@ -493,14 +493,15 @@ The owner removed stock MA `2.10.7` from HAOS on purpose (Supervisor backup `233
 off-device copy and restore notes kept privately). Stock must NOT be restored automatically.
 The historical recovery controller below assumed stock installed, started stock and restored
 HA groups; it is INVALID for this state and must not be armed. `scripts/private_dev_lifecycle.py`
-(schema `2`, root `/data/airplay-native-probe/dev-lifecycle`) is the replacement. It is
+(schema `3`, root `/data/airplay-native-probe/dev-lifecycle`) is the replacement. It is
 standalone on the SSH app's Python 3.13 with stdlib plus native `/usr/bin/curl`, and it
 never imports or calls the historical helper, whose bundles, receipts and failures stay as
 they are.
 
 What it can and cannot do is fixed by its method/path allowlist: `GET /addons`,
-`GET /addons/<DEV>/info`, `POST /addons/<DEV>/start`, `POST /addons/<DEV>/stop`. There is
-no stock path, no `/store` path and no Core API path, so it cannot install or start stock,
+`GET /addons/<DEV>/info`, `GET /addons/<DEV>/stats?one_shot=true`,
+`POST /addons/<DEV>/start`, `POST /addons/<DEV>/stop`. There is no stock path, no `/store`
+path and no Core API path, so it cannot install or start stock,
 reload an HA entry, or group, play, stop or set volume on ANY player. Office and
 historical-group exclusion are therefore structural, not runtime checks.
 
@@ -525,6 +526,7 @@ state, `protected: true`, `boot: manual` and `watchdog: false`; `startup`, `erro
 ```sh
 python3 "$LIFECYCLE_SCRIPT" preflight            # read-only facts, no run created
 python3 "$LIFECYCLE_SCRIPT" capture              # requires DEV stopped; prints run dir
+python3 "$LIFECYCLE_SCRIPT" capture-recovery     # requires DEV error plus stats-confirmed non-running
 python3 "$LIFECYCLE_SCRIPT" arm --run <uuid> --timeout 120
 python3 "$LIFECYCLE_SCRIPT" start --run <uuid>   # only inside a live armed run
 python3 "$LIFECYCLE_SCRIPT" stop --run <uuid>    # manual early stop, same path as the watchdog
@@ -541,7 +543,12 @@ self-test run, AND proves a child still holds the lease for this run (a `watchdo
 left by a failed spawn or a dead child is refused). It then re-reads the facts, refuses
 any catalog or DEV version drift, requires DEV `stopped`, and only then requests the
 start. `startup` is pending; only an observed `started` within the 90-second budget
-confirms it, and `error` or anything else fails.
+confirms it, and `error` or anything else fails. `capture-recovery` is the sole exception: it
+requires Supervisor `error` plus the exact Docker-backed stats response that DEV is not running.
+This matches Supervisor `2026.10.5`: an exited failed Docker container remains `error`, while
+its stats endpoint returns that error only when the container is not running. It then uses the
+same fresh arm, live lease, start, and stop path. It never alters options, protection,
+boot, watchdog settings, stock state, or any player.
 
 The watchdog/`stop` path stops DEV FIRST, before any catalog check, so a drifted catalog
 (even stock reappearing) can never leave DEV running. Every observation that is not
@@ -560,7 +567,7 @@ absence re-verified against the captured facts. The receipt is `verified: true` 
 any other outcome writes a failed receipt. The first failure stays the evidence of
 record (a repeat failure neither replaces it nor raises a conflict); it is archived as
 `failed_receipt.json` only when the same run later verifies. Historical schema-1 receipts
-and statuses never settle a schema-2 run. Arming an already-receipted run is refused;
+and statuses never settle a schema-3 run. Arming an already-receipted run is refused;
 capture a fresh UUID.
 
 None of this authorizes a launch. `launch_authorized` in the pin stays false, main-only
@@ -687,8 +694,11 @@ verify any explicitly authorized native-peer restoration.
 
 The fake transport is available to a detached `self-test-child` only when that exact armed
 run has an owner-only simulation marker bound to its UUID and nonce. An ordinary production
-snapshot cannot select fake transport. Snapshot schema 1 remains valid for emergency
-restores.
+snapshot cannot select fake transport. Only snapshot schema `3` is accepted; recapture
+after upgrading. The `self-test` parent polls for the child's receipt, which the child creates
+exclusively and then writes, so it may briefly see it empty or partial. Only unparsable JSON
+is retried, within the 5-second budget; a receipt that stays malformed, has unsafe
+permissions or is not an object fails the self-test.
 
 The controller requires the installed native `/usr/bin/curl` (HAOS 8.22.0) and is therefore
 not pure-Python HTTP tooling. Each fixed Supervisor or local readiness request uses curl with
