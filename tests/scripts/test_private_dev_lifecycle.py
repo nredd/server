@@ -1338,12 +1338,22 @@ def test_supervisor_transport_real_wire_contract(monkeypatch: pytest.MonkeyPatch
     assert all(call[2]["Authorization"] == "Bearer private-token" for call in calls)
 
 
+def _not_running_envelope(**overrides: object) -> dict[str, object]:
+    """Return the full not-running body, with keys overridden."""
+    return {
+        "result": "error",
+        "message": f"App {DEV} is not running",
+        "error_key": "app_not_running_error",
+        "extra_fields": {"app": DEV},
+    } | overrides
+
+
 def test_supervisor_transport_requires_the_exact_not_running_stats_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recovery accepts only the documented Docker-backed non-running confirmation."""
+    """Recovery accepts the real Supervisor 2026.10.5 four-key not-running envelope."""
     route = f"/addons/{DEV}/stats?one_shot=true"
-    body = json.dumps({"result": "error", "message": f"App {DEV} is not running"}).encode()
+    body = json.dumps(_not_running_envelope()).encode()
     with _fixed_http_server({route: (400, body)}) as (base_url, calls):
         monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
         lifecycle.SupervisorTransport(
@@ -1353,22 +1363,41 @@ def test_supervisor_transport_requires_the_exact_not_running_stats_response(
     assert calls[0][2]["Authorization"] == "Bearer private-token"
 
 
+def _not_running_without(key: str) -> bytes:
+    """Return the full envelope with one key removed."""
+    return json.dumps({k: v for k, v in _not_running_envelope().items() if k != key}).encode()
+
+
 @pytest.mark.parametrize(
     ("status", "body"),
     [
-        (400, b'{"result":"error","message":"different"}'),
-        (400, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running","x":1}'),
+        (400, json.dumps(_not_running_envelope(message="different")).encode()),
+        (400, json.dumps(_not_running_envelope(message="App other is not running")).encode()),
+        (400, json.dumps(_not_running_envelope(result="ok")).encode()),
+        (400, json.dumps(_not_running_envelope(error_key="other_error")).encode()),
+        (400, json.dumps(_not_running_envelope(error_key=None)).encode()),
+        (400, json.dumps(_not_running_envelope(extra_fields={"app": "other"})).encode()),
+        (400, json.dumps(_not_running_envelope(extra_fields={})).encode()),
+        (400, json.dumps(_not_running_envelope(extra_fields=None)).encode()),
+        (400, json.dumps(_not_running_envelope(extra_fields={"app": DEV, "x": 1})).encode()),
+        (400, json.dumps(_not_running_envelope(extra_fields=[DEV])).encode()),
+        (400, json.dumps(_not_running_envelope(x=1)).encode()),
+        (400, _not_running_without("error_key")),
+        (400, _not_running_without("extra_fields")),
+        (400, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running"}'),
+        (400, b"[]"),
         (400, b"not json"),
         (400, b"\xff"),
-        (200, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running"}'),
-        (500, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running"}'),
+        (200, json.dumps(_not_running_envelope()).encode()),
+        (404, json.dumps(_not_running_envelope()).encode()),
+        (500, json.dumps(_not_running_envelope()).encode()),
         (503, b""),
     ],
 )
 def test_supervisor_transport_rejects_inexact_stats_responses(
     monkeypatch: pytest.MonkeyPatch, status: int, body: bytes
 ) -> None:
-    """Any status, body or extra key but the exact 400 not-running answer is refused."""
+    """Any status, body, missing key or extra (nested) key but the exact envelope is refused."""
     route = f"/addons/{DEV}/stats?one_shot=true"
     with _fixed_http_server({route: (status, body)}) as (base_url, _calls):
         monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)

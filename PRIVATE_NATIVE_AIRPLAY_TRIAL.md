@@ -596,7 +596,11 @@ start. `startup` is pending; only an observed `started` within the 90-second bud
 confirms it, and `error` or anything else fails. `capture-recovery` is the sole exception: it
 requires Supervisor `error` plus the exact Docker-backed stats response that DEV is not running.
 This matches Supervisor `2026.10.5`: an exited failed Docker container remains `error`, while
-its stats endpoint returns that error only when the container is not running. It then uses the
+its stats endpoint returns that error only when the container is not running. The accepted body
+is the full four-key envelope, `result: error`, `message: App <DEV> is not running`,
+`error_key: app_not_running_error`, `extra_fields: {"app": <DEV>}`; any missing, extra or
+differing key, including nested `extra_fields` extras, is refused. The earlier "exactly two keys"
+claim was incorrect. It then uses the
 same fresh arm, live lease, start, and stop path. It never alters options, protection,
 boot, watchdog settings, stock state, or any player.
 
