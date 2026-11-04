@@ -696,25 +696,57 @@ def test_baseline_cli_refuses_symlink_target(
     capsys.readouterr()
 
 
+_OBSERVED = observer.BootstrapObservation(
+    observer.BootstrapPhase.UNKNOWN, False, True, False, True, True
+)
+_EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+_GOOD_BASELINE = json.dumps({"bytes": 0, "sha256": _EMPTY_SHA, "cursor": ""})
+
+
+class _NoNetworkProbe:
+    """Fail loudly if a CLI test ever uses the loopback API probe."""
+
+    def ready(self, *_args: Any) -> bool:
+        """Refuse any probe call."""
+        raise AssertionError("CLI test must not reach the network")
+
+
+@pytest.fixture
+def offline_observe(monkeypatch: pytest.MonkeyPatch) -> list[observer.LogBaseline]:
+    """Stub deadline, lease, probe and observation (the real reader never reads) so CLI tests never touch the network."""
+    seen: list[observer.LogBaseline] = []
+
+    def fake_observe(
+        _reader: Any, _probe: Any, loaded: observer.LogBaseline, _deadline: float, **_kw: Any
+    ) -> observer.BootstrapObservation:
+        seen.append(loaded)
+        return _OBSERVED
+
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
+    monkeypatch.setattr(observer, "_watchdog_deadline", lambda *_a: time.monotonic() + 1000)
+    monkeypatch.setattr(observer, "_lease_is_live", lambda *_a: True)
+    monkeypatch.setattr(observer, "LoopbackApiProbe", _NoNetworkProbe)
+    monkeypatch.setattr(observer, "observe", fake_observe)
+    return seen
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         "not json",
         "[]",
         '{"bytes":1}',
-        '{"bytes":1,"sha256":"%s","cursor":"bad cursor","x":1}' % ("0" * 64),
+        '{"bytes":1,"sha256":"%s","cursor":"","x":1}' % ("0" * 64),
         '{"bytes":1,"sha256":"%s","cursor":"bad cursor"}' % ("0" * 64),
     ],
 )
 def test_observe_cli_refuses_bad_baseline_files(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    offline_observe: list[observer.LogBaseline],
     capsys: pytest.CaptureFixture[str],
     payload: str,
 ) -> None:
     """Malformed, extra-key or injected-cursor baselines are refused with the fixed line."""
-    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
-    monkeypatch.setattr(observer, "_watchdog_deadline", lambda *_a: time.monotonic() + 1000)
     path = tmp_path / "b.json"
     path.write_text(payload)
     path.chmod(0o600)
@@ -722,25 +754,45 @@ def test_observe_cli_refuses_bad_baseline_files(
     captured = capsys.readouterr()
     assert captured.err == "Bootstrap observer refused\n"
     assert captured.out == ""
+    assert offline_observe == []
+
+
+def test_observe_cli_accepts_a_valid_private_baseline(
+    tmp_path: Path,
+    offline_observe: list[observer.LogBaseline],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Positive control: a valid 0600 regular baseline is loaded and printed as safe JSON."""
+    path = tmp_path / "b.json"
+    path.write_text(_GOOD_BASELINE)
+    path.chmod(0o600)
+    assert observer.main(["observe", "--run", "r", "--baseline-file", str(path)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == asdict(_OBSERVED) | {"phase": _OBSERVED.phase.value}
+    assert captured.err == ""
+    assert offline_observe == [observer.LogBaseline(0, _EMPTY_SHA, "")]
 
 
 def test_observe_cli_refuses_loose_permissions_and_symlinks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    offline_observe: list[observer.LogBaseline],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A group-readable or symlinked baseline file is unsafe input."""
-    monkeypatch.setenv("SUPERVISOR_TOKEN", "a" * 40)
-    good = json.dumps({"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(), "cursor": ""})
+    """A group-readable or symlinked baseline file is refused before any observation."""
     loose = tmp_path / "loose.json"
-    loose.write_text(good)
+    loose.write_text(_GOOD_BASELINE)
     loose.chmod(0o644)
-    assert observer.main(["observe", "--run", "r", "--baseline-file", str(loose)]) == 1
-    link = tmp_path / "link.json"
     real = tmp_path / "real.json"
-    real.write_text(good)
+    real.write_text(_GOOD_BASELINE)
     real.chmod(0o600)
+    link = tmp_path / "link.json"
     link.symlink_to(real)
-    assert observer.main(["observe", "--run", "r", "--baseline-file", str(link)]) == 1
-    assert capsys.readouterr().out == ""
+    for unsafe in (loose, link):
+        assert observer.main(["observe", "--run", "r", "--baseline-file", str(unsafe)]) == 1
+        captured = capsys.readouterr()
+        assert captured.err == "Bootstrap observer refused\n"
+        assert captured.out == ""
+    assert offline_observe == []
 
 
 def test_budget_exhaustion_after_lease_loss_is_unknown() -> None:

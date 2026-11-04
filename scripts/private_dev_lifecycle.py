@@ -423,6 +423,19 @@ def load_snapshot(root: Path, run_id: str) -> tuple[Path, Snapshot]:
     return run_dir, _parse_snapshot(raw["snapshot"], expected_run_id=run_id)
 
 
+def load_watchdog_deadline(root: Path, run_id: str) -> float:
+    """
+    Return the armed run's absolute `time.monotonic()` cleanup deadline.
+
+    :param root: Lifecycle state root.
+    :param run_id: Run whose watchdog lease to read.
+    :return: Absolute monotonic deadline, never later than the wall-clock deadline allows.
+    :raises LifecycleError: If the run or its watchdog state is not valid.
+    """
+    run_dir, snapshot = load_snapshot(root, run_id)
+    return float(_watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot)))
+
+
 def arm_watchdog(root: Path, run_id: str, timeout: float, *, self_test: bool = False) -> int:
     """
     Detach a one-shot child that invokes this controller's same stop path.
@@ -963,19 +976,6 @@ def _write_json_exclusive(path: Path, value: dict[str, Any]) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
-
-
-def load_watchdog_deadline(root: Path, run_id: str) -> float:
-    """
-    Return the armed run's absolute `time.monotonic()` cleanup deadline.
-
-    :param root: Lifecycle state root.
-    :param run_id: Run whose watchdog lease to read.
-    :return: Absolute monotonic deadline, never later than the wall-clock deadline allows.
-    :raises LifecycleError: If the run or its watchdog state is not valid.
-    """
-    run_dir, snapshot = load_snapshot(root, run_id)
-    return float(_watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot)))
 
 
 def _watchdog_monotonic_deadline(watch: dict[str, Any]) -> float:
