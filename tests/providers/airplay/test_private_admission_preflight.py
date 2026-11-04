@@ -60,7 +60,15 @@ async def test_safe_snapshot_is_read_only(raw: object) -> None:
 
 @pytest.mark.parametrize(
     "raw",
-    [None, [], {PLAYER_ID: None}, {PLAYER_ID: {"values": []}}, {PLAYER_ID: {"setup_data": None}}],
+    [
+        None,
+        [],
+        {PLAYER_ID: None},
+        {PLAYER_ID: {"values": []}},
+        {PLAYER_ID: {"values": False}},
+        {PLAYER_ID: {"setup_data": None}},
+        {PLAYER_ID: {"setup_data": []}},
+    ],
 )
 async def test_malformed_snapshot_fails_closed(raw: object) -> None:
     """Malformed data is never reported as absent."""

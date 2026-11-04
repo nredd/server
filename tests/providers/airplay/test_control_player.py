@@ -1153,11 +1153,16 @@ async def test_native_mrp_connection_uses_advertised_service() -> None:
 
 
 @pytest.mark.parametrize(
-    ("private", "credentials", "connect_expected"),
-    [(True, None, False), (True, "creds", True), (False, None, True)],
+    ("private", "apple_tv", "credentials", "connect_expected"),
+    [
+        (True, True, None, False),
+        (True, True, "creds", True),
+        (False, True, None, True),
+        (True, False, None, True),
+    ],
 )
 async def test_private_tv_native_mrp_requires_credentials(
-    private: bool, credentials: str | None, connect_expected: bool
+    private: bool, apple_tv: bool, credentials: str | None, connect_expected: bool
 ) -> None:
     """Private TVs never initiate native MRP without credentials."""
     player = _make_control_player(setup_data={CONF_NATIVE_MRP_CREDENTIALS: credentials})
@@ -1172,7 +1177,7 @@ async def test_private_tv_native_mrp_requires_credentials(
             return_value=private,
         ),
         patch.object(
-            type(player), "_is_apple_tv_device", new_callable=PropertyMock, return_value=True
+            type(player), "_is_apple_tv_device", new_callable=PropertyMock, return_value=apple_tv
         ),
         patch(
             "music_assistant.providers.airplay.control_player.pyatv.connect", return_value=device
