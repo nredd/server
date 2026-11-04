@@ -183,19 +183,20 @@ class StimulusServer:
                 if self.path != "/stimulus.wav":
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
-                controller._fetched.set()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "audio/wav")
                 self.send_header("Content-Length", str(len(controller._stimulus.payload)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(controller._stimulus.payload)
+                controller._fetched.set()
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
         self._server = ThreadingHTTPServer((bind, 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._started = False
 
     @property
     def port(self) -> int:
@@ -210,11 +211,13 @@ class StimulusServer:
     def start(self) -> None:
         """Start the bounded local source server."""
         self._thread.start()
+        self._started = True
 
     def close(self) -> None:
         """Stop the source server and join its one owned thread."""
-        self._server.shutdown()
-        self._thread.join(timeout=HTTP_TIMEOUT_SECONDS)
+        if self._started:
+            self._server.shutdown()
+            self._thread.join(timeout=HTTP_TIMEOUT_SECONDS)
         self._server.server_close()
 
 
@@ -255,12 +258,14 @@ def run_once(
     try:
         players = api.command("players/all", {})
         check_players(players, scope.player, TrialMode.TV_RAOP)
+        # Begin the stop budget before dispatch: MA may accept a request whose
+        # response is lost or delayed, so cleanup cannot depend on that response.
+        stop_deadline = time.monotonic() + STOP_BUDGET_SECONDS
         api.command(
             "player_queues/play_media",
             {"queue_id": scope.player, "media": advertised_url},
         )
         receipt.ma_play_request_accepted = True
-        stop_deadline = time.monotonic() + STOP_BUDGET_SECONDS
         # Reserve a full bounded HTTP call for STOP: waiting for a fetch must never
         # consume the only interval in which the unconditional stop can be delivered.
         while time.monotonic() < stop_deadline - HTTP_TIMEOUT_SECONDS and not server.fetched:
