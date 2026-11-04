@@ -50,6 +50,7 @@ def snapshot(**changes: Any) -> lifecycle.Snapshot:
         time.time(),
         ("core_ssh", DEV),
         "2.11.0.dev",
+        False,
     )
     return replace(base, **changes)
 
@@ -208,6 +209,90 @@ def test_capture_requires_dev_stopped_and_records_catalog() -> None:
     assert state.dev_version == "2.11.0.dev"
     assert lifecycle._is_uuid(state.run_id)
     assert lifecycle._is_nonce(state.nonce)
+
+
+def test_recovery_capture_and_start_require_confirmed_nonrunning_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery can start only from a freshly proven non-running Supervisor error."""
+    transport = ScriptedTransport()
+
+    def errored_info(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info" and f"POST /addons/{DEV}/start" not in transport.calls:
+            transport.calls.append(f"{method} {path}")
+            return _info("error")
+        return ScriptedTransport.request(transport, method, path)
+
+    confirmations: list[None] = []
+    original_confirmation = transport.confirm_dev_not_running
+
+    def confirm_nonrunning() -> None:
+        confirmations.append(None)
+        original_confirmation()
+
+    monkeypatch.setattr(transport, "request", errored_info)
+    monkeypatch.setattr(transport, "confirm_dev_not_running", confirm_nonrunning)
+    state = lifecycle.capture_recovery(transport)
+    assert state.recovery_from_error is True
+    lifecycle.start(transport, state, time.monotonic() + 5)
+    assert confirmations == [None, None]
+    assert transport.dev_started is True
+
+    stopped = ScriptedTransport()
+    with pytest.raises(lifecycle.LifecycleError, match="not confirmed"):
+        lifecycle.capture_recovery(stopped)
+
+    running = ScriptedTransport(dev_started=True)
+    with pytest.raises(lifecycle.LifecycleError, match="running state"):
+        running.confirm_dev_not_running()
+
+
+def test_normal_start_does_not_use_recovery_stats_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary stopped-state lifecycle never consults recovery-only stats."""
+    transport = ScriptedTransport()
+    monkeypatch.setattr(
+        transport,
+        "confirm_dev_not_running",
+        lambda: pytest.fail("normal start must not use recovery stats"),
+    )
+    lifecycle.start(transport, snapshot(), time.monotonic() + 5)
+    assert transport.dev_started is True
+
+
+def test_ordinary_run_never_starts_from_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-recovery snapshot refuses to start from `error`."""
+    transport = ScriptedTransport()
+
+    def errored_info(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info":
+            transport.calls.append(f"{method} {path}")
+            return _info("error")
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", errored_info)
+    with pytest.raises(lifecycle.LifecycleError, match="not confirmed"):
+        lifecycle.start(transport, snapshot(), time.monotonic() + 5)
+    assert f"POST /addons/{DEV}/start" not in transport.calls
+
+
+def test_recovery_error_is_never_treated_as_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An error that survives stop requests fails instead of completing recovery."""
+    monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(lifecycle, "STOP_RESEND_INTERVAL", 0.01)
+    transport = ScriptedTransport()
+
+    def persistent_error(method: str, path: str) -> Any:
+        if path == f"/addons/{DEV}/info":
+            transport.calls.append(f"{method} {path}")
+            return _info("error")
+        return ScriptedTransport.request(transport, method, path)
+
+    monkeypatch.setattr(transport, "request", persistent_error)
+    with pytest.raises(lifecycle.LifecycleError, match="did not stop"):
+        lifecycle.restore(transport, snapshot(recovery_from_error=True), time.monotonic() + 0.06)
+    assert f"POST /addons/{DEV}/stop" in transport.calls
 
 
 def test_start_only_from_matching_stopped_facts() -> None:
@@ -615,8 +700,8 @@ def test_request_allowlist_has_no_stock_store_or_core_requests() -> None:
 
 
 def test_snapshot_roundtrip_and_schema_rejections(tmp_path: Path) -> None:
-    """Schema 2 snapshots round-trip; the historical schema 1 shape is never loaded."""
-    state = snapshot()
+    """Schema 3 snapshots round-trip; historical snapshot shapes are never loaded."""
+    state = snapshot(recovery_from_error=True)
     run_dir = lifecycle.save_snapshot(tmp_path, state)
     assert oct(run_dir.stat().st_mode & 0o777) == "0o700"
     assert oct((run_dir / "snapshot.json").stat().st_mode & 0o777) == "0o600"
@@ -1067,6 +1152,32 @@ def test_supervisor_transport_real_wire_contract(monkeypatch: pytest.MonkeyPatch
     assert facts == lifecycle.Facts(("core_ssh", DEV), "stopped", "2.11.0.dev")
     assert [call[1] for call in calls] == ["/addons", f"/addons/{DEV}/info"]
     assert all(call[2]["Authorization"] == "Bearer private-token" for call in calls)
+
+
+def test_supervisor_transport_requires_the_exact_not_running_stats_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery accepts only the documented Docker-backed non-running confirmation."""
+    route = f"/addons/{DEV}/stats?one_shot=true"
+    body = json.dumps({"result": "error", "message": f"App {DEV} is not running"}).encode()
+    with _fixed_http_server({route: (400, body)}) as (base_url, calls):
+        monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
+        lifecycle.SupervisorTransport(
+            "private-token", time.monotonic() + 5
+        ).confirm_dev_not_running()
+    assert [call[1] for call in calls] == [route]
+    assert calls[0][2]["Authorization"] == "Bearer private-token"
+
+    for status, rejected_body in (
+        (400, b'{"result":"error","message":"different"}'),
+        (200, body),
+    ):
+        with _fixed_http_server({route: (status, rejected_body)}) as (base_url, _calls):
+            monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
+            with pytest.raises(lifecycle.LifecycleError, match="running state"):
+                lifecycle.SupervisorTransport(
+                    "private-token", time.monotonic() + 5
+                ).confirm_dev_not_running()
 
 
 @pytest.mark.parametrize(

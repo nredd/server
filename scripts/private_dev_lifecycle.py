@@ -44,6 +44,7 @@ ALLOWED_REQUESTS = frozenset(
     {
         ("GET", "/addons"),
         ("GET", f"/addons/{DEV}/info"),
+        ("GET", f"/addons/{DEV}/stats?one_shot=true"),
         ("POST", f"/addons/{DEV}/start"),
         ("POST", f"/addons/{DEV}/stop"),
     }
@@ -51,7 +52,7 @@ ALLOWED_REQUESTS = frozenset(
 MAX_RESPONSE = 256 * 1024
 RESTORE_TIMEOUT = 90.0
 START_TIMEOUT = 90.0
-SCHEMA = 2
+SCHEMA = 3
 MAX_RUN_AGE = 600.0
 MAX_WATCHDOG_TIMEOUT = 3600.0
 LOCK_TIMEOUT = 600.0
@@ -81,6 +82,9 @@ class Transport(Protocol):
 
     def request(self, method: str, path: str) -> Any:
         """Make one Supervisor API request and return its `data`."""
+
+    def confirm_dev_not_running(self) -> None:
+        """Prove Supervisor's Docker-backed stats endpoint reports DEV is not running."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,7 @@ class Snapshot:
     created_at: float
     installed_slugs: tuple[str, ...]
     dev_version: str
+    recovery_from_error: bool
 
 
 class SupervisorTransport:
@@ -148,6 +153,21 @@ class SupervisorTransport:
         if not isinstance(parsed, dict) or parsed.get("result") != "ok" or "data" not in parsed:
             raise LifecycleError("Supervisor response is malformed")
         return parsed["data"]
+
+    def confirm_dev_not_running(self) -> None:
+        """Require the documented stats route's exact not-running response for DEV."""
+        path = f"/addons/{DEV}/stats?one_shot=true"
+        if ("GET", path) not in ALLOWED_REQUESTS:
+            raise LifecycleError("invalid fixed API request")
+        raw, status = self._curl("GET", f"{SUPERVISOR_BASE_URL}{path}")
+        if status != 400:
+            raise LifecycleError("DEV running state is not confirmed")
+        try:
+            parsed = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as err:
+            raise LifecycleError("DEV running state is not confirmed") from err
+        if parsed != {"result": "error", "message": f"App {DEV} is not running"}:
+            raise LifecycleError("DEV running state is not confirmed")
 
     def _curl(self, method: str, url: str) -> tuple[bytes, int]:
         """Run fixed native curl with credentials only in its stdin configuration."""
@@ -210,54 +230,11 @@ def validate_token(token: str) -> str:
 
 def read_facts(transport: Transport) -> Facts:
     """
-    Establish stock absence from the complete installed-app catalog, then DEV's own facts.
+    Establish stock absence from the complete installed-app catalog and confirmed DEV facts.
 
     :param transport: The fixed Supervisor transport.
     """
-    # Absence is a fact about the whole `GET /addons` list. The per-app `info` fallback
-    # for an uninstalled app is never consulted or modelled.
-    catalog = transport.request("GET", "/addons")
-    if not isinstance(catalog, dict) or set(catalog) != {"addons"}:
-        raise LifecycleError("installed-app catalog is malformed")
-    entries = catalog["addons"]
-    if not isinstance(entries, list) or not entries:
-        raise LifecycleError("installed-app catalog is malformed")
-    slugs: list[str] = []
-    states: dict[str, str] = {}
-    for entry in entries:
-        if (
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("slug"), str)
-            or not entry["slug"]
-            or not isinstance(entry.get("state"), str)
-            or not isinstance(entry.get("version"), str)
-        ):
-            raise LifecycleError("installed-app catalog entry is incomplete")
-        slugs.append(entry["slug"])
-        states[entry["slug"]] = entry["state"]
-    if len(set(slugs)) != len(slugs):
-        raise LifecycleError("installed-app catalog contains duplicate slugs")
-    if STOCK in slugs:
-        raise LifecycleError(
-            "stock Music Assistant is installed; this lifecycle requires its absence"
-        )
-    if DEV not in slugs:
-        raise LifecycleError("DEV app is not installed")
-    # Sibling MA apps (a local dev build, a beta) may stay installed, but a running one
-    # owns the shared host ports and speakers, and the operator must stop it by hand:
-    # this controller can never issue a stop to any other app.
-    if any(
-        slug != DEV and "music_assistant" in slug and states[slug] != "stopped" for slug in slugs
-    ):
-        raise LifecycleError("another Music Assistant app is not stopped")
-    info = _dev_info(transport)
-    if info.protected is not True:
-        raise LifecycleError("DEV app protection mode is off")
-    if info.boot != "manual":
-        raise LifecycleError("DEV app boot mode is not manual")
-    if info.watchdog is not False:
-        raise LifecycleError("DEV app Supervisor watchdog is on")
-    return Facts(tuple(sorted(slugs)), info.state, info.version)
+    return _read_facts(transport, CONFIRMED_STATES)
 
 
 def capture(transport: Transport) -> Snapshot:
@@ -275,6 +252,27 @@ def capture(transport: Transport) -> Snapshot:
         created_at=time.time(),
         installed_slugs=facts.installed_slugs,
         dev_version=facts.dev_version,
+        recovery_from_error=False,
+    )
+
+
+def capture_recovery(transport: Transport) -> Snapshot:
+    """
+    Capture a recovery-only run from Supervisor's non-running `error` state.
+
+    :param transport: The fixed Supervisor transport.
+    """
+    facts = _read_facts(transport, ("error",))
+    if facts.dev_state != "error":
+        raise LifecycleError("recovery capture requires DEV error")
+    transport.confirm_dev_not_running()
+    return Snapshot(
+        run_id=str(uuid.uuid4()),
+        nonce=secrets.token_hex(32),
+        created_at=time.time(),
+        installed_slugs=facts.installed_slugs,
+        dev_version=facts.dev_version,
+        recovery_from_error=True,
     )
 
 
@@ -286,10 +284,14 @@ def start(transport: Transport, snapshot: Snapshot, deadline: float) -> None:
     :param snapshot: The armed run's captured facts.
     :param deadline: Absolute `time.monotonic()` budget for the confirmed start.
     """
-    facts = read_facts(transport)
+    allowed_states = ("error",) if snapshot.recovery_from_error else CONFIRMED_STATES
+    facts = _read_facts(transport, allowed_states)
     _require_snapshot_facts(snapshot, facts)
-    if facts.dev_state != "stopped":
-        raise LifecycleError("start requires DEV stopped")
+    expected_state = "error" if snapshot.recovery_from_error else "stopped"
+    if facts.dev_state != expected_state:
+        raise LifecycleError(f"start requires DEV {expected_state}")
+    if snapshot.recovery_from_error:
+        transport.confirm_dev_not_running()
     transport.request("POST", f"/addons/{DEV}/start")
     # Supervisor reports `startup` while the app comes up; only an observed `started`
     # confirms the request, and anything else by the deadline is a failure.
@@ -540,7 +542,12 @@ def self_test(root: Path) -> None:
     :param root: The private lifecycle root directory.
     """
     snapshot = Snapshot(
-        str(uuid.uuid4()), secrets.token_hex(32), time.time(), ("core_ssh", DEV), "2.11.0.dev"
+        str(uuid.uuid4()),
+        secrets.token_hex(32),
+        time.time(),
+        ("core_ssh", DEV),
+        "2.11.0.dev",
+        False,
     )
     run_dir = save_snapshot(root, snapshot)
     arm_watchdog(root, snapshot.run_id, 0.05, self_test=True)
@@ -548,7 +555,11 @@ def self_test(root: Path) -> None:
     until = time.monotonic() + 5.0
     while time.monotonic() < until:
         if receipt.exists():
-            payload = _read_private_json(receipt, "receipt")
+            try:
+                payload = _read_private_json(receipt, "receipt")
+            except LifecycleError:
+                time.sleep(0.02)
+                continue
             if payload.get("run_id") == snapshot.run_id and payload.get("verified") is True:
                 return
             raise LifecycleError("self-test child returned an invalid receipt")
@@ -568,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=(
             "preflight",
             "capture",
+            "capture-recovery",
             "arm",
             "start",
             "stop",
@@ -586,9 +598,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "preflight":
             facts = read_facts(SupervisorTransport(_token(), time.monotonic() + RESTORE_TIMEOUT))
             sys.stdout.write(json.dumps(asdict(facts), sort_keys=True) + "\n")
-        elif args.command == "capture":
+        elif args.command in {"capture", "capture-recovery"}:
             transport = SupervisorTransport(_token(), time.monotonic() + RESTORE_TIMEOUT)
-            sys.stdout.write(f"{save_snapshot(args.root, capture(transport))}\n")
+            operation = capture_recovery if args.command == "capture-recovery" else capture
+            sys.stdout.write(f"{save_snapshot(args.root, operation(transport))}\n")
         else:
             run_id = _require_run_id(args.run)
             if args.command == "arm":
@@ -664,6 +677,11 @@ class FakeTransport:
             return None
         raise LifecycleError("self-test fake transport rejected request")
 
+    def confirm_dev_not_running(self) -> None:
+        """Model the Docker-backed stats confirmation used by recovery capture."""
+        if self.dev_started:
+            raise LifecycleError("DEV running state is not confirmed")
+
     def _dev_state(self) -> str:
         return "started" if self.dev_started else "stopped"
 
@@ -685,14 +703,6 @@ def _curl_config_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _dev_info(transport: Transport) -> DevInfo:
-    """Read DEV's own facts; the state must be confirmed, never `unknown` or `error`."""
-    info = _dev_observation(transport)
-    if info.state not in CONFIRMED_STATES:
-        raise LifecycleError("DEV app state is not confirmed started or stopped")
-    return info
-
-
 def _dev_observation(transport: Transport) -> DevInfo:
     """Read DEV's own info with any string state, for loops that must act on all."""
     info = transport.request("GET", f"/addons/{DEV}/info")
@@ -709,6 +719,61 @@ def _dev_observation(transport: Transport) -> DevInfo:
         info.get("boot"),
         info.get("watchdog"),
     )
+
+
+def _read_facts(transport: Transport, allowed_states: tuple[str, ...]) -> Facts:
+    """
+    Read stock-absent facts while accepting only the caller's DEV states.
+
+    :param transport: The fixed Supervisor transport.
+    :param allowed_states: DEV states the caller accepts; any other state is refused.
+    """
+    # Absence is a fact about the whole `GET /addons` list. The per-app `info` fallback
+    # for an uninstalled app is never consulted or modelled.
+    catalog = transport.request("GET", "/addons")
+    if not isinstance(catalog, dict) or set(catalog) != {"addons"}:
+        raise LifecycleError("installed-app catalog is malformed")
+    entries = catalog["addons"]
+    if not isinstance(entries, list) or not entries:
+        raise LifecycleError("installed-app catalog is malformed")
+    slugs: list[str] = []
+    states: dict[str, str] = {}
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("slug"), str)
+            or not entry["slug"]
+            or not isinstance(entry.get("state"), str)
+            or not isinstance(entry.get("version"), str)
+        ):
+            raise LifecycleError("installed-app catalog entry is incomplete")
+        slugs.append(entry["slug"])
+        states[entry["slug"]] = entry["state"]
+    if len(set(slugs)) != len(slugs):
+        raise LifecycleError("installed-app catalog contains duplicate slugs")
+    if STOCK in slugs:
+        raise LifecycleError(
+            "stock Music Assistant is installed; this lifecycle requires its absence"
+        )
+    if DEV not in slugs:
+        raise LifecycleError("DEV app is not installed")
+    # Sibling MA apps (a local dev build, a beta) may stay installed, but a running one
+    # owns the shared host ports and speakers, and the operator must stop it by hand:
+    # this controller can never issue a stop to any other app.
+    if any(
+        slug != DEV and "music_assistant" in slug and states[slug] != "stopped" for slug in slugs
+    ):
+        raise LifecycleError("another Music Assistant app is not stopped")
+    info = _dev_observation(transport)
+    if info.state not in allowed_states:
+        raise LifecycleError("DEV app state is not confirmed")
+    if info.protected is not True:
+        raise LifecycleError("DEV app protection mode is off")
+    if info.boot != "manual":
+        raise LifecycleError("DEV app boot mode is not manual")
+    if info.watchdog is not False:
+        raise LifecycleError("DEV app Supervisor watchdog is on")
+    return Facts(tuple(sorted(slugs)), info.state, info.version)
 
 
 def _require_snapshot_facts(snapshot: Snapshot, facts: Facts) -> None:
@@ -776,6 +841,7 @@ def _parse_snapshot(value: Any, expected_run_id: str) -> Snapshot:
         "created_at",
         "installed_slugs",
         "dev_version",
+        "recovery_from_error",
     }:
         raise LifecycleError("snapshot is malformed")
     slugs = value["installed_slugs"]
@@ -793,6 +859,7 @@ def _parse_snapshot(value: Any, expected_run_id: str) -> Snapshot:
         or DEV not in slugs
         or not isinstance(value["dev_version"], str)
         or not value["dev_version"]
+        or not isinstance(value["recovery_from_error"], bool)
     ):
         raise LifecycleError("snapshot is malformed")
     return Snapshot(
@@ -801,6 +868,7 @@ def _parse_snapshot(value: Any, expected_run_id: str) -> Snapshot:
         float(value["created_at"]),
         tuple(slugs),
         value["dev_version"],
+        value["recovery_from_error"],
     )
 
 
