@@ -18,6 +18,9 @@ from scripts import private_bootstrap_observer as observer
 from scripts import private_dev_lifecycle as lifecycle
 
 SOURCE = observer.EXPECTED_SOURCE
+# First line of the canonical add-on entrypoint (music-assistant/home-assistant-addon,
+# `music_assistant_dev/entrypoint.sh`) when `server_repo` is `nredd/server@<sha>`.
+ANCHOR = f"Building from source using server_repo: nredd/server@{SOURCE}"
 
 
 class Clock:
@@ -103,7 +106,7 @@ def test_stale_prior_provider_traceback_does_not_override_current_install() -> N
     """Only errors after the new exact-source anchor belong to the observed boot."""
     old = current("Traceback TrialBinaryError: obsolete asset")
     fresh = old + current(
-        f"Updating nredd/server@{SOURCE}",
+        ANCHOR,
         "aiolibdatachannel git update begun",
     )
     clock = Clock()
@@ -125,7 +128,7 @@ def test_multibyte_baseline_does_not_shift_the_current_boot_boundary() -> None:
     """A byte-positioned anchor excludes a stale error after non-ASCII baseline text."""
     old = current("π Traceback TrialBinaryError: stale")
     fresh = old + current(
-        f"Updating nredd/server@{SOURCE}",
+        ANCHOR,
         "aiolibdatachannel git update begun",
     )
     clock = Clock()
@@ -143,7 +146,7 @@ def test_multibyte_baseline_does_not_shift_the_current_boot_boundary() -> None:
 def test_delayed_install_reaches_api_ready_without_resetting_budget() -> None:
     """A cold dependency install may progress to API readiness inside the fixed budget."""
     old = current("previous boot complete")
-    install = old + current(f"Updating nredd/server@{SOURCE}", "aiolibdatachannel git update begun")
+    install = old + current(ANCHOR, "aiolibdatachannel git update begun")
     runtime = install + current("Installed music-assistant", "Starting Music Assistant")
     clock = Clock()
     reader = SequenceReader([install, runtime])
@@ -165,7 +168,7 @@ def test_delayed_install_reaches_api_ready_without_resetting_budget() -> None:
 
 def test_same_pin_prior_boot_is_not_accepted_without_a_new_anchor() -> None:
     """A healthy old boot with the same pin cannot satisfy a later boot observation."""
-    old = current(f"Updating nredd/server@{SOURCE}", "Starting Music Assistant")
+    old = current(ANCHOR, "Starting Music Assistant")
     clock = Clock()
     result = observer.observe(
         SequenceReader([old]),
@@ -183,7 +186,7 @@ def test_same_pin_prior_boot_is_not_accepted_without_a_new_anchor() -> None:
 def test_api_response_before_current_runtime_is_not_boot_readiness() -> None:
     """A stale listening API cannot turn an incomplete new install into success."""
     old = current("old boot")
-    log = old + current(f"Updating nredd/server@{SOURCE}", "fetching dependencies")
+    log = old + current(ANCHOR, "fetching dependencies")
     clock = Clock()
     result = observer.observe(
         SequenceReader([log]),
@@ -200,7 +203,7 @@ def test_api_response_before_current_runtime_is_not_boot_readiness() -> None:
 def test_explicit_current_error_is_failure() -> None:
     """A recognized error after the current anchor is safely classified as current failure."""
     old = current("old boot")
-    log = old + current(f"Updating nredd/server@{SOURCE}", "Traceback TrialBinaryError: rejected")
+    log = old + current(ANCHOR, "Traceback TrialBinaryError: rejected")
     clock = Clock()
     result = observer.observe(
         SequenceReader([log]),
@@ -217,7 +220,7 @@ def test_explicit_current_error_is_failure() -> None:
 def test_rotation_or_truncation_fails_unknown_without_reusing_history() -> None:
     """A rotated log stream invalidates an anchor rather than treating prior bytes as current."""
     old = current("old boot")
-    anchored = old + current(f"Updating nredd/server@{SOURCE}")
+    anchored = old + current(ANCHOR)
     clock = Clock()
     result = observer.observe(
         SequenceReader([anchored, current("rotated log")]),
@@ -234,7 +237,7 @@ def test_rotation_or_truncation_fails_unknown_without_reusing_history() -> None:
 def test_budget_exhaustion_keeps_cleanup_reserve() -> None:
     """Observer time is capped by watchdog remaining time less the fixed cleanup reserve."""
     old = current("old boot")
-    log = old + current(f"Updating nredd/server@{SOURCE}", "fetching dependencies")
+    log = old + current(ANCHOR, "fetching dependencies")
     clock = Clock()
     reader = SequenceReader([log])
     result = observer.observe(
@@ -275,7 +278,7 @@ def test_result_redacts_logs_tokens_and_identities() -> None:
 def test_blocking_log_read_cannot_produce_a_late_boot_result() -> None:
     """A blocking read that returns after the deadline is fail-closed, never readiness evidence."""
     old = current("old boot")
-    log = old + current(f"Updating nredd/server@{SOURCE}", "fetching dependencies")
+    log = old + current(ANCHOR, "fetching dependencies")
     clock = Clock()
     result = observer.observe(
         DelayedReader(clock, 4.0, log),
@@ -292,7 +295,7 @@ def test_blocking_log_read_cannot_produce_a_late_boot_result() -> None:
 def test_every_log_read_receives_the_same_absolute_deadline() -> None:
     """Every log read receives the same absolute deadline instead of a rolling wait budget."""
     old = current("old boot")
-    log = old + current(f"Updating nredd/server@{SOURCE}", "fetching dependencies")
+    log = old + current(ANCHOR, "fetching dependencies")
     clock = Clock()
     reader = SequenceReader([log])
     observer.observe(
@@ -369,7 +372,7 @@ def test_invalid_baseline_is_refused(baseline_data: observer.LogBaseline) -> Non
 def test_lease_loss_mid_run_fails_unknown() -> None:
     """A torn-down owner run must not keep yielding bootstrap results at the next poll."""
     log = current("start")
-    reader = SequenceReader([log, log + current(f"Installing nredd/server@{SOURCE}")])
+    reader = SequenceReader([log, log + current(ANCHOR)])
     clock = Clock()
     leases = iter([True, False])
     result = observer.observe(
@@ -488,7 +491,7 @@ def _api_ready_run(
     """Reach `runtime` on the FIRST poll so only the post-probe recheck can intervene."""
     clock = Clock()
     log = current("start")
-    runtime = log + current(f"Installing nredd/server@{SOURCE}", "Starting Music Assistant")
+    runtime = log + current(ANCHOR, "Starting Music Assistant")
     probe = BlockingProbe(clock, clock_jump)
     leases = iter([True, lease_after])
     result = observer.observe(
@@ -572,7 +575,7 @@ def test_baseline_survives_a_full_sliding_tail(monkeypatch: pytest.MonkeyPatch) 
     token = "a" * 40
     base = observer.capture_baseline(observer.SupervisorLogReader(token), time.monotonic() + 5)
     assert base.cursor == "c298"
-    journal.append(f"Installing nredd/server@{SOURCE}")
+    journal.append(ANCHOR)
     journal.append(*[f"Fetching wheel {i}" for i in range(400)])
     journal.append("Starting Music Assistant")
     reader = observer.SupervisorLogReader(token, base.cursor)
@@ -593,7 +596,7 @@ def test_rotated_baseline_cursor_is_unknown(monkeypatch: pytest.MonkeyPatch) -> 
     token = "a" * 40
     base = observer.capture_baseline(observer.SupervisorLogReader(token), time.monotonic() + 5)
     journal.rotate(49)
-    journal.append(f"Installing nredd/server@{SOURCE}")
+    journal.append(ANCHOR)
     result = observer.observe(
         observer.SupervisorLogReader(token, base.cursor),
         SequenceProbe([True]),
@@ -625,7 +628,7 @@ def test_entry_limit_truncation_is_unknown(monkeypatch: pytest.MonkeyPatch) -> N
 def test_failure_after_lease_loss_is_unknown() -> None:
     """A failure line read just as the owner tears down is not a result."""
     log = current("start")
-    bad = log + current(f"Installing nredd/server@{SOURCE}", "Traceback boom")
+    bad = log + current(ANCHOR, "Traceback boom")
     reader = SequenceReader([bad])
     leases = iter([True, False])
     result = observer.observe(
@@ -798,7 +801,7 @@ def test_observe_cli_refuses_loose_permissions_and_symlinks(
 def test_budget_exhaustion_after_lease_loss_is_unknown() -> None:
     """The final budget-exhausted result also requires a live lease."""
     log = current("start")
-    seen = log + current(f"Installing nredd/server@{SOURCE}")
+    seen = log + current(ANCHOR)
     clock = Clock()
     kwargs: dict[str, Any] = {"now": clock.now, "sleep": clock.sleep}
     live = observer.observe(
@@ -817,3 +820,143 @@ def test_budget_exhaustion_after_lease_loss_is_unknown() -> None:
         **kwargs,
     )
     assert result.phase is observer.BootstrapPhase.UNKNOWN
+
+
+# Canonical installer transcript for `server_repo: nredd/server@<sha>`: entrypoint echoes
+# plus uv output (shapes only; no private values).
+INSTALLER_LINES = (
+    ANCHOR,
+    f"Server repository: nredd/server@{SOURCE}",
+    f"Server URL: git+https://github.com/nredd/server@{SOURCE}",
+    f"Updating https://github.com/nredd/server ({SOURCE})",
+    f"Updated https://github.com/nredd/server ({SOURCE})",
+)
+
+
+@pytest.mark.parametrize("line", INSTALLER_LINES)
+def test_each_canonical_installer_line_anchors(line: str) -> None:
+    """Every real installer line for the exact source is a valid anchor."""
+    raw = current("noise", line, "more")
+    assert observer._find_anchor(raw, 0) == len(b"noise\n")
+
+
+@pytest.mark.parametrize("wrap", ["{}\r", "\x1b[32m{}\x1b[0m", "\x1b[1m\x1b[32m{}\x1b[0m\r"])
+def test_terminal_colour_and_carriage_return_are_tolerated(wrap: str) -> None:
+    """Colour codes and CRLF do not hide the installer line."""
+    raw = current("noise", wrap.format(ANCHOR))
+    assert observer._find_anchor(raw, 0) == len(b"noise\n")
+
+
+def test_real_installer_transcript_reaches_api_ready() -> None:
+    """A boot shaped like the real add-on log leaves `unknown` and probes the API."""
+    old = current("old boot line")
+    log = old + current(
+        "",
+        "Music Assistant Developer App",
+        ANCHOR,
+        "",
+        "Step 1: Installing Music Assistant Server",
+        f"Server repository: nredd/server@{SOURCE}",
+        f"Server URL: git+https://github.com/nredd/server@{SOURCE}",
+        "Installing dependencies from: https://raw.githubusercontent.com/x/requirements_all.txt",
+        f"Updating https://github.com/nredd/server ({SOURCE})",
+        f"Updated https://github.com/nredd/server ({SOURCE})",
+        f"Built music-assistant @ git+https://github.com/nredd/server@{SOURCE}",
+        "Starting Music Assistant",
+    )
+    clock = Clock()
+    probe = SequenceProbe([True])
+    result = observer.observe(
+        SequenceReader([log]),
+        probe,
+        baseline(old),
+        observer.CLEANUP_RESERVE + 100.0,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+    assert result.phase is observer.BootstrapPhase.API_READY
+    assert result.expected_source_seen
+    assert result.api_ready
+
+
+OTHER_SHA = "0" * 40
+NEAR_MISSES = [
+    pytest.param(
+        f"Building from source using server_repo: nredd/server@{OTHER_SHA}", id="other-sha"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: other/server@{SOURCE}", id="other-owner"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: nredd/serverx@{SOURCE}", id="other-repo"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: xnredd/server@{SOURCE}", id="owner-prefix"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: nredd/server@{SOURCE[:-1]}", id="sha-prefix"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: nredd/server@{SOURCE}0", id="sha-suffix"
+    ),
+    pytest.param(f"Building from source using server_repo: nredd/server@0{SOURCE}", id="sha-lead"),
+    pytest.param(
+        f"Building from source using server_repo: nredd/server@{SOURCE}-x", id="ref-suffix"
+    ),
+    pytest.param(
+        f"Building from source using server_repo: nredd/server@{SOURCE.upper()}", id="case"
+    ),
+    pytest.param(f"xx {ANCHOR}", id="line-prefix"),
+    pytest.param(f"{ANCHOR} xx", id="line-suffix"),
+    pytest.param(f"echo {ANCHOR}", id="quoted-prefix"),
+    pytest.param(f"Server repository: nredd/server@{SOURCE}x", id="repository-suffix"),
+    pytest.param(
+        f"Server URL: git+https://github.com/nredd/server@{OTHER_SHA}", id="url-other-sha"
+    ),
+    pytest.param(f"Server URL: git+https://github.com/other/server@{SOURCE}", id="url-other-owner"),
+    pytest.param(f"Server URL: git+https://github.com/nredd/server@{SOURCE}.git", id="url-suffix"),
+    pytest.param(f"Updating https://github.com/nredd/server ({OTHER_SHA})", id="uv-other-sha"),
+    pytest.param(f"Updating https://github.com/other/server ({SOURCE})", id="uv-other-repo"),
+    pytest.param(f"Updating https://github.com/nredd/server ({SOURCE[:-1]})", id="uv-sha-prefix"),
+    pytest.param(f"Updating https://github.com/nredd/server ({SOURCE}0)", id="uv-sha-suffix"),
+    pytest.param(f"Updating https://github.com/nredd/server ({SOURCE}) now", id="uv-line-suffix"),
+    pytest.param(f"Updating nredd/server@{SOURCE}", id="legacy-synthetic"),
+    pytest.param(f"Installing nredd/server@{SOURCE}", id="legacy-synthetic-installing"),
+    pytest.param(f"server_repo: nredd/server@{SOURCE}", id="selector-alone"),
+    pytest.param(f"nredd/server@{SOURCE}", id="bare-selector"),
+    pytest.param(
+        f"Built music-assistant @ git+https://github.com/nredd/server@{SOURCE}", id="built"
+    ),
+    pytest.param("Starting Music Assistant", id="runtime-alone"),
+    pytest.param("Loaded player provider AirPlay", id="provider-alone"),
+]
+
+
+@pytest.mark.parametrize("line", NEAR_MISSES)
+def test_near_misses_never_anchor(line: str) -> None:
+    """Other repos, SHAs, prefix or suffix collisions and generic lines stay `unknown`."""
+    old = current("old boot line")
+    log = old + current(line, "Starting Music Assistant", "aiolibdatachannel git update")
+    assert observer._find_anchor(log, len(old)) is None
+    clock = Clock()
+    probe = SequenceProbe([True, True])
+    result = observer.observe(
+        SequenceReader([log]),
+        probe,
+        baseline(old),
+        observer.CLEANUP_RESERVE + 10.0,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
+    assert not result.expected_source_seen
+    assert not result.api_ready
+    assert probe.deadlines == []
+
+
+def test_stale_baseline_anchor_is_not_a_current_anchor() -> None:
+    """The exact installer line in the pre-start baseline does not anchor the new boot."""
+    old = current(*INSTALLER_LINES, "Starting Music Assistant")
+    log = old + current("Starting Music Assistant")
+    assert observer._find_anchor(old, 0) is not None
+    assert observer._find_anchor(log, len(old)) is None
