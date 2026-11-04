@@ -217,14 +217,14 @@ publication suppression, not a network sandbox or proof of an actual HA flow out
 
 The trial profile may resolve, probe and register exactly ONE device, named by the private
 advanced discovery core entry `private_trial_target` as `<12 lowercase hex MAC>@<advertised
-name>` (e.g. `aabbccddeeff@Main Pod`). The entry exists only on the trial target. While it is
-unset, blank or malformed the profile fails closed: no directed mDNS query, no related-service
-lookup, no `/info` probe and no player registration happens for ANY device, including the
-intended one. It is read live, so set it through the private API and then reload the
-`airplay` provider to replay the shared mDNS cache under the new admission. Changing the
-target while the provider runs is unsupported: the old device's records are no longer
-admitted (not even its `Removed` event), so its registered player would linger until the
-provider reload unregisters it. Retarget means reload.
+name>` (e.g. `aabbccddeeff@Main Pod`). The entry exists only on the trial target. Every private-profile boot clears any persisted
+admission before creating the discovery browser. While it is unset, blank or malformed the
+profile fails closed: no directed mDNS query, no related-service lookup, no `/info` probe and no
+player registration happens for ANY device, including the intended one. After boot, set it through
+the private API and then reload the `airplay` provider to replay the shared mDNS cache under the
+new admission. Changing the target while the provider runs is unsupported: the old device's
+records are no longer admitted (not even its `Removed` event), so its registered player would
+linger until the provider reload unregisters it. Retarget means reload.
 
 Enforcement seams, each with offline RED/GREEN tests and no ordinary-profile change:
 
