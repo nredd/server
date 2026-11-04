@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.private_trial_scope import TrialMode, TrialScope, check_players
+from scripts.private_trial_scope import CaptureVisibility, TrialMode, TrialScope, check_players
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,6 +53,74 @@ def test_tv_scope_preserves_explicit_exclusions() -> None:
     assert "host 192.0.2.10" in scope.capture_filter
     assert "host 198.51.100.20" in scope.excluded_filter
     assert "ether host 02:aa:bb:cc:dd:ee" in scope.excluded_filter
+
+
+def routed_inventory() -> dict[str, object]:
+    """Return a synthetic routed inventory: explicit visibility, no link MACs."""
+    data = inventory() | {
+        "capture_visibility": "routed-ip",
+        "excluded": [{"ip": "198.51.100.20"}],
+    }
+    del data["target_link_mac"]
+    return data
+
+
+def test_default_visibility_is_on_link() -> None:
+    """Existing inventories keep the on-link contract and filters unchanged."""
+    scope = TrialScope.parse(inventory())
+    assert scope.visibility == CaptureVisibility.ON_LINK
+    assert "ether host 02:11:22:33:44:55" in scope.capture_filter
+    explicit = TrialScope.parse(inventory() | {"capture_visibility": "on-link"})
+    assert explicit.capture_filter == scope.capture_filter
+    assert "CAPTURE_VISIBILITY=on-link" in scope.shell()
+
+
+def test_routed_scope_is_ip_only_and_host_paired() -> None:
+    """Routed filters match only HAOS<->declared IPv4 endpoints, never MACs."""
+    scope = TrialScope.parse(routed_inventory())
+    assert scope.visibility == CaptureVisibility.ROUTED_IP
+    assert (
+        scope.capture_filter
+        == "ip and host 203.0.113.30 and (host 198.51.100.20 or host 192.0.2.10)"
+    )
+    assert scope.excluded_filter == "ip and host 203.0.113.30 and (host 198.51.100.20)"
+    assert "ether" not in scope.capture_filter + scope.excluded_filter
+    assert "multicast" not in scope.capture_filter
+    assert "CAPTURE_VISIBILITY=routed-ip" in scope.shell()
+
+
+def test_routed_rejects_mac_fields_instead_of_dropping_them() -> None:
+    """A MAC supplied under routed-ip (e.g. a gateway MAC) is refused, not ignored."""
+    with pytest.raises(ValueError, match="forbids `target_link_mac`"):
+        TrialScope.parse(routed_inventory() | {"target_link_mac": "02:00:00:00:00:01"})
+    with pytest.raises(ValueError, match="forbids excluded link `mac`"):
+        TrialScope.parse(
+            routed_inventory() | {"excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}]}
+        )
+
+
+def test_routed_still_requires_other_fields_and_known_visibility() -> None:
+    """Routed drops only the MAC requirement; the rest stays exact."""
+    for field in ("target", "target_ip", "excluded", "host_ip", "ssh_host", "mode"):
+        data = routed_inventory()
+        del data[field]
+        with pytest.raises(ValueError, match="documented inventory fields"):
+            TrialScope.parse(data)
+    for value in ("routed", "", "ROUTED-IP"):
+        with pytest.raises(ValueError, match="Invalid `capture_visibility`"):
+            TrialScope.parse(routed_inventory() | {"capture_visibility": value})
+    with pytest.raises(ValueError, match="Invalid `capture_visibility`"):
+        TrialScope.parse(routed_inventory() | {"capture_visibility": None})
+    with pytest.raises(ValueError, match="documented inventory fields"):
+        TrialScope.parse(routed_inventory() | {"gateway_mac": "02:00:00:00:00:01"})
+
+
+def test_on_link_without_mac_still_refuses() -> None:
+    """Omitting target_link_mac never silently selects routed mode."""
+    data = inventory()
+    del data["target_link_mac"]
+    with pytest.raises(ValueError, match=r".+"):
+        TrialScope.parse(data)
 
 
 def test_missing_fields() -> None:

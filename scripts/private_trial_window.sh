@@ -191,7 +191,7 @@ SCOPE_HELPER="$(cd "$(dirname "$0")" && pwd)/private_trial_scope.py"
 [[ $# == 1 ]] || { printf 'Usage: %s SCOPE.json\n' "$0" >&2; exit 2; }
 SCOPE_ASSIGNMENTS=$(python3 "$SCOPE_HELPER" --scope "$1") || exit 2
 eval "$SCOPE_ASSIGNMENTS"
-readonly TRIAL_TARGET TRIAL_PLAYER TRIAL_MODE TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER
+readonly TRIAL_TARGET TRIAL_PLAYER TRIAL_MODE TARGET_IP HAOS_IP HOST CAP_FILTER EXCLUDED_FILTER CAPTURE_VISIBILITY
 
 TOTAL_STAGES=12
 ENV_FILE="${ENV_FILE:-$HOME/.config/native-airplay-trial/window.env}"
@@ -274,8 +274,16 @@ stage "Review the validated scope (no excluded-device discovery)"
 say "Admitted target: $TRIAL_TARGET ($TRIAL_PLAYER) at $TARGET_IP in $TRIAL_MODE mode"
 say "Capture: $CAP_FILTER"
 say "Excluded-only verdict: $EXCLUDED_FILTER"
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  warn "routed-ip capture: only IPv4 between the HAOS host and the declared endpoints is observed."
+  warn "L2, non-IP and IPv6 traffic are NOT MEASURED; this window cannot prove full isolation."
+fi
 say "No ping, ARP or neighbor lookup of excluded endpoints is performed."
-say "IP-only exclusions cover listed IPv4 only; supply link MACs for IPv6 coverage."
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  say "routed-ip: IPv6/L2 coverage is unavailable; it is reported UNKNOWN, not clean."
+else
+  say "IP-only exclusions cover listed IPv4 only; supply link MACs for IPv6 coverage."
+fi
 pause
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
@@ -420,10 +428,23 @@ echo AIRPLAY_PORTS \$(grep -cE '\\.(7000|7100|319|320|6[0-9]{3}):' $CAP_FILE.ver
 echo '--- non-baseline flows (count, flow):'
 awk '{c=\$1; \$1=\"\"; sub(/^ /,\"\"); print c\"\\t\"\$0}' $CAP_FILE.flows | awk -F'\\t' 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$2 in b)' $BASE.flows -
 echo NEW_EXCLUDED_FLOWS \$(awk '{\$1=\"\"; sub(/^ /,\"\"); print}' $CAP_FILE.flows | awk 'FILENAME==ARGV[1]{b[\$0]=1; next} !(\$0 in b)' $BASE.flows - | wc -l)") || fail "Verdict pipeline failed."
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  # IPv4-only capture: a computed non-IP zero is unobservable, so never print it as a count.
+  VERDICT=$(printf '%s\n' "$VERDICT" | sed 's/^NON_IP .*/NON_IP UNKNOWN (not measured)/')
+fi
 printf '%s\n' "$VERDICT"
 H2E=$(printf '%s\n' "$VERDICT" | awk '/^HOST_TO_EXCLUDED /{print $2}'); AP=$(printf '%s\n' "$VERDICT" | awk '/^AIRPLAY_PORTS /{print $2}'); NEW=$(printf '%s\n' "$VERDICT" | awk '/^NEW_EXCLUDED_FLOWS /{print $2}')
 NON_IP=$(printf '%s\n' "$VERDICT" | awk '/^NON_IP /{print $2}')
-if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && "$NON_IP" == 0 && $ABORTED == 0 ]]; then
+if [[ "$CAPTURE_VISIBILITY" == "routed-ip" ]]; then
+  NON_IP=UNKNOWN
+  if [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && $ABORTED == 0 ]]; then
+    printf '  %sROUTED-IP SCOPE: no IPv4 violation observed%s (non-IP/L2/IPv6 UNKNOWN, not measured; NOT an isolation pass)\n' "$YELLOW" "$RESET"
+    VERDICT_PARTIAL=1
+  else
+    printf '  %sROUTED-IP SCOPE FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
+    VERDICT_FAILED=1
+  fi
+elif [[ "$H2E" == 0 && "$AP" == 0 && "$NEW" == 0 && "$NON_IP" == 0 && $ABORTED == 0 ]]; then
   printf '  %sISOLATION PASS%s\n' "$GREEN" "$RESET"
 else
   printf '  %sISOLATION FAIL%s (host/excluded %s, airplay ports %s, new excluded flows %s, non-IP %s, aborted %s)\n' "$RED" "$RESET" "$H2E" "$AP" "$NEW" "$NON_IP" "$ABORTED"
@@ -432,5 +453,6 @@ fi
 say "The verdict reads only excluded endpoints from the validated inventory."
 warn "Restart sibling apps yourself if desired. The trial never does."
 
+if [[ "${VERDICT_FAILED:-0}" != 0 ]]; then exit 2; fi
+if [[ "${VERDICT_PARTIAL:-0}" != 0 ]]; then exit 3; fi
 finish
-[[ "${VERDICT_FAILED:-0}" == 0 ]] || exit 2
