@@ -91,9 +91,9 @@ def test_routed_scope_is_ip_only_and_host_paired() -> None:
 
 def test_routed_rejects_mac_fields_instead_of_dropping_them() -> None:
     """A MAC supplied under routed-ip (e.g. a gateway MAC) is refused, not ignored."""
-    with pytest.raises(ValueError, match="forbids target_link_mac"):
+    with pytest.raises(ValueError, match="forbids `target_link_mac`"):
         TrialScope.parse(routed_inventory() | {"target_link_mac": "02:00:00:00:00:01"})
-    with pytest.raises(ValueError, match="forbids excluded link MACs"):
+    with pytest.raises(ValueError, match="forbids excluded link `mac`"):
         TrialScope.parse(
             routed_inventory() | {"excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}]}
         )
@@ -104,14 +104,14 @@ def test_routed_still_requires_other_fields_and_known_visibility() -> None:
     for field in ("target", "target_ip", "excluded", "host_ip", "ssh_host", "mode"):
         data = routed_inventory()
         del data[field]
-        with pytest.raises(ValueError, match=r".+"):
+        with pytest.raises(ValueError, match="documented inventory fields"):
             TrialScope.parse(data)
     for value in ("routed", "", "ROUTED-IP"):
-        with pytest.raises(ValueError, match=r".+"):
+        with pytest.raises(ValueError, match="Invalid `capture_visibility`"):
             TrialScope.parse(routed_inventory() | {"capture_visibility": value})
-    with pytest.raises(TypeError, match=r".+"):
+    with pytest.raises(ValueError, match="Invalid `capture_visibility`"):
         TrialScope.parse(routed_inventory() | {"capture_visibility": None})
-    with pytest.raises(ValueError, match=r".+"):
+    with pytest.raises(ValueError, match="documented inventory fields"):
         TrialScope.parse(routed_inventory() | {"gateway_mac": "02:00:00:00:00:01"})
 
 

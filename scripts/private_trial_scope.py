@@ -63,9 +63,8 @@ class TrialScope:
     @classmethod
     def parse(cls, data: object) -> TrialScope:
         """Validate a complete explicit inventory, rejecting ambiguous scope."""
-        visibility = _checked_visibility(data)
+        data, visibility = _checked_fields(data)
         routed = visibility == CaptureVisibility.ROUTED_IP
-        assert isinstance(data, dict)
         target = data["target"]
         if not isinstance(target, str) or not (match := TARGET.fullmatch(target)):
             raise ValueError("Target must be a MAC@name with a safe DNS instance name")
@@ -75,7 +74,7 @@ class TrialScope:
             raise ValueError("ssh_host must be a plain SSH host alias")
         target_ip = _ipv4(data["target_ip"])
         host_ip = _ipv4(data["host_ip"])
-        target_mac = None if routed else _mac(data[LINK_MAC_FIELD])
+        target_mac = "" if routed else _mac(data[LINK_MAC_FIELD])
         if target_ip == host_ip:
             raise ValueError("Target and host addresses overlap")
         excluded = data["excluded"]
@@ -91,10 +90,10 @@ class TrialScope:
             if address in seen:
                 raise ValueError("Duplicate or overlapping inventory addresses")
             seen.add(address)
+            if "mac" in entry and routed:
+                raise ValueError("`routed-ip` scope forbids excluded link `mac` entries")
             terms.append(f"host {address}")
             hosts.append(f"host {address}")
-            if "mac" in entry and routed:
-                raise ValueError("routed-ip scope forbids excluded link MACs")
             if "mac" in entry:
                 mac = _mac(entry["mac"])
                 if mac in (
@@ -119,7 +118,6 @@ class TrialScope:
                 excluded_filter,
                 visibility,
             )
-        assert target_mac is not None  # on-link scope always supplies it
         excluded_filter = f"({' or '.join(terms)}) and not multicast and not broadcast"
         capture_filter = (
             f"({' or '.join([*terms, f'host {target_ip}', f'ether host {target_mac}'])})"
@@ -203,31 +201,31 @@ def _trial_mode(value: object) -> TrialMode:
         raise ValueError(f"Invalid trial mode: {err}; expected homepod-ptp or tv-raop") from err
 
 
-def _checked_visibility(data: object) -> CaptureVisibility:
-    """Validate the field set for the declared visibility and return it."""
-    if not isinstance(data, dict):
-        raise TypeError("Scope must be a JSON object")
+def _checked_fields(data: object) -> tuple[dict[str, object], CaptureVisibility]:
+    """Validate the field set for the declared visibility and return both."""
+    if not isinstance(data, dict) or not set(data) >= REQUIRED_FIELDS:
+        raise ValueError("Scope requires exactly the documented inventory fields")
     visibility = _visibility(data.get(VISIBILITY_FIELD, CaptureVisibility.ON_LINK))
     routed = visibility == CaptureVisibility.ROUTED_IP
     if routed and LINK_MAC_FIELD in data:
         raise ValueError(
-            "routed-ip scope forbids target_link_mac: the routed target's MAC is not "
+            "`routed-ip` scope forbids `target_link_mac`: the routed target's MAC is not "
             "visible on the host link (a gateway MAC would widen the capture)"
         )
     required = REQUIRED_FIELDS | (set() if routed else {LINK_MAC_FIELD})
     if not required <= set(data) <= required | {VISIBILITY_FIELD}:
         raise ValueError("Scope requires exactly the documented inventory fields")
-    return visibility
+    return data, visibility
 
 
 def _visibility(value: object) -> CaptureVisibility:
     """Require an explicit supported capture visibility."""
-    if not isinstance(value, str):
-        raise TypeError("capture_visibility must be a string")
     try:
-        return CaptureVisibility(value)
+        return CaptureVisibility(str(value))
     except ValueError as err:
-        raise ValueError("Invalid capture_visibility: expected on-link or routed-ip") from err
+        raise ValueError(
+            f"Invalid `capture_visibility` '{value}'; expected `on-link` or `routed-ip`"
+        ) from err
 
 
 def _ipv4(value: object) -> str:

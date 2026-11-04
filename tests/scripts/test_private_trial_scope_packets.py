@@ -188,10 +188,15 @@ async def test_routed_filters_match_exact_endpoints_only(tmp_path: Path) -> None
     assert await tcpdump_count(capture, scope.excluded_filter) == 1
 
 
-async def test_routed_verdict_never_reads_as_isolation_pass(tmp_path: Path) -> None:
-    """Routed verdicts report non-IP as UNKNOWN and never print the full-isolation pass."""
+@pytest.mark.parametrize(
+    ("destination", "failed"), [("192.0.2.10", False), ("198.51.100.20", True)]
+)
+async def test_routed_verdict_never_reads_as_isolation_pass(
+    tmp_path: Path, destination: str, failed: bool
+) -> None:
+    """Routed verdicts report non-IP as UNKNOWN, never `NON_IP 0` or the isolation pass."""
     capture = tmp_path / "window.pcap"
-    write_packets(capture, [packet("203.0.113.30", "192.0.2.10")])
+    write_packets(capture, [packet("203.0.113.30", destination)])
     (tmp_path / "baseline.flows").write_text("")
     script = (ROOT / "scripts/private_trial_window.sh").read_text()
     flowkey = next(line for line in script.splitlines() if line.startswith("FLOWKEY="))
@@ -218,7 +223,9 @@ async def test_routed_verdict_never_reads_as_isolation_pass(tmp_path: Path) -> N
         env=os.environ | {"PATH": f"{Path(str(TCPDUMP)).parent}:{os.environ['PATH']}"},
     )
     stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-    assert process.returncode == 0, stdout + stderr
+    assert (process.returncode != 0) is failed, stdout + stderr
     assert b"ISOLATION PASS" not in stdout
-    assert b"NOT an isolation pass" in stdout
-    assert b"UNKNOWN" in stdout
+    assert b"NON_IP 0" not in stdout
+    assert b"NON_IP UNKNOWN" in stdout
+    assert (b"ROUTED-IP SCOPE FAIL" in stdout) is failed
+    assert (b"NOT an isolation pass" in stdout) is not failed
