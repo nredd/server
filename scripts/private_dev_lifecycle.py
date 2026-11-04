@@ -69,6 +69,10 @@ class LifecycleError(RuntimeError):
     """A sanitized lifecycle failure that must not be treated as success."""
 
 
+class MalformedStateError(LifecycleError):
+    """A private state file that is not parseable JSON, e.g. observed while still being written."""
+
+
 class TransientAvailabilityError(LifecycleError):
     """A documented temporary Supervisor availability failure."""
 
@@ -84,7 +88,16 @@ class Transport(Protocol):
         """Make one Supervisor API request and return its `data`."""
 
     def confirm_dev_not_running(self) -> None:
-        """Prove Supervisor's Docker-backed stats endpoint reports DEV is not running."""
+        """
+        Prove DEV's container is not running, using only Supervisor's stats route.
+
+        Callers use this to distinguish a failed, exited container (still `error` in
+        `info`) from one that is running; it must be checked immediately before any
+        recovery start, never cached.
+
+        :raises LifecycleError: Unless Supervisor positively confirmed DEV is not
+            running; any other response, including an unreachable one, is a refusal.
+        """
 
 
 @dataclass(frozen=True)
@@ -155,7 +168,16 @@ class SupervisorTransport:
         return parsed["data"]
 
     def confirm_dev_not_running(self) -> None:
-        """Require the documented stats route's exact not-running response for DEV."""
+        """
+        Require the stats route's exact not-running response for DEV.
+
+        Supervisor answers `GET /addons/<DEV>/stats?one_shot=true` with HTTP 400 and
+        `{"result": "error", "message": "App <DEV> is not running"}` only when the
+        Docker container is not running. Success, other statuses, non-JSON bodies and
+        any extra or differing key are all treated as unconfirmed.
+
+        :raises LifecycleError: Unless that exact response was received.
+        """
         path = f"/addons/{DEV}/stats?one_shot=true"
         if ("GET", path) not in ALLOWED_REQUESTS:
             raise LifecycleError("invalid fixed API request")
@@ -557,7 +579,12 @@ def self_test(root: Path) -> None:
         if receipt.exists():
             try:
                 payload = _read_private_json(receipt, "receipt")
-            except LifecycleError:
+            except MalformedStateError:
+                # The child creates the receipt exclusively and then writes it, so the
+                # parent can observe it empty or partial. Only unparsable JSON is
+                # retried, and only within this loop's budget; a persistently malformed
+                # receipt falls through to the timeout failure. Unsafe permissions,
+                # wrong types or oversize files are never retried.
                 time.sleep(0.02)
                 continue
             if payload.get("run_id") == snapshot.run_id and payload.get("verified") is True:
@@ -678,7 +705,11 @@ class FakeTransport:
         raise LifecycleError("self-test fake transport rejected request")
 
     def confirm_dev_not_running(self) -> None:
-        """Model the Docker-backed stats confirmation used by recovery capture."""
+        """
+        Model the stats confirmation used by recovery capture and start.
+
+        :raises LifecycleError: While DEV is modelled as started.
+        """
         if self.dev_started:
             raise LifecycleError("DEV running state is not confirmed")
 
@@ -906,7 +937,9 @@ def _read_private_json(path: Path, label: str) -> dict[str, Any]:
         raise LifecycleError(f"{label} exceeded limit")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as err:
+    except ValueError as err:
+        raise MalformedStateError(f"{label} is malformed") from err
+    except OSError as err:
         raise LifecycleError(f"{label} is malformed") from err
     if not isinstance(value, dict):
         raise LifecycleError(f"{label} is malformed")

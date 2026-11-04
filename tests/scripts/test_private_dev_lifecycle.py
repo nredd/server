@@ -339,6 +339,91 @@ def _info(state: str) -> dict[str, Any]:
     }
 
 
+def _errored(**kwargs: Any) -> ScriptedTransport:
+    """Return a transport whose DEV reports Supervisor `error` and is confirmed not running."""
+    transport = ScriptedTransport(**kwargs)
+    transport.overrides[f"/addons/{DEV}/info"] = _info("error")
+    return transport
+
+
+def test_normal_capture_rejects_error() -> None:
+    """The ordinary capture never accepts `error`, even with stats proving not-running."""
+    transport = _errored()
+    with pytest.raises(lifecycle.LifecycleError, match="not confirmed"):
+        lifecycle.capture(transport)
+    assert not any("stats" in call for call in transport.calls)
+
+
+@pytest.mark.parametrize(
+    ("state", "field", "value", "message"),
+    [
+        ("started", "protected", True, "not confirmed"),
+        ("stopped", "protected", True, "not confirmed"),
+        ("error", "protected", False, "protection mode is off"),
+        ("error", "watchdog", True, "Supervisor watchdog is on"),
+        ("error", "boot", "auto", "boot mode is not manual"),
+    ],
+)
+def test_recovery_capture_rejects_non_error_or_unsafe_dev(
+    state: str, field: str, value: Any, message: str
+) -> None:
+    """Recovery capture needs `error` on a protected, manual, unwatched DEV."""
+    transport = ScriptedTransport()
+    transport.overrides[f"/addons/{DEV}/info"] = {**_info(state), field: value}
+    with pytest.raises(lifecycle.LifecycleError, match=message):
+        lifecycle.capture_recovery(transport)
+
+
+def test_recovery_capture_rejects_running_sibling() -> None:
+    """A running sibling Music Assistant app blocks recovery capture."""
+    transport = _errored(slugs=(DEV, "core_ssh", "local_music_assistant_dev"))
+    transport.sibling_state = "started"
+    with pytest.raises(lifecycle.LifecycleError, match="another Music Assistant app"):
+        lifecycle.capture_recovery(transport)
+
+
+def test_recovery_capture_rejects_unconfirmed_stats() -> None:
+    """An `error` DEV that stats cannot prove non-running yields no snapshot."""
+    transport = _errored(dev_started=True)
+    with pytest.raises(lifecycle.LifecycleError, match="running state"):
+        lifecycle.capture_recovery(transport)
+
+
+def test_recovery_start_skips_post_when_fresh_stats_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stats failure at start time, after a valid capture, sends no start request."""
+    transport = _errored()
+    state = lifecycle.capture_recovery(transport)
+
+    def refuse() -> None:
+        raise lifecycle.LifecycleError("DEV running state is not confirmed")
+
+    monkeypatch.setattr(transport, "confirm_dev_not_running", refuse)
+    with pytest.raises(lifecycle.LifecycleError, match="running state"):
+        lifecycle.start(transport, state, time.monotonic() + 5)
+    assert f"POST /addons/{DEV}/start" not in transport.calls
+
+
+@pytest.mark.parametrize(
+    ("drift", "message"),
+    [("catalog", "catalog changed"), ("version", "version changed")],
+)
+def test_recovery_start_refuses_catalog_or_version_drift(drift: str, message: str) -> None:
+    """Recovery start keeps the captured catalog and image binding."""
+    state = lifecycle.capture_recovery(_errored())
+    kwargs: dict[str, Any] = (
+        {"slugs": (DEV, "core_ssh", "core_samba")} if drift == "catalog" else {}
+    )
+    transport = _errored(**kwargs)
+    if drift == "version":
+        transport.dev_version = "2.11.0.dev2"
+        transport.overrides[f"/addons/{DEV}/info"] = {**_info("error"), "version": "2.11.0.dev2"}
+    with pytest.raises(lifecycle.LifecycleError, match=message):
+        lifecycle.start(transport, state, time.monotonic() + 5)
+    assert f"POST /addons/{DEV}/start" not in transport.calls
+
+
 def test_start_waits_through_startup_and_rejects_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """`startup` is pending, `started` confirms, `error` fails at once."""
     monkeypatch.setattr(lifecycle, "POLL_INTERVAL", 0.01)
@@ -1088,6 +1173,67 @@ def test_self_test_detaches_and_verifies_receipt(tmp_path: Path) -> None:
     assert (receipts[0].parent / "simulation.json").exists()
 
 
+def _private_write(path: Path, text: str) -> None:
+    """Write an owner-only file in place, as the lifecycle's own state files are."""
+    path.write_text(text)
+    path.chmod(0o600)
+
+
+def test_self_test_retries_a_partially_written_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The child creates then writes the receipt, so a half-written one is retried."""
+    good = {"run_id": "", "verified": True}
+
+    def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
+        receipt = root / run_id / "receipt.json"
+        _private_write(receipt, '{"run_id": "')
+        good["run_id"] = run_id
+
+        def finish() -> None:
+            time.sleep(0.1)
+            _private_write(receipt, json.dumps(good))
+
+        threading.Thread(target=finish).start()
+        return 0
+
+    monkeypatch.setattr(lifecycle, "arm_watchdog", arm)
+    lifecycle.self_test(tmp_path)
+
+
+def test_self_test_persistently_malformed_receipt_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt that never becomes valid JSON fails at the budget, never passes."""
+    real_monotonic = time.monotonic
+    start = real_monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: (real_monotonic() - start) * 100)
+
+    def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
+        _private_write(root / run_id / "receipt.json", "{")
+        return 0
+
+    monkeypatch.setattr(lifecycle, "arm_watchdog", arm)
+    with pytest.raises(lifecycle.LifecycleError, match="timed out"):
+        lifecycle.self_test(tmp_path)
+
+
+def test_self_test_does_not_retry_non_malformed_receipt_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsafe permissions or a wrong JSON type fail at once instead of being retried."""
+
+    def arm(root: Path, run_id: str, _timeout: float, **_kwargs: Any) -> int:
+        receipt = root / run_id / "receipt.json"
+        _private_write(receipt, "[]")
+        return 0
+
+    monkeypatch.setattr(lifecycle, "arm_watchdog", arm)
+    with pytest.raises(lifecycle.LifecycleError, match="receipt is malformed") as info:
+        lifecycle.self_test(tmp_path)
+    assert not isinstance(info.value, lifecycle.MalformedStateError)
+
+
 def test_self_test_child_requires_matching_simulation_marker(tmp_path: Path) -> None:
     """The fake transport cannot be selected for an ordinary saved run."""
     state = snapshot()
@@ -1168,16 +1314,30 @@ def test_supervisor_transport_requires_the_exact_not_running_stats_response(
     assert [call[1] for call in calls] == [route]
     assert calls[0][2]["Authorization"] == "Bearer private-token"
 
-    for status, rejected_body in (
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
         (400, b'{"result":"error","message":"different"}'),
-        (200, body),
-    ):
-        with _fixed_http_server({route: (status, rejected_body)}) as (base_url, _calls):
-            monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
-            with pytest.raises(lifecycle.LifecycleError, match="running state"):
-                lifecycle.SupervisorTransport(
-                    "private-token", time.monotonic() + 5
-                ).confirm_dev_not_running()
+        (400, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running","x":1}'),
+        (400, b"not json"),
+        (400, b"\xff"),
+        (200, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running"}'),
+        (500, b'{"result":"error","message":"App ' + DEV.encode() + b' is not running"}'),
+        (503, b""),
+    ],
+)
+def test_supervisor_transport_rejects_inexact_stats_responses(
+    monkeypatch: pytest.MonkeyPatch, status: int, body: bytes
+) -> None:
+    """Any status, body or extra key but the exact 400 not-running answer is refused."""
+    route = f"/addons/{DEV}/stats?one_shot=true"
+    with _fixed_http_server({route: (status, body)}) as (base_url, _calls):
+        monkeypatch.setattr(lifecycle, "SUPERVISOR_BASE_URL", base_url)
+        with pytest.raises(lifecycle.LifecycleError):
+            lifecycle.SupervisorTransport(
+                "private-token", time.monotonic() + 5
+            ).confirm_dev_not_running()
 
 
 @pytest.mark.parametrize(
