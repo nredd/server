@@ -140,6 +140,16 @@ Readiness schema version `1` has exactly these top-level fields:
 - `schema_version`: `1`.
 - `installer_provenance`, `expected_sha256`, `startup_validation`, `owned_children`: the existing
   finite provenance/asset/child receipt schemas, with only `ptp` and `stream` roles.
+- `server_code_evidence`: version 1, either exactly `schema_version` and `status: unverified`, or
+  `schema_version`, `status: verified` and `source_hashes`. The latter has exactly `provider`,
+  `control_player`, `player`, `helpers`, `constants`, `trial_binary`, `private_trial` and
+  `server_code_evidence`, each encoded as `u32be-v1` with eight SHA-256 words. Compare every hash
+  with an externally generated manifest for the final reviewed commit. This is approved source
+  hashes plus selected live-code and binding checks, not loaded-commit proof. Source reads and
+  compilation are bounded and read-only; unsupported descriptors, mismatched code or bindings,
+  including the control class's inherited AirPlay capability getter, unreadable or oversized
+  files fail closed. This does not check all runtime globals and does not
+  defend against a malicious process.
 - `snapshot_current`: boolean. Provenance is collected first, then exact PTP/event and
   player/stream/child/request/capture references are snapshotted. After ALL awaits, the same
   references, stream roster and each `TrialAsyncProcess.has_current_receipt()` are checked
