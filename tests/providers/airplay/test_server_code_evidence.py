@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 from music_assistant.helpers.private_trial import encode_public_digest
 from music_assistant.providers.airplay import (
+    constants,
     control_player,
     provider,
+    trial_binary,
 )
 from music_assistant.providers.airplay import (
     server_code_evidence as evidence,
@@ -99,6 +99,37 @@ def test_unsupported_decorator_and_defaults(
     )
     assert defaulted != source
     path.write_bytes(defaulted)
+    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("owner", "name", "replacement"),
+    [
+        (provider, "trial_binary", object()),
+        (control_player, "trial_binary", object()),
+        (trial_binary, "_is_trial_target", lambda: False),
+        (control_player, "supports_mrp_service", lambda _: False),
+        (provider, "_PRIVATE_CREDENTIAL_KEYS", frozenset()),
+        (provider, "_PRIVATE_PLAYER_ID", None),
+        (constants, "CONF_MRP_CREDENTIALS", "wrong"),
+    ],
+)
+def test_binding_inventory_swaps(
+    monkeypatch: pytest.MonkeyPatch, owner: object, name: str, replacement: object
+) -> None:
+    """Selected imported aliases, credential constants and inventory fail closed."""
+    monkeypatch.setattr(owner, name, replacement)
+    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+def test_stale_control_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Changed MRP endpoint semantics on disk reject the old live getter."""
+    source = Path(control_player.__file__).read_bytes()
+    changed = source.replace(b"return self.mrp_discovery_info, Protocol.MRP", b"return None")
+    assert changed != source
+    path = tmp_path / "control_player.py"
+    path.write_bytes(changed)
+    monkeypatch.setattr(control_player, "__file__", str(path))
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
 
 

@@ -22,78 +22,13 @@ if TYPE_CHECKING:
 _MAX_SOURCE_SIZE = 1024 * 1024
 
 
-def _normalize(code: CodeType) -> CodeType:
-    """Remove only source filenames, recursively, before same-interpreter comparison."""
-    return code.replace(
-        co_filename="",
-        co_consts=tuple(
-            _normalize(item) if isinstance(item, CodeType) else item for item in code.co_consts
-        ),
-    )
-
-
-def _codes(code: CodeType) -> list[CodeType]:
-    """Collect nested code for later qualified-name lookup."""
-    result: list[CodeType] = []
-    for item in code.co_consts:
-        if isinstance(item, CodeType):
-            result.append(item)
-            result.extend(_codes(item))
-    return result
-
-
-def _check_function(
-    compiled: list[CodeType], tree: ast.Module, owner: object, name: str, prop: bool = False
-) -> None:
-    """Check one undecorated function or explicitly expected property getter."""
-    class_name = owner.__name__ if isinstance(owner, type) else None
-    nodes = tree.body
-    if class_name is not None:
-        classes = [
-            item for item in nodes if isinstance(item, ast.ClassDef) and item.name == class_name
-        ]
-        if len(classes) != 1:
-            raise ValueError("Unexpected class")
-        nodes = classes[0].body
-    declarations = [
-        item
-        for item in nodes
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
-    ]
-    if len(declarations) != 1:
-        raise ValueError("Unexpected declaration")
-    declaration = declarations[0]
-    if declaration.args.defaults or any(item is not None for item in declaration.args.kw_defaults):
-        raise ValueError("Unexpected source defaults")
-    decorators = declaration.decorator_list
-    if (not prop and decorators) or (
-        prop
-        and (
-            len(decorators) != 1
-            or not isinstance(decorators[0], ast.Name)
-            or decorators[0].id != "property"
-        )
-    ):
-        raise ValueError("Unexpected decorator")
-    value = inspect.getattr_static(owner, name)
-    if prop:
-        if type(value) is not property or value.fset is not None or value.fdel is not None:
-            raise ValueError("Unexpected descriptor")
-        value = value.fget
-    if type(value) is not FunctionType or hasattr(value, "__wrapped__"):
-        raise ValueError("Unexpected callable")
-    if value.__defaults__ is not None or value.__kwdefaults__ is not None:
-        raise ValueError("Unexpected defaults")
-    qualname = f"{class_name}.{name}" if class_name else name
-    if value.__qualname__ != qualname:
-        raise ValueError("Unexpected qualified name")
-    matches = [item for item in compiled if item.co_qualname == qualname]
-    if len(matches) != 1 or _normalize(value.__code__) != _normalize(matches[0]):
-        raise ValueError("Code mismatch")
-
-
 def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
-    """Return source hashes only when selected live code and bindings agree."""
+    """
+    Return source hashes only when selected live code and bindings agree.
+
+    :param provider: The loaded AirPlay provider module.
+    :return: A verified evidence payload or a secret-free unverified result.
+    """
     failure: dict[str, SerializableType] = {"schema_version": 1, "status": "unverified"}
     try:
         modules = {
@@ -247,3 +182,82 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         OverflowError,
     ):
         return failure
+
+
+def _normalize(code: CodeType) -> CodeType:
+    """Return a code object suitable for same-interpreter comparison."""
+    return code.replace(
+        co_filename="",
+        co_consts=tuple(
+            _normalize(item) if isinstance(item, CodeType) else item for item in code.co_consts
+        ),
+    )
+
+
+def _codes(code: CodeType) -> list[CodeType]:
+    """Return all nested code objects."""
+    result: list[CodeType] = []
+    for item in code.co_consts:
+        if isinstance(item, CodeType):
+            result.append(item)
+            result.extend(_codes(item))
+    return result
+
+
+def _check_function(
+    compiled: list[CodeType], tree: ast.Module, owner: object, name: str, prop: bool = False
+) -> None:
+    """
+    Reject a selected callable that does not match its source declaration.
+
+    :param compiled: Code objects compiled from the source.
+    :param tree: Parsed source declarations.
+    :param owner: Module or class containing the callable.
+    :param name: Expected callable name.
+    :param prop: Whether the callable must be a property getter.
+    :raises ValueError: If the callable differs from its source declaration.
+    """
+    class_name = owner.__name__ if isinstance(owner, type) else None
+    nodes = tree.body
+    if class_name is not None:
+        classes = [
+            item for item in nodes if isinstance(item, ast.ClassDef) and item.name == class_name
+        ]
+        if len(classes) != 1:
+            raise ValueError("Unexpected class")
+        nodes = classes[0].body
+    declarations = [
+        item
+        for item in nodes
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
+    ]
+    if len(declarations) != 1:
+        raise ValueError("Unexpected declaration")
+    declaration = declarations[0]
+    if declaration.args.defaults or any(item is not None for item in declaration.args.kw_defaults):
+        raise ValueError("Unexpected source defaults")
+    decorators = declaration.decorator_list
+    if (not prop and decorators) or (
+        prop
+        and (
+            len(decorators) != 1
+            or not isinstance(decorators[0], ast.Name)
+            or decorators[0].id != "property"
+        )
+    ):
+        raise ValueError("Unexpected decorator")
+    value = inspect.getattr_static(owner, name)
+    if prop:
+        if type(value) is not property or value.fset is not None or value.fdel is not None:
+            raise ValueError("Unexpected descriptor")
+        value = value.fget
+    if type(value) is not FunctionType or hasattr(value, "__wrapped__"):
+        raise ValueError("Unexpected callable")
+    if value.__defaults__ is not None or value.__kwdefaults__ is not None:
+        raise ValueError("Unexpected defaults")
+    qualname = f"{class_name}.{name}" if class_name else name
+    if value.__qualname__ != qualname:
+        raise ValueError("Unexpected qualified name")
+    matches = [item for item in compiled if item.co_qualname == qualname]
+    if len(matches) != 1 or _normalize(value.__code__) != _normalize(matches[0]):
+        raise ValueError("Code mismatch")
