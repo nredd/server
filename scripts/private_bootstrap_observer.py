@@ -43,7 +43,7 @@ STARTUP_BUDGET = 480.0
 CLEANUP_RESERVE = 120.0
 POLL_INTERVAL = 2.0
 
-_CURSOR = re.compile(r"[A-Za-z0-9=;_.:-]{1,512}")
+_CURSOR = re.compile(r"[A-Za-z0-9=;_.-]{1,512}")
 
 _INSTALLER_ANCHOR = re.compile(
     rb"\b(?:installing|updating)\b.*\bnredd/server@" + EXPECTED_SOURCE.encode() + rb"\b",
@@ -146,7 +146,7 @@ class SupervisorLogReader:
         if self._cursor is None:
             entries = "entries=:-1:2"
         else:
-            entries = f"entries={self._cursor}::{MAX_LOG_ENTRIES}"
+            entries = f"entries={self._cursor}:0:{MAX_LOG_ENTRIES}"
         url = f"{lifecycle.SUPERVISOR_BASE_URL}/addons/{DEV}/logs"
         config = (
             "\n".join(
@@ -182,6 +182,9 @@ class SupervisorLogReader:
         head, separator, body = result.stdout.partition(b"\r\n\r\n")
         if not separator or len(head) > MAX_HEADER_BYTES or len(body) > MAX_LOG_BYTES:
             raise ObserverError("log capture unavailable")
+        if self._cursor is not None and body.count(b"\n") >= MAX_LOG_ENTRIES:
+            # gatewayd silently truncates at the entry count; an entry has at least one line.
+            raise ObserverError("log capture exceeded entry limit")
         self.first_cursor = _first_cursor(head)
         if self._cursor is not None and self._cursor != "":
             # Anchored reads must start at the baseline entry; otherwise it was rotated away.
@@ -294,6 +297,8 @@ def observe(
         if anchor_offset is not None:
             phase = _classify(raw[anchor_offset:])
             if phase is BootstrapPhase.FAILURE:
+                if now() >= deadline or not lease_live():
+                    return _unknown(False)
                 return BootstrapObservation(
                     phase=phase,
                     expected_source_seen=True,

@@ -475,7 +475,7 @@ so the baseline records the journal cursor (`X-First-Cursor`) of its first entry
 reads use the supported `Range: entries=<cursor>::<count>` header to start at that exact entry
 (Supervisor 2026.10.5 `api/host.py` `advanced_logs_handler`; systemd journal-gatewayd). The
 baseline cursor must come back as the first entry again; if journald vacuumed it, the result is
-`unknown`. Reads over 256 KiB or 2000 entries also yield `unknown`. The live-lease probe takes a
+`unknown`. Reads over 256 KiB or at the 2000-entry cap (conservatively, 2000 lines) also yield `unknown`. The live-lease probe takes a
 non-blocking shared flock only, and the lifecycle `start` probe is shared too, so an observer
 can never make a dead watchdog look alive; arm the watchdog before observing, because an
 observer's momentary shared lock can make a concurrent `arm` report the lease as taken. Capture

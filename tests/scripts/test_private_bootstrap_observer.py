@@ -522,6 +522,7 @@ class FakeJournal:
             if "Range:" in line
         )
         cursor, skip, count = spec.split(":")
+        assert skip, "explicit skip field required"
         if cursor == "" and skip:
             chosen = self.entries[int(skip) - 1 :][: int(count)]
         else:
@@ -581,3 +582,31 @@ def test_log_cursor_header_is_validated() -> None:
         observer._first_cursor(b"HTTP/1.1 200 OK\r\nX-First-Cursor: a b")
     with pytest.raises(observer.ObserverError):
         observer.SupervisorLogReader("a" * 40, 'bad"cursor')
+
+
+def test_entry_limit_truncation_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body that may have been truncated at the entry cap is refused, not read as a prefix."""
+    journal = FakeJournal(3)
+    monkeypatch.setattr(subprocess, "run", journal.run)
+    token = "a" * 40
+    base = observer.capture_baseline(observer.SupervisorLogReader(token), time.monotonic() + 5)
+    journal.append(*[f"line {i}" for i in range(observer.MAX_LOG_ENTRIES)])
+    with pytest.raises(observer.ObserverError, match="entry limit"):
+        observer.SupervisorLogReader(token, base.cursor).read(time.monotonic() + 5)
+
+
+def test_failure_after_lease_loss_is_unknown() -> None:
+    """A failure line read just as the owner tears down is not a result."""
+    log = current("start")
+    bad = log + current(f"Installing nredd/server@{SOURCE}", "Traceback boom")
+    leases = iter([True, False])
+    result = observer.observe(
+        SequenceReader([log, bad]),
+        SequenceProbe([False]),
+        baseline(log),
+        1000.0,
+        now=Clock().now,
+        sleep=lambda _s: None,
+        lease_live=lambda: next(leases, False),
+    )
+    assert result.phase is observer.BootstrapPhase.UNKNOWN
