@@ -465,7 +465,8 @@ The observer derives one absolute monotonic deadline from the existing armed lif
 uses at most 480 seconds and always reserves the final 120 seconds for the independent watchdog
 cleanup. Dependency progress does not reset either deadline. This permits a cold dependency/source
 install without permitting an unbounded readiness loop. No observer result authorizes a live
-mutation; `749156b7` remains the exclusive recovery owner.
+mutation; the single designated live-run owner (named by the parent for that run) remains the
+exclusive recovery owner.
 
 ## Gates before any launch
 
