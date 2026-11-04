@@ -323,7 +323,7 @@ def run_once(
         limitations=[
             "No native receiver group membership evidence.",
             "No acoustic or iPhone-control evidence.",
-            "No RTP evidence unless an independently captured packet receipt is supplied.",
+            "No RTP or packet evidence is produced or accepted by this tool.",
         ],
     )
     stop_deadline: float | None = None
@@ -508,7 +508,9 @@ def main(argv: list[str] | None = None) -> int:
             with suppress(OSError):
                 server.close()
     sys.stdout.write(receipt.model_dump_json(exclude_none=False) + "\n")
-    return 0 if receipt.outcome == "OBSERVED" and receipt.ma_stop_requested else 1
+    # This controller cannot establish receiver acceptance: clean source/stop facts are
+    # deliberately incomplete, while a setup, request, or cleanup failure is failed.
+    return 1 if receipt.outcome == "FAILED" or not receipt.ma_stop_requested else 2
 
 
 if __name__ == "__main__":

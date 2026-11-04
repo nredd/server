@@ -8,11 +8,13 @@ import time
 from contextlib import suppress
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
 
+from scripts import private_tv_transport as transport
 from scripts.private_trial_scope import TrialScope
 from scripts.private_tv_transport import (
     HTTP_TIMEOUT_SECONDS,
@@ -106,7 +108,9 @@ def test_controller_records_observed_fetch_and_stops_in_finally() -> None:
     assert receipt.ma_stop_requested is True
     assert receipt.child_connected is None
     assert receipt.child_pcm is None
-    assert "RTP evidence" in receipt.limitations[-1]
+    assert (
+        receipt.limitations[-1] == "No RTP or packet evidence is produced or accepted by this tool."
+    )
     assert api.calls[1] == (
         "player_queues/play_media",
         {"queue_id": "ap021122334455", "media": url, "option": "replace"},
@@ -269,6 +273,83 @@ def test_independent_watchdog_stops_after_slow_play_response() -> None:
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+def test_main_returns_incomplete_for_clean_source_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Do not promote a clean infrastructure observation into transport acceptance."""
+    inventory = tmp_path / "scope.json"
+    inventory.write_text(
+        json.dumps(
+            {
+                "target": "021122334455@test-tv",
+                "target_ip": "192.0.2.10",
+                "target_link_mac": "02:11:22:33:44:55",
+                "excluded": [{"ip": "198.51.100.20", "mac": "02:aa:bb:cc:dd:ee"}],
+                "host_ip": "203.0.113.30",
+                "ssh_host": "trial-host",
+                "mode": "tv-raop",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(transport, "validate_lifecycle_run", lambda *_args: None)
+    monkeypatch.setattr(transport, "MusicAssistantApi", lambda *_args: FakeApi())
+    monkeypatch.setattr(transport, "StopWatchdog", lambda *_args: FakeStopGuard())
+
+    result = transport.main(
+        [
+            "--inventory",
+            str(inventory),
+            "--ma-url",
+            "http://127.0.0.1:8095",
+            "--bind",
+            "127.0.0.1",
+            "--advertised-host",
+            "127.0.0.1",
+            "--lifecycle-root",
+            str(tmp_path),
+            "--lifecycle-run",
+            "00000000-0000-0000-0000-000000000000",
+        ]
+    )
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().out)["outcome"] == "INCOMPLETE"
+
+
+def test_main_returns_failure_for_preflight_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Distinguish a failed setup from clean but insufficient transport facts."""
+    inventory = tmp_path / "scope.json"
+    inventory.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        transport,
+        "validate_lifecycle_run",
+        lambda *_args: (_ for _ in ()).throw(TransportError("watchdog missing")),
+    )
+
+    result = transport.main(
+        [
+            "--inventory",
+            str(inventory),
+            "--ma-url",
+            "http://127.0.0.1:8095",
+            "--bind",
+            "127.0.0.1",
+            "--advertised-host",
+            "127.0.0.1",
+            "--lifecycle-root",
+            str(tmp_path),
+            "--lifecycle-run",
+            "00000000-0000-0000-0000-000000000000",
+        ]
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().out)["outcome"] == "FAILED"
 
 
 def test_only_the_stimulus_path_is_served() -> None:
