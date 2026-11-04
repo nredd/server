@@ -57,7 +57,7 @@ _INSTALLER_ANCHOR = re.compile(
     rb"Building from source using server_repo: nredd/server@" + _SHA + rb"|"
     rb"Server repository: nredd/server@" + _SHA + rb"|"
     rb"Server URL: git\+https://github\.com/nredd/server@" + _SHA + rb"|"
-    rb"(?:Updating|Updated) https://github\.com/nredd/server \(" + _SHA + rb"\)"
+    rb"Updating https://github\.com/nredd/server \(" + _SHA + rb"\)"
     rb")" + _SGR + rb"\r?$",
     re.MULTILINE,
 )

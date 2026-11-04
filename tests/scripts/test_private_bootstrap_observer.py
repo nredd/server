@@ -833,7 +833,7 @@ INSTALLER_LINES = (
 )
 
 
-@pytest.mark.parametrize("line", INSTALLER_LINES)
+@pytest.mark.parametrize("line", INSTALLER_LINES[:-1])
 def test_each_canonical_installer_line_anchors(line: str) -> None:
     """Every real installer line for the exact source is a valid anchor."""
     raw = current("noise", line, "more")
@@ -920,6 +920,7 @@ NEAR_MISSES = [
     pytest.param(f"Updating https://github.com/nredd/server ({SOURCE[:-1]})", id="uv-sha-prefix"),
     pytest.param(f"Updating https://github.com/nredd/server ({SOURCE}0)", id="uv-sha-suffix"),
     pytest.param(f"Updating https://github.com/nredd/server ({SOURCE}) now", id="uv-line-suffix"),
+    pytest.param(f"Updated https://github.com/nredd/server ({SOURCE})", id="uv-updated-alone"),
     pytest.param(f"Updating nredd/server@{SOURCE}", id="legacy-synthetic"),
     pytest.param(f"Installing nredd/server@{SOURCE}", id="legacy-synthetic-installing"),
     pytest.param(f"server_repo: nredd/server@{SOURCE}", id="selector-alone"),
