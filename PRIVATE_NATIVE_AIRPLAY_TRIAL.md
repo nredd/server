@@ -437,6 +437,56 @@ a mocked acknowledgement. Record the command's bounded stdout/stderr and exit st
 external artifact receipt. This gate proves only the current server/CLI integration contract, not
 receiver, playback, or native-control acceptance.
 
+## Bounded bootstrap observation
+
+`scripts/private_bootstrap_observer.py` is a read-only companion to the existing
+`private_dev_lifecycle.py` controller. It has no start, stop, option, player, receiver or
+provider-reload operation. It reads only the fixed Supervisor DEV log endpoint and the fixed
+unauthenticated `127.0.0.1:18095/info` endpoint, with bounded native-curl/HTTP requests. It
+never prints raw logs, tokens, option values, paths, identities, response bodies or memory
+measurements.
+
+Capture `baseline` while DEV is confirmed stopped, then arm/start only through the lifecycle
+controller and invoke `observe` with that lifecycle run. `baseline --baseline-file PATH` creates
+the file exclusively with mode 0600 and prints only `Baseline captured`; `observe` reads it with
+the same `--baseline-file PATH` (symlinks, foreign owners, loose permissions and bad payloads
+are refused). The file holds a length, a SHA-256 prefix identity and a journal cursor (which
+contains machine and boot identifiers), never log content, so it is never printed or passed on
+argv. A boot is current only if the current log is
+an append-only continuation of that baseline and contains a new exact
+`nredd/server@0f7b543127f71c5639d55d4e0e34168ba92d0c33` installer anchor after it. A healthy
+prior boot of the same pin, stale provider traceback, log rotation, truncation, unreadable logs,
+or a changed baseline is `unknown`, never success or failure evidence for the new boot.
+
+The safe result has only `phase`, `expected_source_seen`, `current_boot`, `api_ready`,
+`budget_remaining`, and `log_continuity`. `phase` is one of `fetching-deps`, `source-install`,
+`runtime`, `api-ready`, `failure`, or `unknown`. `api-ready` means only the fixed API returned a
+bounded JSON object. It does not establish AirPlay provider readiness, player admission, installed
+source provenance, binary image identity, receiver contact, playback, or memory state. Current
+errors are recognized only after the new installer anchor.
+
+The observer derives one absolute monotonic deadline from the existing armed lifecycle lease. It
+uses at most 480 seconds and always reserves the final 120 seconds for the independent watchdog
+cleanup. Dependency progress does not reset either deadline. This permits a cold dependency/source
+install without permitting an unbounded readiness loop. No observer result authorizes a live
+mutation; the single designated live-run owner (named by the parent for that run) remains the
+exclusive recovery owner.
+
+The observer rechecks the live lease on every poll, after the API probe before it can report
+`api-ready`, and before any failure or budget-exhausted result; a dead lease or expired deadline
+yields `unknown`.
+
+The Supervisor add-on log endpoint defaults to a sliding tail of the last 100 journal entries, so
+the baseline records the journal cursor (`X-First-Cursor`) of its first entry, and later reads use
+the supported `Range: entries=<cursor>:0:2000` header to start at that exact entry (Supervisor
+2026.10.5 `api/host.py` `advanced_logs_handler`; systemd journal-gatewayd). The baseline cursor
+must come back as the first entry again; if journald vacuumed it, the result is `unknown`. Reads
+over 256 KiB or at the 2000-entry cap (conservatively, 2000 lines) also yield `unknown`. The
+live-lease probe takes a non-blocking shared flock only, and the lifecycle `start` probe is shared
+too, so an observer can never make a dead watchdog look alive; arm the watchdog before observing,
+because an observer's momentary shared lock can make a concurrent `arm` report the lease as taken.
+Capture the baseline while DEV is stopped; this is an operator step and is not enforced by code.
+
 ## Gates before any launch
 
 - Preserve a verified backup and restore route for protected official MA 2.10.7, including

@@ -423,6 +423,19 @@ def load_snapshot(root: Path, run_id: str) -> tuple[Path, Snapshot]:
     return run_dir, _parse_snapshot(raw["snapshot"], expected_run_id=run_id)
 
 
+def load_watchdog_deadline(root: Path, run_id: str) -> float:
+    """
+    Return the armed run's absolute `time.monotonic()` cleanup deadline.
+
+    :param root: Lifecycle state root.
+    :param run_id: Run whose watchdog lease to read.
+    :return: Absolute monotonic deadline, never later than the wall-clock deadline allows.
+    :raises LifecycleError: If the run or its watchdog state is not valid.
+    """
+    run_dir, snapshot = load_snapshot(root, run_id)
+    return float(_watchdog_monotonic_deadline(_load_watchdog(run_dir, snapshot)))
+
+
 def arm_watchdog(root: Path, run_id: str, timeout: float, *, self_test: bool = False) -> int:
     """
     Detach a one-shot child that invokes this controller's same stop path.
@@ -461,6 +474,7 @@ def arm_watchdog(root: Path, run_id: str, timeout: float, *, self_test: bool = F
                     "run_id": snapshot.run_id,
                     "nonce": snapshot.nonce,
                     "deadline": time.time() + timeout,
+                    "monotonic_deadline": time.monotonic() + timeout,
                 },
             )
             if self_test:
@@ -506,10 +520,11 @@ def watchdog(root: Path, run_id: str, transport: Transport | None = None) -> Non
     """
     run_dir, snapshot = load_snapshot(root, run_id)
     watch = _load_watchdog(run_dir, snapshot)
-    # The wall-clock deadline is converted once so a clock step cannot stretch the wait.
+    # New leases persist their monotonic deadline so all same-boot consumers share one
+    # immutable budget. Legacy leases retain their one-time wall-clock conversion.
     # Sleep in slices so a manual `stop` that already verified this run releases the
     # application-wide lease early instead of holding it until the deadline.
-    deadline = time.monotonic() + (watch["deadline"] - time.time())
+    deadline = _watchdog_monotonic_deadline(watch)
     while (delay := deadline - time.monotonic()) > 0:
         if _has_verified_receipt(run_dir, snapshot):
             return
@@ -841,7 +856,9 @@ def _require_live_lease(root: Path, snapshot: Snapshot) -> None:
     descriptor = _open_lock(root, "watchdog.lock")
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Shared, not exclusive: the watchdog holds LOCK_EX, so a shared probe fails only
+            # for a real holder. A read-only observer's transient LOCK_SH cannot fake liveness.
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             pass
         else:
@@ -961,16 +978,35 @@ def _write_json_exclusive(path: Path, value: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _watchdog_monotonic_deadline(watch: dict[str, Any]) -> float:
+    """Bound the persisted monotonic deadline by the wall deadline so a reboot cannot stretch it."""
+    wall = float(time.monotonic() + (watch["deadline"] - time.time()))
+    persisted = watch.get("monotonic_deadline")
+    return wall if persisted is None else float(min(float(persisted), wall))
+
+
 def _load_watchdog(run_dir: Path, snapshot: Snapshot) -> dict[str, Any]:
     """Validate the deadline and nonce belonging to this exact armed run."""
     value = _read_private_json(run_dir / "watchdog.json", "watchdog state")
     if (
-        set(value) != {"run_id", "nonce", "deadline"}
+        not isinstance(value, dict)
+        or set(value)
+        not in (
+            {"run_id", "nonce", "deadline"},
+            {"run_id", "nonce", "deadline", "monotonic_deadline"},
+        )
         or value["run_id"] != snapshot.run_id
         or value["nonce"] != snapshot.nonce
         or type(value["deadline"]) not in (int, float)
         or not math.isfinite(value["deadline"])
         or value["deadline"] > time.time() + MAX_WATCHDOG_TIMEOUT
+        or (
+            "monotonic_deadline" in value
+            and (
+                type(value["monotonic_deadline"]) not in (int, float)
+                or not math.isfinite(value["monotonic_deadline"])
+            )
+        )
     ):
         raise LifecycleError("watchdog does not own this lifecycle run")
     return value
