@@ -977,9 +977,9 @@ def load_watchdog_deadline(root: Path, run_id: str) -> float:
 
 def _watchdog_monotonic_deadline(watch: dict[str, Any]) -> float:
     """Bound the persisted monotonic deadline by the wall deadline so a reboot cannot stretch it."""
-    wall = time.monotonic() + (watch["deadline"] - time.time())
+    wall = float(time.monotonic() + (watch["deadline"] - time.time()))
     persisted = watch.get("monotonic_deadline")
-    return wall if persisted is None else min(float(persisted), wall)
+    return wall if persisted is None else float(min(float(persisted), wall))
 
 
 def _load_watchdog(run_dir: Path, snapshot: Snapshot) -> dict[str, Any]:
