@@ -463,7 +463,7 @@ The anchor is a *full line* match, and only these four official-entrypoint forma
 - `Server URL: git+https://github.com/nredd/server@<sha>`
 - `Updating https://github.com/nredd/server (<sha>)` (the `uv` output line)
 
-Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
+The three entrypoint lines are the primary anchors; the `uv` line is optional, best-effort (it may be absent or differently formatted). Only ANSI colour sequences and a trailing CR are tolerated. Another repo or SHA, a prefix or
 suffix, additional text, a stale-baseline line, or a generic runtime/selector line alone is not
 an anchor. The `expected_source_seen` flag is a log reference to the expected source, *not*
 proof of the installed commit. A healthy
@@ -474,8 +474,11 @@ The safe result has only `phase`, `expected_source_seen`, `current_boot`, `api_r
 `budget_remaining`, and `log_continuity`. `phase` is one of `fetching-deps`, `source-install`,
 `runtime`, `api-ready`, `failure`, or `unknown`. `api-ready` means only the fixed API returned a
 bounded JSON object. It does not establish AirPlay provider readiness, player admission, installed
-source provenance, binary image identity, receiver contact, playback, or memory state. Current
-errors are recognized only after the new installer anchor.
+source provenance, binary image identity, receiver contact, playback, or memory state. `runtime` requires the
+real post-install startup line from `music_assistant/mass.py`,
+`Starting Music Assistant Server (<id>) version <v> ...`; `Step 1: Installing Music Assistant Server`,
+dependency output, `listening on` and other product-name mentions never count, so the API is not
+probed before it. Current errors are recognized only after the new installer anchor.
 
 The observer derives one absolute monotonic deadline from the existing armed lifecycle lease. It
 uses at most 480 seconds and always reserves the final 120 seconds for the independent watchdog

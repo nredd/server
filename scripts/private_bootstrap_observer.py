@@ -67,9 +67,10 @@ _DEPENDENCY_FETCH = re.compile(
 _SOURCE_INSTALLED = re.compile(
     r"\b(?:installed|built)\b.*\b(?:music-assistant|server)\b", re.IGNORECASE
 )
-_RUNTIME_STARTED = re.compile(
-    r"\b(?:starting music assistant|music assistant server|listening on)\b", re.IGNORECASE
-)
+# `music_assistant/mass.py` logs this once, after the install step, as
+# `Starting Music Assistant Server (<id>) version <v> - HA add-on: ...`. The entrypoint's
+# `Step 1: Installing Music Assistant Server`, dependency logs and product mentions never match.
+_RUNTIME_STARTED = re.compile(r"\bStarting Music Assistant Server \([^)\n]*\) version \S")
 _CURRENT_FAILURE = re.compile(
     r"\b(?:traceback|trialbinaryerror|jsondecodeerror|installation failed)\b", re.IGNORECASE
 )

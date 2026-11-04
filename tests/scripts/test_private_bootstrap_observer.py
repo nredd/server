@@ -20,6 +20,10 @@ from scripts import private_dev_lifecycle as lifecycle
 SOURCE = observer.EXPECTED_SOURCE
 # First line of the canonical add-on entrypoint (music-assistant/home-assistant-addon,
 # `music_assistant_dev/entrypoint.sh`) when `server_repo` is `nredd/server@<sha>`.
+# Real `music_assistant/mass.py` startup line (the only runtime marker).
+STARTED = (
+    "Starting Music Assistant Server (abc123) version 2.9.0 - HA add-on: True - Safe mode: False"
+)
 ANCHOR = f"Building from source using server_repo: nredd/server@{SOURCE}"
 
 
@@ -147,7 +151,7 @@ def test_delayed_install_reaches_api_ready_without_resetting_budget() -> None:
     """A cold dependency install may progress to API readiness inside the fixed budget."""
     old = current("previous boot complete")
     install = old + current(ANCHOR, "aiolibdatachannel git update begun")
-    runtime = install + current("Installed music-assistant", "Starting Music Assistant")
+    runtime = install + current("Installed music-assistant", STARTED)
     clock = Clock()
     reader = SequenceReader([install, runtime])
     probe = SequenceProbe([False, True])
@@ -168,7 +172,7 @@ def test_delayed_install_reaches_api_ready_without_resetting_budget() -> None:
 
 def test_same_pin_prior_boot_is_not_accepted_without_a_new_anchor() -> None:
     """A healthy old boot with the same pin cannot satisfy a later boot observation."""
-    old = current(ANCHOR, "Starting Music Assistant")
+    old = current(ANCHOR, STARTED)
     clock = Clock()
     result = observer.observe(
         SequenceReader([old]),
@@ -491,7 +495,7 @@ def _api_ready_run(
     """Reach `runtime` on the FIRST poll so only the post-probe recheck can intervene."""
     clock = Clock()
     log = current("start")
-    runtime = log + current(ANCHOR, "Starting Music Assistant")
+    runtime = log + current(ANCHOR, STARTED)
     probe = BlockingProbe(clock, clock_jump)
     leases = iter([True, lease_after])
     result = observer.observe(
@@ -577,7 +581,7 @@ def test_baseline_survives_a_full_sliding_tail(monkeypatch: pytest.MonkeyPatch) 
     assert base.cursor == "c298"
     journal.append(ANCHOR)
     journal.append(*[f"Fetching wheel {i}" for i in range(400)])
-    journal.append("Starting Music Assistant")
+    journal.append(STARTED)
     reader = observer.SupervisorLogReader(token, base.cursor)
     result = observer.observe(
         reader,
@@ -862,7 +866,7 @@ def test_real_installer_transcript_reaches_api_ready() -> None:
         f"Updating https://github.com/nredd/server ({SOURCE})",
         f"Updated https://github.com/nredd/server ({SOURCE})",
         f"Built music-assistant @ git+https://github.com/nredd/server@{SOURCE}",
-        "Starting Music Assistant",
+        STARTED,
     )
     clock = Clock()
     probe = SequenceProbe([True])
@@ -928,7 +932,7 @@ NEAR_MISSES = [
     pytest.param(
         f"Built music-assistant @ git+https://github.com/nredd/server@{SOURCE}", id="built"
     ),
-    pytest.param("Starting Music Assistant", id="runtime-alone"),
+    pytest.param(STARTED, id="runtime-alone"),
     pytest.param("Loaded player provider AirPlay", id="provider-alone"),
 ]
 
@@ -937,7 +941,7 @@ NEAR_MISSES = [
 def test_near_misses_never_anchor(line: str) -> None:
     """Other repos, SHAs, prefix or suffix collisions and generic lines stay `unknown`."""
     old = current("old boot line")
-    log = old + current(line, "Starting Music Assistant", "aiolibdatachannel git update")
+    log = old + current(line, STARTED, "aiolibdatachannel git update")
     assert observer._find_anchor(log, len(old)) is None
     clock = Clock()
     probe = SequenceProbe([True, True])
@@ -957,7 +961,63 @@ def test_near_misses_never_anchor(line: str) -> None:
 
 def test_stale_baseline_anchor_is_not_a_current_anchor() -> None:
     """The exact installer line in the pre-start baseline does not anchor the new boot."""
-    old = current(*INSTALLER_LINES, "Starting Music Assistant")
-    log = old + current("Starting Music Assistant")
+    old = current(*INSTALLER_LINES, STARTED)
+    log = old + current(STARTED)
     assert observer._find_anchor(old, 0) is not None
     assert observer._find_anchor(log, len(old)) is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Step 1: Installing Music Assistant Server",
+        "Downloading music-assistant-server",
+        "Building music-assistant @ file:///x",
+        "Music Assistant Server docs: listening on port 8095 in pip",
+        "Starting Music Assistant Server",
+        "Starting Music Assistant",
+        "uvicorn listening on 0.0.0.0",
+    ],
+)
+def test_pre_runtime_lines_are_not_runtime_and_never_probe(line: str) -> None:
+    """Install-step and product-name lines after a valid anchor stay below `runtime`."""
+    old = current("old boot line")
+    log = old + current(ANCHOR, line)
+    clock = Clock()
+    probe = SequenceProbe([True])
+    result = observer.observe(
+        SequenceReader([log]),
+        probe,
+        baseline(old),
+        observer.CLEANUP_RESERVE + 10.0,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+    assert result.phase is not observer.BootstrapPhase.RUNTIME
+    assert result.phase is not observer.BootstrapPhase.API_READY
+    assert not result.api_ready
+    assert probe.deadlines == []
+
+
+def test_truncated_real_transcript_before_built_is_not_api_ready() -> None:
+    """Critic repro: a transcript cut off after `Step 1` must not probe or report ready."""
+    old = current("old boot line")
+    log = old + current(
+        ANCHOR,
+        "",
+        "Step 1: Installing Music Assistant Server",
+        f"Server repository: nredd/server@{SOURCE}",
+    )
+    clock = Clock()
+    probe = SequenceProbe([True])
+    result = observer.observe(
+        SequenceReader([log]),
+        probe,
+        baseline(old),
+        observer.CLEANUP_RESERVE + 10.0,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+    assert not result.api_ready
+    assert result.phase in (observer.BootstrapPhase.SOURCE_INSTALL, observer.BootstrapPhase.UNKNOWN)
+    assert probe.deadlines == []
