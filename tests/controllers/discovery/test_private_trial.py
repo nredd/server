@@ -93,7 +93,6 @@ async def test_trial_setup_clears_stale_admission_before_browser(
         "discovery", CONF_PRIVATE_TRIAL_TARGET, "aabbccddeeff@test"
     )
     await mass.config.async_save()
-    config = await mass.config.get_core_config("discovery")
     provider = MagicMock(
         instance_id="private-airplay",
         available=True,
@@ -120,6 +119,8 @@ async def test_trial_setup_clears_stale_admission_before_browser(
         patch.object(discovery, "_setup_mdns_browser", side_effect=setup_browser) as browser,
         patch.object(discovery_module, "AsyncServiceInfo") as service_info,
     ):
+        config = await mass.config.get_core_config("discovery")
+        assert config.get_value(CONF_PRIVATE_TRIAL_TARGET) == "aabbccddeeff@test"
         await discovery.setup(config)
 
     browser.assert_awaited_once()
