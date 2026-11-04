@@ -853,6 +853,8 @@ async def test_real_child_stdout_fifo_round_trip(tmp_path: Path) -> None:
             await rig.request(630)
             assert stream.player.volume_level == 61
     finally:
-        await stream.stop(force=True)
-        await rig.close()
+        try:
+            await stream.stop(force=True)
+        finally:
+            await rig.close()
     assert not pipe.exists()

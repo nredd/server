@@ -97,5 +97,7 @@ async def test_bind_revalidates_owner_after_delivery() -> None:
         assert backend not in backend._dependents
         assert not any("STREAM_VOLUME_APPLY" in command for command in rig.commands)
     finally:
-        release.set()
-        await rig.close()
+        try:
+            release.set()
+        finally:
+            await rig.close()

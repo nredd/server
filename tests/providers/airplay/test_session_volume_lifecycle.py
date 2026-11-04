@@ -370,8 +370,10 @@ async def test_warm_owner_change_detaches_binding_before_delayed_old_unbind(
             for command in rig.commands
         )
     finally:
-        release_old_unbind.set()
-        await rig.close()
+        try:
+            release_old_unbind.set()
+        finally:
+            await rig.close()
 
 
 async def test_rebinding_accepts_low_ordinal_after_generation_retirement() -> None:
