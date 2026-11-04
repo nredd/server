@@ -294,30 +294,41 @@ async def test_async_find_mdns_service_rescans_after_a_stale_request(
         "amplipi-stale._amplipi._tcp.local.": {},
     }
     attempts: list[str] = []
+    # The budget split is what is under test, so the stale request spends its share on a virtual
+    # loop clock instead of a real sleep: the verdict must not depend on host scheduling latency.
+    loop = asyncio.get_running_loop()
+    elapsed = 0.0
+    start = loop.time()
 
     class _Info:
         def __init__(self, _service_type: str, name: str) -> None:
             self.name = name
 
         async def async_request(self, _zeroconf: object, timeout: float) -> bool:
+            nonlocal elapsed
             attempts.append(self.name)
             if "stale" in self.name:
                 # the live instance announces itself midway through the stale request
                 cache["amplipi-live._amplipi._tcp.local."] = {}
                 for waiter in mass.discovery._mdns_waiters:
                     waiter.set()
-                await asyncio.sleep(timeout / 1000)
+                elapsed += timeout / 1000
+                await asyncio.sleep(0)
                 return False
             return True
 
-    with patch(
-        "music_assistant.controllers.discovery.controller.AsyncServiceInfo",
-        new=_Info,
+    with (
+        patch(
+            "music_assistant.controllers.discovery.controller.AsyncServiceInfo",
+            new=_Info,
+        ),
+        patch.object(loop, "time", lambda: start + elapsed),
     ):
         result = await mass.discovery.async_find_mdns_service("_amplipi._tcp.local.", timeout=0.2)
 
     assert result is not None
     assert result.name == "amplipi-live._amplipi._tcp.local."
+    assert attempts[0] == "amplipi-stale._amplipi._tcp.local."
 
 
 async def test_async_find_mdns_service_preserves_at_sign_in_name(mass: MusicAssistant) -> None:
