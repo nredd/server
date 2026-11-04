@@ -822,7 +822,12 @@ class SyncGroupPlayer(Player):
     async def _form_syncgroup(
         self, *, new_content: bool = False, explicit_power: bool = False
     ) -> tuple[Player, object] | None:
-        """Form syncgroup by syncing all (possible) members."""
+        """
+        Form syncgroup by syncing all (possible) members.
+
+        :param new_content: The caller is preparing new playback content.
+        :param explicit_power: The group was explicitly powered on.
+        """
         # any in-flight grace or debounced re-form timer is moot now —
         # we're (re)forming the group
         self._cancel_idle_grace_timer()

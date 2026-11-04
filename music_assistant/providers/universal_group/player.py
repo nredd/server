@@ -460,6 +460,8 @@ class UniversalGroupPlayer(Player):
         that are currently captured by another group / sync session, and
         leaves the group ready for playback. Idempotent: safe to call on an
         already-prepared group.
+
+        :param automatic: Member power-on is a side effect of playback or grouping.
         """
         # rebuild the effective member list from the configured static set
         self._attr_group_members = []
