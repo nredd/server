@@ -191,6 +191,28 @@ async def test_cold_bridge_retries_checked_initial_volume_after_publishing_owner
         await rig.close()
 
 
+async def test_later_bridge_owner_retries_all_checked_initial_volumes() -> None:
+    """The final group owner retries members whose first commit lacked a complete group."""
+    fixture = await make_bridge_rig(2)
+    rig = fixture.rig
+    provider = cast("AirPlayProvider", rig.streams[0].prov)
+    manager = provider.bridge_manager
+    _, second = fixture.bridges
+    try:
+        second._airplay_stream = None
+        second.airplay_player.stream = None
+        rig.commands.clear()
+        await manager.retry_initial_checked_volumes()
+        assert not rig.commands
+
+        second._airplay_stream = rig.streams[1]
+        second.airplay_player.stream = rig.streams[1]
+        await manager.retry_initial_checked_volumes()
+        assert sum("ACTION=STREAM_VOLUME_APPLY" in command for command in rig.commands) == 2
+    finally:
+        await rig.close()
+
+
 @pytest.mark.parametrize(
     "change", ["missing", "mixed", "replaced", "membership", "native", "cycle"]
 )

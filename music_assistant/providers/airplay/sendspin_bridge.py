@@ -899,8 +899,9 @@ class SendspinAirPlayBridge:
                 return False
             self._airplay_stream = stream
             self.airplay_player.stream = stream
-            if stream.session_volume_requested is True and stream.session_volume.supported is True:
-                await stream._send_current_volume()
+            manager = self.provider.bridge_manager
+            if isinstance(manager, SendspinBridgeManager):
+                await manager.retry_initial_checked_volumes()
             if await self._anchor_stream(stream, warm=False):
                 return True
             # A superseded cold stream is this task's to tear down: it was
@@ -1824,6 +1825,17 @@ class SendspinBridgeManager(SendspinBridgeManagerBase[SendspinAirPlayBridge]):
             if (decision := sibling.active_shared_ptp) is not None:
                 return decision
         return None
+
+    async def retry_initial_checked_volumes(self) -> None:
+        """Retry initial checked commits after every bridge stream ownership publication."""
+        for bridge in self._bridges.values():
+            stream = bridge._airplay_stream
+            if (
+                stream
+                and stream.session_volume_requested is True
+                and stream.session_volume.supported is True
+            ):
+                await stream._send_current_volume()
 
     def get_volume_command_context(self, airplay_player_id: str) -> BridgeVolumeContext | None:
         """Resolve only an exact current bridge source; an unresolved owner must not fall back."""
