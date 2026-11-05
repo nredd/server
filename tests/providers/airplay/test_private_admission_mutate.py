@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Awaitable
+from collections.abc import AsyncGenerator, Awaitable
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -319,10 +320,11 @@ async def test_flush_failure_and_cancellation_do_not_roll_back(
     assert cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == ""
 
 
-async def test_post_flush_real_core_save_replaces_both_target_references(
-    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A generic core save detaches both old references while admission waits to flush."""
+@asynccontextmanager
+async def _parked_admission(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, mode: str, real_flush: bool
+) -> AsyncGenerator[asyncio.Task[Any]]:
+    """Pause admission during its post-mutation flush until the caller exits."""
     cfg = admission.mass.config
     entered, release = asyncio.Event(), asyncio.Event()
     real_save = cfg.async_save
@@ -330,12 +332,24 @@ async def test_post_flush_real_core_save_replaces_both_target_references(
     async def parked_save() -> None:
         entered.set()
         await release.wait()
-        await real_save()
+        if real_flush:
+            await real_save()
 
     monkeypatch.setattr(cfg, "async_save", parked_save)
-    task = asyncio.create_task(admission.private_trial_admission_mutate(request()))
+    task = asyncio.create_task(admission.private_trial_admission_mutate(request(mode)))
     try:
         await asyncio.wait_for(entered.wait(), 5)
+        yield task
+    finally:
+        release.set()
+
+
+async def test_post_flush_real_core_save_replaces_both_target_references(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generic core save detaches both old references while admission waits to flush."""
+    cfg = admission.mass.config
+    async with _parked_admission(admission, monkeypatch, "admit", real_flush=True) as task:
         old_values = cfg.get("core/discovery/values")
         old_entry = admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET]
         await cfg.save_core_config("discovery", {CONF_PRIVATE_TRIAL_TARGET: "ffffffffffff@Other"})
@@ -348,8 +362,6 @@ async def test_post_flush_real_core_save_replaces_both_target_references(
             admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value
             == "ffffffffffff@Other"
         )
-    finally:
-        release.set()
     result = await task
     assert result["status"] == "applied"
     assert result["memory"] == "applied"
@@ -379,16 +391,7 @@ async def test_post_flush_current_state_is_checked(
 ) -> None:
     """Detached or malformed current targets make persistence unproven, not rollback."""
     cfg = admission.mass.config
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def parked_save() -> None:
-        entered.set()
-        await release.wait()
-
-    monkeypatch.setattr(cfg, "async_save", parked_save)
-    task = asyncio.create_task(admission.private_trial_admission_mutate(request()))
-    try:
-        await asyncio.wait_for(entered.wait(), 5)
+    async with _parked_admission(admission, monkeypatch, "admit", real_flush=False) as task:
         old_values = cfg.get("core/discovery/values")
         old_entry = admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET]
         if change == "raw_only":
@@ -422,8 +425,6 @@ async def test_post_flush_current_state_is_checked(
             admission.mass.discovery.config = loaded
         assert old_values[CONF_PRIVATE_TRIAL_TARGET] == TARGET
         assert old_entry.value == TARGET
-    finally:
-        release.set()
     result = await task
     assert result["status"] == "applied"
     assert result["memory"] == "applied"
@@ -439,23 +440,12 @@ async def test_post_flush_clear_and_admit_use_current_values(
     cfg = admission.mass.config
     if mode == "clear":
         assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def parked_save() -> None:
-        entered.set()
-        await release.wait()
-
-    monkeypatch.setattr(cfg, "async_save", parked_save)
-    task = asyncio.create_task(admission.private_trial_admission_mutate(request(mode)))
-    try:
-        await asyncio.wait_for(entered.wait(), 5)
+    async with _parked_admission(admission, monkeypatch, mode, real_flush=False) as task:
         cfg._data["core"] = deepcopy(cfg._data["core"])
         admission.mass.discovery.config = deepcopy(admission.mass.discovery.config)
         if not matches:
             cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] = "other"
             admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value = "other"
-    finally:
-        release.set()
     result = await task
     assert result["memory"] == "applied"
     assert result["persistence"] == ("completed" if matches else "unproven")
