@@ -489,6 +489,7 @@ def _constants_on_disk(
     ("old", "new"),
     [
         (b'STATE_MISMATCH = "state_mismatch"', b'STATE_MISMATCH = "state_mismatcX"'),
+        (b'TARGET_MISMATCH = "target_mismatch"', b'TARGET_MISMATCH = "target_mismatcX"'),
         (b'    TRUE = "true"\n', b'    TRUE = "yes"\n'),
         (b'    NEXT_LOAD = "next_load"\n', b'    NEXT_LOAD = "next_load"\n    EXTRA = "extra"\n'),
         (b'    FALSE = "false"\n', b'    FALSE = "false"\n    OTHER = "false"\n'),

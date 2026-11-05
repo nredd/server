@@ -147,6 +147,13 @@ async def test_admit_and_clear_preserve_raw_neighbours(admission: AirPlayProvide
         {"mode": "admit", "player_id": PLAYER, "target": TARGET, "extra": 1},
         {"mode": "admit", "player_id": PLAYER, "target": "0123456789ab@bad/name"},
         {"mode": "admit", "player_id": "apabcdefabcdef", "target": TARGET},
+        {"mode": "admit", "player_id": "apABCDEF123456", "target": TARGET},
+        {"mode": "admit", "player_id": "ap123", "target": TARGET},
+        {"mode": "admit", "player_id": "ap0123456789ab/values", "target": TARGET},
+        {"mode": "admit", "player_id": PLAYER, "target": "0123456789AB@TV"},
+        {"mode": "admit", "player_id": PLAYER, "target": "0123456789ab@"},
+        {"mode": "admit", "player_id": PLAYER, "target": "0123456789ab@ TV "},
+        {"mode": "admit", "player_id": PLAYER, "target": "0123456789ab"},
         {"mode": True, "player_id": PLAYER, "target": TARGET},
     ],
 )
@@ -173,6 +180,7 @@ async def test_invalid_refuses_without_flush(
         "credential",
         "flag",
         "player",
+        "stream",
         "raw_target",
         "loaded_target",
     ],
@@ -194,8 +202,10 @@ async def test_unsafe_state_refuses(
         )
     elif state == "flag":
         admission.config.values[CONF_PRIVATE_NATIVE_VOLUME_CAPTURE].value = True
-    elif state == "player":
-        admission.__dict__["get_players"].return_value = [SimpleNamespace(stream=None)]
+    elif state in ("player", "stream"):
+        admission.__dict__["get_players"].return_value = [
+            SimpleNamespace(stream=object() if state == "stream" else None)
+        ]
     elif state == "raw_target":
         del cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET]
     else:
