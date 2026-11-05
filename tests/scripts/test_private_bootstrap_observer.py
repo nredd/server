@@ -482,7 +482,7 @@ class BlockingProbe:
         self.jump = jump
         self.calls = 0
 
-    def ready(self, _deadline: float) -> bool:
+    def ready(self, deadline: float) -> bool:
         """Block, then report a ready API."""
         self.calls += 1
         self.clock.value += self.jump
@@ -585,7 +585,7 @@ def test_baseline_survives_a_full_sliding_tail(monkeypatch: pytest.MonkeyPatch) 
     reader = observer.SupervisorLogReader(token, base.cursor)
     result = observer.observe(
         reader,
-        type("P", (), {"ready": lambda _s, _d: True})(),
+        SequenceProbe([True]),
         base,
         time.monotonic() + 1000,
     )
@@ -937,7 +937,8 @@ NEAR_MISSES = [
 ]
 
 
-RUNTIME_SHA = "208e9c069163a1c9e1a4ed6da16015d69d972d34"
+RUNTIME_SHA = "3ff62b9cf15a93a49aeec9789a871d1112faa15f"
+REPLACED_RUNTIME_SHA = "208e9c069163a1c9e1a4ed6da16015d69d972d34"
 SUPERSEDED_RUNTIME_SHA = "4799bd57c86dff1bb39a7333c2a5e9bf91f8812b"
 PRIOR_RUNTIME_SHA = "dae8ae9484cd19d847bf495bb95a85e6d1afc2c2"
 LAST_RUNTIME_SHA = "ad73c02283350952f535e328f7c001c8b209e9fa"
@@ -965,6 +966,7 @@ def test_real_runtime_sha_anchors_and_previous_sha_does_not(template: str) -> No
     good = old + current(template.format(RUNTIME_SHA))
     assert observer._find_anchor(good, len(old)) == len(old)
     for stale_sha in (
+        REPLACED_RUNTIME_SHA,
         SUPERSEDED_RUNTIME_SHA,
         PRIOR_RUNTIME_SHA,
         LAST_RUNTIME_SHA,

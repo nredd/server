@@ -84,8 +84,8 @@ next boot (an `inspect`, or the stored file), not an assumption.
 Registration joins the other private routes: a collision on any name releases only this
 provider's own claims, retains the incumbent and fails loading. The selected-code evidence
 binds this handler, its guards, helpers, route scope and constants to the loaded code; the
-evidence stays at the existing eight source hashes. A future client must read that evidence
-before writing.
+evidence now contains ten source hashes, not whole-process proof. A future client must read that
+evidence before writing.
 
 ## Discovery identity
 
@@ -604,12 +604,13 @@ are refused). The file holds a length, a SHA-256 prefix identity and a journal c
 contains machine and boot identifiers), never log content, so it is never printed or passed on
 argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
-`nredd/server@208e9c069163a1c9e1a4ed6da16015d69d972d34` installer anchor after it.
+`nredd/server@3ff62b9cf15a93a49aeec9789a871d1112faa15f` installer anchor after it.
 
-The observer's runtime source pin is the merge `208e9c069163a1c9e1a4ed6da16015d69d972d34` (PR #63),
-whose tree equals reviewed source `b34cfd128ca99ea6930334fe319adcd1ddb41142` (tree
-`4491fdb942ab70f4334c5ec8e066e68d44f15df9`). This pin does not authorize private flags invocation.
-Previous pins `4799bd57c86dff1bb39a7333c2a5e9bf91f8812b`,
+The observer's runtime source pin is the merge `3ff62b9cf15a93a49aeec9789a871d1112faa15f` (PR #67),
+whose tree equals reviewed source `7332a7f76aac78825d76e114ad37209234984efa` (tree
+`5c8a42820317e6c4e2c3265eb9be54f451cc5983`). This pin does not authorize private flags invocation
+or real receiver admission. Previous pins `208e9c069163a1c9e1a4ed6da16015d69d972d34`,
+`4799bd57c86dff1bb39a7333c2a5e9bf91f8812b`,
 `dae8ae9484cd19d847bf495bb95a85e6d1afc2c2`,
 `ad73c02283350952f535e328f7c001c8b209e9fa`, `a6382b99fad1603176fe89daf0a233406e77f5ad`,
 and `0f7b543127f71c5639d55d4e0e34168ba92d0c33` are observer history only.
