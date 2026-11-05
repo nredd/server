@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -18,8 +19,10 @@ from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.controllers.config import ConfigController
 from music_assistant.helpers.api import APICommandHandler, parse_arguments
+from music_assistant.helpers.json import json_dumps
 from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
 from music_assistant.mass import MusicAssistant
+from music_assistant.providers.airplay import constants
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay.constants import (
     CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
@@ -735,3 +738,22 @@ async def test_route_registration_is_system_manage_scoped(harness: Harness) -> N
     assert unregister is not None
     unregister()
     assert "airplay/private_flags" not in registry.command_handlers
+
+
+@pytest.mark.parametrize(
+    "enum_class",
+    [
+        constants.PrivateFlagState,
+        constants.PrivateFlagMode,
+        constants.PrivateFlagStatus,
+        constants.PrivateFlagReason,
+        constants.PrivateFlagMemory,
+        constants.PrivateFlagPersistence,
+        constants.PrivateFlagEffect,
+    ],
+)
+def test_enum_members_serialize_to_their_literal(enum_class: type[enum.StrEnum]) -> None:
+    """The project serializer emits each closed enum member as its exact wire literal."""
+    for member in enum_class:
+        assert json_dumps({"value": member}) == json_dumps({"value": member.value})
+        assert json.loads(json_dumps({"value": member}))["value"] == member.value

@@ -603,11 +603,12 @@ Previous pins `dae8ae9484cd19d847bf495bb95a85e6d1afc2c2`,
 `ad73c02283350952f535e328f7c001c8b209e9fa`, `a6382b99fad1603176fe89daf0a233406e77f5ad`,
 and `0f7b543127f71c5639d55d4e0e34168ba92d0c33` are observer history only.
 The installer anchor identifies the requested source, not proof of loaded code. The separate
-`server_code_evidence` guard checks selected loaded code, not the entire process. That includes the closed `StrEnum` flag states, modes, statuses and reasons in `constants.py`: each
-source declaration must be plain literal members of one `StrEnum` and match the live class members and
-shape, else the evidence is `unverified`. The observer itself
+`server_code_evidence` guard checks selected loaded code, not the entire process. The observer itself
 is tooling and may be newer than the runtime source it pins. The separate CLI pins (`429c5670`
 source, `cd7d36b` CI label, `fc77ceec` ELF) remain unchanged.
+The closed `StrEnum` flag states, modes, statuses and reasons in `constants.py` are covered too: each
+source declaration must be plain literal members of one `StrEnum` and match the live class members and
+shape, else the evidence is `unverified`.
 The pin is a code constant with no argument, so a later merge deliberately differs from it until a new
 reviewed runtime is chosen.
 

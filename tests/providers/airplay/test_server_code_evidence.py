@@ -349,3 +349,22 @@ def test_live_enum_method_injection_is_unverified() -> None:
     finally:
         type.__setattr__(cls, "__str__", enum.StrEnum.__str__)
     assert evidence.server_code_evidence(provider)["status"] == "verified"
+
+
+@pytest.mark.parametrize("attribute", ["_value2member_map_", "_member_names_", "TRUE"])
+def test_live_enum_lookup_corruption_is_unverified(attribute: str) -> None:
+    """Corrupting the lookup tables or a member attribute of a live enum is rejected."""
+    cls = constants.PrivateFlagState
+    original = vars(cls)[attribute]
+    if attribute == "_value2member_map_":
+        replacement: object = {**original, "true": cls.FALSE}
+    elif attribute == "_member_names_":
+        replacement = list(reversed(original))
+    else:
+        replacement = cls.FALSE
+    type.__setattr__(cls, attribute, replacement)
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        type.__setattr__(cls, attribute, original)
+    assert evidence.server_code_evidence(provider)["status"] == "verified"

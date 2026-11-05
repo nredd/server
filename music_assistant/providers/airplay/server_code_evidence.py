@@ -34,9 +34,7 @@ _PRIVATE_FLAG_ENUMS = (
     "PrivateFlagPersistence",
     "PrivateFlagEffect",
 )
-# Stdlib factory building the pristine shape (typed Any, as type checkers want literals).
 _ENUM_FACTORY: Any = enum.StrEnum
-# Class attributes an enum gets from the stdlib and that must stay the stdlib's own objects.
 _ENUM_SHARED_ATTRIBUTES = (
     "__new__",
     "__str__",
@@ -344,8 +342,7 @@ def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name
     """
     Reject a live string enum that differs from its simple literal source declaration.
 
-    Only `class Name(StrEnum)` bodies of unique `NAME = "literal"` members are supported,
-    so no source is executed and aliases, methods and other bases are refused.
+    Only `class Name(StrEnum)` bodies of unique `NAME = "literal"` members are supported.
 
     :param tree: Parsed source of the module declaring the enum.
     :param module: The loaded module declaring the enum.
@@ -404,6 +401,7 @@ def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name
         or len({value for _, value in declared}) != len(declared)
     ):
         raise ValueError("Unsupported enum members")
+    # The source is only parsed, never run: a pristine class is built from the declared literals.
     live: Any = vars(module)[name]
     if vars(consumer)[name] is not live:
         raise ValueError("Unexpected enum binding")
@@ -419,5 +417,9 @@ def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name
         or any(type(member) is not live for _, member in members)
         or set(vars(live)) - {"__firstlineno__", "__static_attributes__"} != set(vars(reference))
         or any(vars(live)[key] is not vars(reference)[key] for key in _ENUM_SHARED_ATTRIBUTES)
+        or list(vars(live)["_member_names_"]) != [key for key, _ in declared]
+        or any(vars(live)[key] is not member for key, member in members)
+        or {value: id(vars(live)[key]) for key, value in declared}
+        != {value: id(member) for value, member in vars(live)["_value2member_map_"].items()}
     ):
         raise ValueError("Live enum differs from source")
