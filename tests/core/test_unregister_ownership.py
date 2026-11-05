@@ -1,4 +1,9 @@
-"""Tests for ownership-safe player removal."""
+"""
+Tests for ownership-safe player removal.
+
+References:
+- https://github.com/nredd/server/issues/66
+"""
 
 from __future__ import annotations
 

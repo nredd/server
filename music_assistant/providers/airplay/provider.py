@@ -734,7 +734,9 @@ class AirPlayProvider(PlayerProvider):
             msg = "Private native-volume capture is unavailable outside the trial target"
             raise RuntimeError(msg)
         provenance = await asyncio.to_thread(installer_provenance)
-        code_evidence = await asyncio.to_thread(server_code_evidence, sys.modules[__name__])
+        code_evidence = await asyncio.to_thread(
+            server_code_evidence, sys.modules[__name__], self.mass.players
+        )
         daemon, ptp_event = self._ptp_daemon, self._ptp_daemon_ready
         streams = [
             (
@@ -1111,11 +1113,8 @@ class AirPlayProvider(PlayerProvider):
                 RAOP_DISCOVERY_TYPE, display_name, timeout=10.0
             )
 
-        if airplay_discovery_info:
-            model_discovery_info = airplay_discovery_info
-        elif raop_discovery_info:
-            model_discovery_info = raop_discovery_info
-        else:
+        model_discovery_info = airplay_discovery_info or raop_discovery_info
+        if not model_discovery_info:
             return  # should not happen, but guard just in case
         manufacturer, model = get_model_info(model_discovery_info)
 
@@ -1216,6 +1215,9 @@ class AirPlayProvider(PlayerProvider):
 
         # Set up Sendspin bridge for protocol linking (if Sendspin provider is available)
         await self._bridge_manager.evaluate_bridge(player)
+        if self.unloading or not self._admits_private_player(player_id):
+            await self.mass.players.unregister(player_id, expected_player=player)
+            return
 
         # Track control players (Apple TVs) for dashboard eligibility
         if isinstance(player, AirPlayControlPlayer):

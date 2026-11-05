@@ -17,10 +17,13 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.auth import Scope
 
 from music_assistant import constants as core_constants
+from music_assistant import mass as mass_module
+from music_assistant.controllers import players as players_package
+from music_assistant.controllers.players import controller as players_controller
 from music_assistant.helpers import private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 
-from . import constants, control_player, helpers, player, trial_binary
+from . import constants, control_player, helpers, player, sendspin_bridge, trial_binary
 
 if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
@@ -47,11 +50,14 @@ _ENUM_SHARED_ATTRIBUTES = (
 )
 
 
-def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
+def server_code_evidence(
+    provider: ModuleType, controller: players_controller.PlayerController
+) -> dict[str, SerializableType]:
     """
     Return source hashes only when selected live code and bindings agree.
 
     :param provider: The loaded AirPlay provider module.
+    :param controller: The player controller used by the provider.
     :return: A verified evidence payload or a secret-free unverified result.
     """
     failure: dict[str, SerializableType] = {"schema_version": 1, "status": "unverified"}
@@ -65,6 +71,8 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             "trial_binary": trial_binary,
             "private_trial": private_trial,
             "server_code_evidence": sys.modules[__name__],
+            "players_controller": players_controller,
+            "sendspin_bridge": sendspin_bridge,
         }
         hashes: dict[str, SerializableType] = {}
         codes: dict[str, list[CodeType]] = {}
@@ -90,6 +98,20 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             "_register_private_capture_api",
         ):
             _check_function(codes["provider"], trees["provider"], provider.AirPlayProvider, name)
+        _check_function(
+            codes["players_controller"],
+            trees["players_controller"],
+            players_controller.PlayerController,
+            "unregister",
+            defaults=(False, None, None),
+        )
+        _check_function(
+            codes["sendspin_bridge"],
+            trees["sendspin_bridge"],
+            sendspin_bridge.SendspinBridgeManager,
+            "_lifecycle_allows_bridge",
+        )
+        _check_runtime_bindings(controller)
         for name in (
             "_private_flag_states",
             "_private_flag_map",
@@ -148,7 +170,10 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         _check_function(
             codes["trial_binary"], trees["trial_binary"], trial_binary, "is_trial_target"
         )
-        if provider.AirPlayControlPlayer is not control_player.AirPlayControlPlayer:
+        if (
+            provider.AirPlayControlPlayer is not control_player.AirPlayControlPlayer
+            or provider.SendspinBridgeManager is not sendspin_bridge.SendspinBridgeManager
+        ):
             return failure
         if (
             vars(control_player)["AirPlayPlayer"] is not player.AirPlayPlayer
@@ -160,6 +185,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         if (
             provider.trial_binary is not trial_binary
             or vars(control_player)["trial_binary"] is not trial_binary
+            or vars(player)["trial_binary"] is not trial_binary
         ):
             return failure
         if vars(trial_binary)["_is_trial_target"] is not private_trial.is_trial_target:
@@ -262,6 +288,35 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         return failure
 
 
+def _check_runtime_bindings(controller: object) -> None:
+    """Reject stale consumers and noncanonical bindings of selected race guards."""
+    controller_class = players_controller.PlayerController
+    unregister = inspect.getattr_static(controller_class, "unregister")
+    if players_package.PlayerController is not controller_class:
+        raise ValueError("Stale players package alias")
+    if vars(mass_module)["PlayerController"] is not controller_class:
+        raise ValueError("Stale mass controller alias")
+    if type(controller) is not controller_class:
+        raise ValueError("Unexpected player controller instance")
+    if inspect.getattr_static(controller, "unregister") is not unregister:
+        raise ValueError("Shadowed unregister")
+    if unregister.__globals__ is not vars(players_controller):
+        raise ValueError("Unexpected unregister globals")
+    bridge_class = sendspin_bridge.SendspinBridgeManager
+    lifecycle = inspect.getattr_static(bridge_class, "_lifecycle_allows_bridge")
+    if lifecycle.__globals__ is not vars(sendspin_bridge):
+        raise ValueError("Unexpected bridge globals")
+    if vars(sendspin_bridge)["cast"] is not typing.cast:
+        raise ValueError("Unexpected bridge cast")
+    if (
+        lifecycle.__code__.co_freevars != ("__class__",)
+        or lifecycle.__closure__ is None
+        or len(lifecycle.__closure__) != 1
+        or lifecycle.__closure__[0].cell_contents is not bridge_class
+    ):
+        raise ValueError("Unexpected bridge closure")
+
+
 def _normalize(code: CodeType) -> CodeType:
     """Return a code object suitable for same-interpreter comparison."""
     return code.replace(
@@ -283,7 +338,12 @@ def _codes(code: CodeType) -> list[CodeType]:
 
 
 def _check_function(
-    compiled: list[CodeType], tree: ast.Module, owner: object, name: str, prop: bool = False
+    compiled: list[CodeType],
+    tree: ast.Module,
+    owner: object,
+    name: str,
+    prop: bool = False,
+    defaults: tuple[object, ...] = (),
 ) -> None:
     """
     Reject a selected callable that does not match its source declaration.
@@ -293,6 +353,7 @@ def _check_function(
     :param owner: Module or class containing the callable.
     :param name: Expected callable name.
     :param prop: Whether the callable must be a property getter.
+    :param defaults: Expected positional defaults, if any.
     :raises ValueError: If the callable differs from its source declaration.
     """
     class_name = owner.__name__ if isinstance(owner, type) else None
@@ -312,7 +373,9 @@ def _check_function(
     if len(declarations) != 1:
         raise ValueError("Unexpected declaration")
     declaration = declarations[0]
-    if declaration.args.defaults or any(item is not None for item in declaration.args.kw_defaults):
+    if tuple(ast.literal_eval(item) for item in declaration.args.defaults) != defaults or any(
+        item is not None for item in declaration.args.kw_defaults
+    ):
         raise ValueError("Unexpected source defaults")
     decorators = declaration.decorator_list
     if (not prop and decorators) or (
@@ -331,7 +394,15 @@ def _check_function(
         value = value.fget
     if type(value) is not FunctionType or hasattr(value, "__wrapped__"):
         raise ValueError("Unexpected callable")
-    if value.__defaults__ is not None or value.__kwdefaults__ is not None:
+    actual_defaults = value.__defaults__ or ()
+    if (
+        len(actual_defaults) != len(defaults)
+        or any(
+            actual is not expected
+            for actual, expected in zip(actual_defaults, defaults, strict=True)
+        )
+        or value.__kwdefaults__ is not None
+    ):
         raise ValueError("Unexpected defaults")
     qualname = f"{class_name}.{name}" if class_name else name
     if value.__qualname__ != qualname:

@@ -1063,6 +1063,8 @@ class AirPlayPlayer(Player):
         prov = cast("AirPlayProvider", self.provider)
         if prov.unloading or not prov._admits_private_player(self.player_id):
             return
+        if trial_binary.is_trial_target() and not self.initialized.is_set():
+            return
         await prov.bridge_manager.evaluate_bridge(self)
 
     async def on_unload(self) -> None:

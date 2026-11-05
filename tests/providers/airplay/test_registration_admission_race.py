@@ -1,4 +1,9 @@
-"""Regression tests for admission changes during player registration."""
+"""
+Regression tests for admission changes during player registration.
+
+References:
+- https://github.com/nredd/server/issues/66
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ from music_assistant.helpers.private_trial import parse_trial_target
 from music_assistant.mass import MusicAssistant
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay.provider import AirPlayProvider
+from music_assistant.providers.airplay.sendspin_bridge import SendspinBridgeManager
 
 PLAYER_ID = "ap0123456789ab"
 TARGET = "0123456789ab@Test Receiver"
@@ -103,6 +109,76 @@ async def test_admitted_player_is_constructed_and_registered(
     register.assert_awaited_once()
     assert isinstance(provider._bridge_manager, MagicMock)
     provider._bridge_manager.evaluate_bridge.assert_awaited_once()
+
+
+@pytest.mark.parametrize("change", ["clear", "unload", "none"])
+async def test_bridge_lock_rechecks_admission(
+    setup_context: tuple[AirPlayProvider, MagicMock, list[str], MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Bridge setup rechecks admission after waiting for the manager lock."""
+    provider, _info, target, _create = setup_context
+    mass = provider.mass
+    monkeypatch.setattr(mass, "subscribe", MagicMock())
+    monkeypatch.setattr(mass, "get_provider", MagicMock(return_value=MagicMock()))
+    manager = SendspinBridgeManager(provider)
+    player = MagicMock(player_id=PLAYER_ID)
+    assert isinstance(mass.players, MagicMock)
+    mass.players.get_player.return_value = player
+    monkeypatch.setattr(manager, "_should_have_bridge", MagicMock(return_value=True))
+    bridge = MagicMock(is_registered=True, start=AsyncMock())
+    create = MagicMock(return_value=bridge)
+    monkeypatch.setattr(manager, "_create_bridge", create)
+    await manager._lock.acquire()
+    task = asyncio.create_task(manager.setup_bridge(player))
+    await asyncio.sleep(0)
+    if change == "clear":
+        target[0] = ""
+    elif change == "unload":
+        provider.unloading = True
+    manager._lock.release()
+    await task
+    assert create.call_count == (1 if change == "none" else 0)
+
+
+@pytest.mark.parametrize("change", ["clear", "unload"])
+async def test_change_during_bridge_evaluation_cleans_up(
+    setup_context: tuple[AirPlayProvider, MagicMock, list[str], MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Admission changes during bridge evaluation remove only the constructed player."""
+    provider, info, target, _create = setup_context
+    monkeypatch.setattr(
+        provider.mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None)
+    )
+    players = provider.mass.players
+    assert isinstance(players, MagicMock)
+    players.register = AsyncMock()
+    players.unregister = AsyncMock()
+    started, proceed = asyncio.Event(), asyncio.Event()
+
+    async def evaluate(_player: object) -> None:
+        started.set()
+        await proceed.wait()
+
+    monkeypatch.setattr(
+        provider._bridge_manager, "evaluate_bridge", AsyncMock(side_effect=evaluate)
+    )
+    task = asyncio.create_task(provider._setup_player(PLAYER_ID, "Test Receiver", info))
+    await asyncio.wait_for(started.wait(), 2)
+    if change == "clear":
+        target[0] = ""
+    else:
+        provider.unloading = True
+    proceed.set()
+    await task
+    assert players.register.await_args is not None
+    player = players.register.await_args.args[0]
+    players.unregister.assert_awaited_once_with(PLAYER_ID, expected_player=player)
+    assert isinstance(provider.dashboards, MagicMock)
+    provider.dashboards.setup_player.assert_not_called()
 
 
 @pytest.mark.parametrize("change", ["clear", "unload"])

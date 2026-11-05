@@ -1929,6 +1929,15 @@ class SendspinBridgeManager(SendspinBridgeManagerBase[SendspinAirPlayBridge]):
             sendspin_server,
         )
 
+    def _lifecycle_allows_bridge(self, player: Player) -> bool:
+        """Reject a bridge when the provider is unloading or admission changed."""
+        provider = cast("AirPlayProvider", self.provider)
+        return (
+            not provider.unloading
+            and provider._admits_private_player(player.player_id)
+            and super()._lifecycle_allows_bridge(player)
+        )
+
     def _should_have_bridge(self, player: Player) -> bool:
         """Return whether an AirPlay player should have a Sendspin bridge."""
         return get_bridge_client_id(cast("AirPlayPlayer", player)) is not None
