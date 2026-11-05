@@ -81,6 +81,7 @@ class TrialAsyncProcess(AsyncProcess):
         name: str | None = None,
         env: dict[str, str] | None = None,
         pass_fds: tuple[int, ...] = (),
+        unset_env: frozenset[str] = frozenset(),
     ) -> None:
         """Initialize a process with one parent-owned executable descriptor."""
         self._asset_fd: int | None = asset_fd
@@ -105,6 +106,8 @@ class TrialAsyncProcess(AsyncProcess):
             env=env,
             pass_fds=(*pass_fds, asset_fd),
         )
+        for key in unset_env:
+            self._env.pop(key, None)
 
     async def start(self) -> None:
         """Start the passed descriptor and consume its required first stdout line."""
@@ -502,9 +505,12 @@ async def create_private_process(
     name: str | None = None,
     env: dict[str, str] | None = None,
     pass_fds: tuple[int, ...] = (),
+    unset_env: frozenset[str] = frozenset(),
 ) -> AsyncProcess:
     """Create the sole private CLI launch path without hashing mutable media on the event loop."""
     if not is_trial_target():
+        if unset_env:
+            raise TrialBinaryError("Private environment exclusions require the trial target")
         return AsyncProcess(args, stdin, stdout, stderr, name, env, pass_fds)
     asset_fd = await open_in_thread(
         _open_private_asset_fd, str(TRIAL_ROOT / EXPECTED_SHA / ASSET_NAME), os.O_RDONLY
@@ -520,6 +526,7 @@ async def create_private_process(
             name=name,
             env=env,
             pass_fds=pass_fds,
+            unset_env=unset_env,
         )
     except BaseException:
         os.close(asset_fd)

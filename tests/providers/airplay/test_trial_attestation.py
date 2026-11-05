@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import textwrap
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,13 @@ import pytest
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import descriptor_path
 from music_assistant.providers.airplay import trial_binary as trial
+from music_assistant.providers.airplay.constants import (
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_EXPERIMENTAL_SESSION_VOLUME,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    CONF_PRIVATE_NOW_PLAYING_DATASTREAM,
+    StreamingProtocol,
+)
 from music_assistant.providers.airplay.stream import AirPlayStream
 from tests.providers.airplay.test_stream import _make_player
 from tests.providers.airplay.test_stream_session import _make_session
@@ -58,6 +66,7 @@ def install_host_spawn(
     spawned: asyncio.Event | None = None,
     *,
     capture_summary: str = "",
+    expected_environment: dict[str, str | None] | None = None,
 ) -> list[asyncio.subprocess.Process]:
     """Replace only foreign execution with a real bounded host child and inherited FD."""
     actual_spawn = asyncio.create_subprocess_exec
@@ -73,7 +82,16 @@ def install_host_spawn(
         if mode == "wrong":
             payload["nonce"] = "0" * 32
         line = "[ATTEST] " + json.dumps(payload) + "\n"
-        body = f"import os,sys,time\nassert os.pread({fd},4,0)==b'\\x7fELF'\n"
+        body = textwrap.dedent(f"""\
+            import os,sys,time
+            assert os.pread({fd},4,0)==b'\\x7fELF'
+        """)
+        if expected_environment is not None:
+            body += textwrap.dedent(f"""\
+                expected = {expected_environment!r}
+                assert all(os.getenv(key) == value for key, value in expected.items())
+                assert 'SUPERVISOR_TOKEN' not in os.environ
+            """)
         if mode == "delay":
             body += "os.write(2,b'connected\\n')\nsys.stdin.buffer.read(1)\n"
         if mode != "silent":
@@ -150,6 +168,101 @@ async def test_live_ack_precedes_status_and_readiness(
     finally:
         await proc.kill()
     assert children
+    assert all(child.returncode is not None for child in children)
+
+
+@pytest.mark.parametrize(
+    (
+        "private",
+        "remote",
+        "capture",
+        "session_volume",
+        "inherited_type130",
+        "expected_now_playing",
+        "expected_type130",
+    ),
+    [
+        (True, True, False, False, "1", "1", None),
+        (True, True, True, False, "1", "0", None),
+        (True, True, False, True, "1", "0", None),
+        (True, True, False, False, "0", "0", "0"),
+        (False, True, False, False, "1", "0", "1"),
+    ],
+)
+async def test_stream_environment_reaches_a_real_child(
+    fixed_asset: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    private: bool,
+    remote: bool,
+    capture: bool,
+    session_volume: bool,
+    inherited_type130: str,
+    expected_now_playing: str,
+    expected_type130: str | None,
+) -> None:
+    """The composed stream environment reaches a harmless child after sanitization."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    player.protocol = StreamingProtocol.AIRPLAY2
+    player.protocol_override = None
+    values = {
+        CONF_EXPERIMENTAL_HOMEPOD_REMOTE: remote,
+        CONF_EXPERIMENTAL_SESSION_VOLUME: session_volume,
+        CONF_PRIVATE_NATIVE_VOLUME_CAPTURE: capture,
+        CONF_PRIVATE_NOW_PLAYING_DATASTREAM: True,
+    }
+    player.provider.config.get_value.side_effect = lambda key, default=None: values.get(
+        key, default
+    )
+    monkeypatch.setenv("CLIAIRPLAY_MRP_TYPE130", inherited_type130)
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "must-not-reach-child")
+    monkeypatch.setattr(trial, "is_trial_target", lambda: private)
+    monkeypatch.setattr(stream, "_check_password_preflight", lambda: None)
+    monkeypatch.setattr(stream.commands_pipe, "create", AsyncMock())
+    monkeypatch.setattr(stream.commands_pipe, "remove", AsyncMock())
+    player.provider.mass.create_task.side_effect = lambda coroutine: (
+        coroutine.close(),
+        MagicMock(),
+    )[1]
+    expected_environment = {
+        "CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM": expected_now_playing,
+        "CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE": "1" if capture and private else "0",
+        "CLIAIRPLAY_NATIVE_VOLUME_RAIL": "1" if private and remote and not session_volume else "0",
+        "CLIAIRPLAY_SESSION_VOLUME": "mrp130" if remote and session_volume else "off",
+        "CLIAIRPLAY_MRP_TYPE130": expected_type130,
+    }
+    if private:
+        expected_environment["CLIAIRPLAY_PTP_STRICT_PEERS"] = "1"
+        children = install_host_spawn(
+            monkeypatch, "valid", expected_environment=expected_environment
+        )
+        monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=[str(fixed_asset)]))
+    else:
+        child_code = textwrap.dedent(f"""\
+            import os,time
+            expected = {expected_environment!r}
+            assert all(os.getenv(key) == value for key, value in expected.items())
+            assert 'SUPERVISOR_TOKEN' not in os.environ
+            os.write(1, b'[TEST] environment-verified\\n')
+            time.sleep(10)
+        """)
+        children = []
+        monkeypatch.setattr(
+            stream, "_build_cli_args", AsyncMock(return_value=[sys.executable, "-c", child_code])
+        )
+
+    try:
+        await stream.connect()
+        assert stream._cli_proc is not None
+        assert stream._cli_proc.returncode is None
+        if not private:
+            assert stream._cli_proc.proc is not None
+            children.append(stream._cli_proc.proc)
+            assert await asyncio.wait_for(stream._cli_proc.read_stdout(), 3) == (
+                b"[TEST] environment-verified\n"
+            )
+    finally:
+        await stream._cleanup_failed_start()
     assert all(child.returncode is not None for child in children)
 
 

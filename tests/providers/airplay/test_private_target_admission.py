@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Coroutine
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,10 +12,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from music_assistant.helpers.private_trial import parse_trial_target
+from music_assistant.helpers.process import AsyncProcess
 from music_assistant.providers.airplay import pairing as pairing_module
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay import trial_binary
-from music_assistant.providers.airplay.constants import COMPANION_DISCOVERY_TYPE
+from music_assistant.providers.airplay.constants import (
+    COMPANION_DISCOVERY_TYPE,
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_EXPERIMENTAL_SESSION_VOLUME,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    CONF_PRIVATE_NOW_PLAYING_DATASTREAM,
+    StreamingProtocol,
+)
 from music_assistant.providers.airplay.player import AirPlayPlayer
 from music_assistant.providers.airplay.provider import AirPlayProvider
 from tests.providers.airplay.test_player import _stub_raw_config, _stub_volume_scaling
@@ -409,3 +418,133 @@ async def test_stream_child_requests_the_native_rail(
     await stream.connect()
     env = factory.call_args.kwargs["env"] if private else captured
     assert env["CLIAIRPLAY_NATIVE_VOLUME_RAIL"] == rail
+
+
+@pytest.mark.parametrize(
+    ("private", "remote", "capture", "volume", "protocol", "inherited", "enabled"),
+    [
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, None, True),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "1", True),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "0", False),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "false", False),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "off", False),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "", True),
+        (True, True, False, False, StreamingProtocol.AIRPLAY2, "malformed", True),
+        (True, True, True, False, StreamingProtocol.AIRPLAY2, None, False),
+        (True, True, False, True, StreamingProtocol.AIRPLAY2, None, False),
+        (True, False, False, False, StreamingProtocol.AIRPLAY2, None, False),
+        (True, True, False, False, StreamingProtocol.RAOP, None, False),
+        (False, True, False, False, StreamingProtocol.AIRPLAY2, None, False),
+    ],
+)
+async def test_private_now_playing_datastream_uses_the_isolated_launch_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    private: bool,
+    remote: bool,
+    capture: bool,
+    volume: bool,
+    protocol: StreamingProtocol,
+    inherited: str | None,
+    enabled: bool,
+) -> None:
+    """Only the private trial arm receives now-playing publication without capture or volume."""
+    provider, player, stream = _playing_provider(monkeypatch)
+    player.protocol = protocol
+    player.protocol_override = None
+    values = {
+        CONF_EXPERIMENTAL_HOMEPOD_REMOTE: remote,
+        CONF_EXPERIMENTAL_SESSION_VOLUME: volume,
+        CONF_PRIVATE_NATIVE_VOLUME_CAPTURE: capture,
+        CONF_PRIVATE_NOW_PLAYING_DATASTREAM: True,
+    }
+    provider.config = MagicMock()
+    provider.config.get_value.side_effect = lambda key, default=None: values.get(key, default)
+    child = _child()
+    monkeypatch.setattr(child, "start", AsyncMock())
+    factory = AsyncMock(return_value=child)
+    if inherited is None:
+        monkeypatch.delenv("CLIAIRPLAY_MRP_TYPE130", raising=False)
+    else:
+        monkeypatch.setenv("CLIAIRPLAY_MRP_TYPE130", inherited)
+    parent_env = dict(os.environ)
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: private)
+    monkeypatch.setattr(trial_binary, "create_private_process", factory)
+    monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=["unused"]))
+    monkeypatch.setattr(stream, "_check_password_preflight", lambda: None)
+    monkeypatch.setattr(stream.commands_pipe, "create", AsyncMock())
+    assert isinstance(provider.mass, MagicMock)
+    provider.mass.create_task.side_effect = lambda coro: (coro.close(), MagicMock())[1]
+
+    captured: dict[str, str] = {}
+    if not private:
+
+        def packaged_factory(*_args: object, **kwargs: Any) -> AsyncProcess:
+            """Record the final packaged-child environment before returning the test child."""
+            captured.update(cast("dict[str, str]", kwargs["env"]))
+            return child
+
+        monkeypatch.setattr(
+            "music_assistant.providers.airplay.stream.AsyncProcess", packaged_factory
+        )
+    await stream.connect()
+
+    env = factory.call_args.kwargs["env"] if private else captured
+    assert env["CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM"] == ("1" if enabled else "0")
+    assert env["CLIAIRPLAY_SESSION_VOLUME"] == ("mrp130" if remote and volume else "off")
+    assert os.environ == parent_env
+    if private:
+        assert env["CLIAIRPLAY_PTP_STRICT_PEERS"] == "1"
+        expected_unset = (
+            frozenset({"CLIAIRPLAY_MRP_TYPE130"})
+            if inherited not in (None, "0", "false", "off")
+            else frozenset()
+        )
+        assert factory.call_args.kwargs["unset_env"] == expected_unset
+
+
+async def test_disabled_private_now_playing_preserves_type130_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disabled experiment leaves an inherited diagnostic force untouched."""
+    provider, player, stream = _playing_provider(monkeypatch)
+    player.protocol = StreamingProtocol.AIRPLAY2
+    player.protocol_override = None
+    provider.config = MagicMock()
+    provider.config.get_value.side_effect = lambda key, default=None: (
+        True if key == CONF_EXPERIMENTAL_HOMEPOD_REMOTE else default
+    )
+    child = _child()
+    monkeypatch.setattr(child, "start", AsyncMock())
+    factory = AsyncMock(return_value=child)
+    monkeypatch.setenv("CLIAIRPLAY_MRP_TYPE130", "1")
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: True)
+    monkeypatch.setattr(trial_binary, "create_private_process", factory)
+    monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=["unused"]))
+    monkeypatch.setattr(stream, "_check_password_preflight", lambda: None)
+    monkeypatch.setattr(stream.commands_pipe, "create", AsyncMock())
+    assert isinstance(provider.mass, MagicMock)
+    provider.mass.create_task.side_effect = lambda coro: (coro.close(), MagicMock())[1]
+
+    await stream.connect()
+
+    env = factory.call_args.kwargs["env"]
+    assert env["CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM"] == "0"
+    assert factory.call_args.kwargs["unset_env"] == frozenset()
+
+
+@pytest.mark.parametrize("private", [False, True])
+async def test_private_now_playing_config_is_private_default_off(
+    monkeypatch: pytest.MonkeyPatch, private: bool
+) -> None:
+    """Only the private profile exposes the bounded default-off now-playing experiment."""
+    provider, _player, _stream = _playing_provider(monkeypatch)
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: private)
+
+    entries = await provider.get_config_entries()
+
+    selected = [entry for entry in entries if entry.key == CONF_PRIVATE_NOW_PLAYING_DATASTREAM]
+    assert len(selected) == int(private)
+    if private:
+        entry = selected[0]
+        assert entry.default_value is False
+        assert entry.advanced is True
