@@ -45,8 +45,9 @@ The existing flush runs after the memory change and flushes shared pending confi
 failed flush reports `unproven`; cancellation propagates with the change potentially applied.
 A lost response is ambiguous. Never automatically retry or blindly roll back: stop and
 reconcile using separately authorized read-only state and lifecycle evidence. Completed
-means the flush returned and both in-memory target values still matched, not an exclusive
-writer or durable-clear guarantee.
+means the flush returned and the current raw and loaded in-memory target values still matched.
+A missing, malformed or mismatched current target makes persistence `unproven`, even if a
+previously captured entry still matches. This is not an exclusive-writer or durable-clear guarantee.
 
 The snapshot and leaf updates run in one event-loop turn. This excludes normal coroutines
 between those operations, but not off-loop mutations, a preexisting stale generic writer

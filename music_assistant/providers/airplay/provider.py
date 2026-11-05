@@ -984,7 +984,20 @@ class AirPlayProvider(PlayerProvider):
         except Exception as err:
             self.logger.warning(f"Private admission flush failed ({type(err).__name__})")
             persistence = PrivateFlagPersistence.UNPROVEN
-        if values.get(CONF_PRIVATE_TRIAL_TARGET) != desired or entry.value != desired:
+        current_core = self.mass.config.get(CONF_CORE)
+        current_loaded = getattr(self.mass.discovery, "config", None)
+        current_entries = getattr(current_loaded, "values", None)
+        if (
+            not isinstance(current_core, dict)
+            or not isinstance(current_discovery := current_core.get("discovery"), dict)
+            or not isinstance(current_values := current_discovery.get("values"), dict)
+            or current_values.get(CONF_PRIVATE_TRIAL_TARGET) != desired
+            or not isinstance(current_entries, dict)
+            or not isinstance(
+                current_entry := current_entries.get(CONF_PRIVATE_TRIAL_TARGET), ConfigEntry
+            )
+            or current_entry.value != desired
+        ):
             persistence = PrivateFlagPersistence.UNPROVEN
         return {
             "version": 1,

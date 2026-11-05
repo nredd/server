@@ -436,6 +436,8 @@ def test_changed_flag_source_on_disk_rejects_live_code(
         (b"values[CONF_PRIVATE_TRIAL_TARGET] != expected or entry.value != expected", b"False"),
         (b"any(self.config.get_value(key) is not False for key in _PRIVATE_FLAG_KEYS)", b"False"),
         (b"or self.get_players()\n", b"or False\n"),
+        (b"current_values.get(CONF_PRIVATE_TRIAL_TARGET) != desired", b"False"),
+        (b"current_entry.value != desired", b"False"),
         (
             b'any(player.player_id != request["player_id"] for player in self.get_players())',
             b"False",

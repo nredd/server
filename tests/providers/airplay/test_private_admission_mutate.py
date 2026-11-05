@@ -319,6 +319,148 @@ async def test_flush_failure_and_cancellation_do_not_roll_back(
     assert cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == ""
 
 
+async def test_post_flush_real_core_save_replaces_both_target_references(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generic core save detaches both old references while admission waits to flush."""
+    cfg = admission.mass.config
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_save = cfg.async_save
+
+    async def parked_save() -> None:
+        entered.set()
+        await release.wait()
+        await real_save()
+
+    monkeypatch.setattr(cfg, "async_save", parked_save)
+    task = asyncio.create_task(admission.private_trial_admission_mutate(request()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        old_values = cfg.get("core/discovery/values")
+        old_entry = admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET]
+        await cfg.save_core_config("discovery", {CONF_PRIVATE_TRIAL_TARGET: "ffffffffffff@Other"})
+        assert cfg.get("core/discovery/values") is not old_values
+        assert admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET] is not old_entry
+        assert old_values[CONF_PRIVATE_TRIAL_TARGET] == TARGET
+        assert old_entry.value == TARGET
+        assert cfg.get("core/discovery/values/private_trial_target") == "ffffffffffff@Other"
+        assert (
+            admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value
+            == "ffffffffffff@Other"
+        )
+    finally:
+        release.set()
+    result = await task
+    assert result["status"] == "applied"
+    assert result["memory"] == "applied"
+    assert result["persistence"] == "unproven"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "raw_only",
+        "loaded_only",
+        "core_missing",
+        "core_null",
+        "discovery_missing",
+        "discovery_null",
+        "values_missing",
+        "values_null",
+        "target_missing",
+        "loaded_missing",
+        "loaded_values_invalid",
+        "entry_missing",
+        "entry_invalid",
+    ],
+)
+async def test_post_flush_current_state_is_checked(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Detached or malformed current targets make persistence unproven, not rollback."""
+    cfg = admission.mass.config
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def parked_save() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(cfg, "async_save", parked_save)
+    task = asyncio.create_task(admission.private_trial_admission_mutate(request()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        old_values = cfg.get("core/discovery/values")
+        old_entry = admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET]
+        if change == "raw_only":
+            cfg._data["core"] = deepcopy(cfg._data["core"])
+            cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] = "other"
+        elif change == "loaded_only":
+            admission.mass.discovery.config = deepcopy(admission.mass.discovery.config)
+            admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value = "other"
+        elif change == "core_missing":
+            del cfg._data["core"]
+        elif change == "core_null":
+            cfg._data["core"] = None
+        elif change in ("discovery_missing", "discovery_null"):
+            cfg._data["core"] = {} if change == "discovery_missing" else {"discovery": None}
+        elif change in ("values_missing", "values_null"):
+            cfg._data["core"] = (
+                {"discovery": {}} if change == "values_missing" else {"discovery": {"values": None}}
+            )
+        elif change == "target_missing":
+            cfg._data["core"] = {"discovery": {"values": {}}}
+        elif change == "loaded_missing":
+            monkeypatch.setattr(admission.mass.discovery, "config", None)
+        else:
+            loaded = deepcopy(admission.mass.discovery.config)
+            if change == "loaded_values_invalid":
+                cast("Any", loaded).values = None
+            elif change == "entry_missing":
+                del loaded.values[CONF_PRIVATE_TRIAL_TARGET]
+            else:
+                cast("Any", loaded.values)[CONF_PRIVATE_TRIAL_TARGET] = None
+            admission.mass.discovery.config = loaded
+        assert old_values[CONF_PRIVATE_TRIAL_TARGET] == TARGET
+        assert old_entry.value == TARGET
+    finally:
+        release.set()
+    result = await task
+    assert result["status"] == "applied"
+    assert result["memory"] == "applied"
+    assert result["persistence"] == "unproven"
+
+
+@pytest.mark.parametrize("mode", ["admit", "clear"])
+@pytest.mark.parametrize("matches", [False, True])
+async def test_post_flush_clear_and_admit_use_current_values(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, mode: str, matches: bool
+) -> None:
+    """Both operations read current values, not the identity of captured containers."""
+    cfg = admission.mass.config
+    if mode == "clear":
+        assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def parked_save() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(cfg, "async_save", parked_save)
+    task = asyncio.create_task(admission.private_trial_admission_mutate(request(mode)))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        cfg._data["core"] = deepcopy(cfg._data["core"])
+        admission.mass.discovery.config = deepcopy(admission.mass.discovery.config)
+        if not matches:
+            cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] = "other"
+            admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value = "other"
+    finally:
+        release.set()
+    result = await task
+    assert result["memory"] == "applied"
+    assert result["persistence"] == ("completed" if matches else "unproven")
+
+
 async def test_queued_writer_runs_only_after_atomic_mutation(
     admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
