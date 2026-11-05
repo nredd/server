@@ -1,4 +1,10 @@
-"""Offline persistence checks for private discovery admission."""
+"""
+Offline persistence checks for private discovery admission.
+
+References:
+- https://github.com/nredd/server/blob/native-volume-capture-integration/music_assistant/controllers/discovery/controller.py
+- https://github.com/nredd/server/blob/native-volume-capture-integration/music_assistant/providers/airplay/provider.py
+"""
 
 from __future__ import annotations
 
@@ -34,6 +40,15 @@ async def private_discovery(
     return mass
 
 
+@pytest.fixture
+def preflight_provider(private_discovery: MusicAssistant) -> AirPlayProvider:
+    """Provide an isolated AirPlay preflight bound to the real config controller."""
+    provider = AirPlayProvider.__new__(AirPlayProvider)
+    provider.mass = private_discovery
+    provider.__dict__["get_players"] = list
+    return provider
+
+
 def persisted_values(mass: MusicAssistant) -> dict[str, object]:
     """Read persisted discovery values written by the real config controller."""
     data = json.loads(Path(mass.config.filename).read_text())
@@ -66,25 +81,27 @@ async def test_setup_flushes_reset_before_browser(
 
 @pytest.mark.parametrize(("players", "state"), [(None, "unsafe"), ({}, "absent")])
 async def test_preflight_real_player_store(
-    private_discovery: MusicAssistant, players: dict[str, object] | None, state: str
+    private_discovery: MusicAssistant,
+    preflight_provider: AirPlayProvider,
+    players: dict[str, object] | None,
+    state: str,
 ) -> None:
     """Null and empty player stores have distinct safety outcomes."""
     mass = private_discovery
     mass.config.set("players", players)
-    provider = AirPlayProvider.__new__(AirPlayProvider)
-    provider.mass = mass
-    provider.__dict__["get_players"] = list
-    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    result = await preflight_provider.get_private_trial_admission_preflight(PLAYER_ID)
     assert result["config_state"] == state
     assert result["target_unset"] is True
     mass.config.remove("players")
-    assert (await provider.get_private_trial_admission_preflight(PLAYER_ID))[
+    assert (await preflight_provider.get_private_trial_admission_preflight(PLAYER_ID))[
         "config_state"
     ] == "unsafe"
 
 
 async def test_core_save_clear_and_deferred_flush(
-    private_discovery: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+    private_discovery: MusicAssistant,
+    preflight_provider: AirPlayProvider,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Core saves update live state before a deliberately blocked disk flush."""
     mass = private_discovery
@@ -119,10 +136,7 @@ async def test_core_save_clear_and_deferred_flush(
     assert result.get_value(CONF_PRIVATE_TRIAL_TARGET) == ""
     assert mass.discovery.trial_target() is None
     assert CONF_PRIVATE_TRIAL_TARGET not in mass.config.get("core/discovery/values")
-    provider = AirPlayProvider.__new__(AirPlayProvider)
-    provider.mass = mass
-    provider.__dict__["get_players"] = list
-    assert (await provider.get_private_trial_admission_preflight(PLAYER_ID))[
+    assert (await preflight_provider.get_private_trial_admission_preflight(PLAYER_ID))[
         "target_unset"
     ] is False
     await mass.config.save_core_config("discovery", {CONF_PRIVATE_TRIAL_TARGET: ""})

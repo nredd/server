@@ -1,4 +1,10 @@
-"""Offline player configuration retention checks for private admission."""
+"""
+Offline player configuration retention checks for private admission.
+
+References:
+- https://github.com/nredd/server/blob/native-volume-capture-integration/music_assistant/controllers/players/controller.py
+- https://github.com/nredd/server/blob/native-volume-capture-integration/music_assistant/models/player.py
+"""
 
 from __future__ import annotations
 
