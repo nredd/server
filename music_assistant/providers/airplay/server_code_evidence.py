@@ -418,7 +418,11 @@ def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name
         or set(vars(live)) - {"__firstlineno__", "__static_attributes__"} != set(vars(reference))
         or any(vars(live)[key] is not vars(reference)[key] for key in _ENUM_SHARED_ATTRIBUTES)
         or list(vars(live)["_member_names_"]) != [key for key, _ in declared]
-        or any(vars(live)[key] is not member for key, member in members)
+        or any(vars(live)[key] is not member or member._name_ != key for key, member in members)
+        or any(
+            vars(live)[key] != vars(reference)[key]
+            for key in ("_hashable_values_", "_unhashable_values_")
+        )
         or {value: id(vars(live)[key]) for key, value in declared}
         != {value: id(member) for value, member in vars(live)["_value2member_map_"].items()}
     ):

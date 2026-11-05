@@ -368,3 +368,26 @@ def test_live_enum_lookup_corruption_is_unverified(attribute: str) -> None:
     finally:
         type.__setattr__(cls, attribute, original)
     assert evidence.server_code_evidence(provider)["status"] == "verified"
+
+
+def test_live_enum_member_name_corruption_is_unverified() -> None:
+    """A member whose stored name no longer matches its declaration is rejected."""
+    member = constants.PrivateFlagState.TRUE
+    member._name_ = "X"
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        member._name_ = "TRUE"
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
+
+
+def test_live_enum_hashable_values_corruption_is_unverified() -> None:
+    """A corrupted value list of a live enum is rejected."""
+    cls = constants.PrivateFlagState
+    original = vars(cls)["_hashable_values_"]
+    type.__setattr__(cls, "_hashable_values_", [*original, "extra"])
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        type.__setattr__(cls, "_hashable_values_", original)
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
