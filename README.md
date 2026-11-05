@@ -3,7 +3,7 @@ Music Assistant
 
 **Music Assistant Server**
 
-Private trial worktree only: [native AirPlay overlay and launch gates](PRIVATE_NATIVE_AIRPLAY_TRIAL.md).
+Private trial worktree only: [native AirPlay overlay, atomic admission contract and launch gates](PRIVATE_NATIVE_AIRPLAY_TRIAL.md).
 Not ready to deploy; never include this overlay in the upstream feature PR.
 
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/music-assistant/server?utm_source=badge)

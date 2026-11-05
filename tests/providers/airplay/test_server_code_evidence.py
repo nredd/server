@@ -426,6 +426,34 @@ def test_changed_flag_source_on_disk_rejects_live_code(
     }
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'not _PRIVATE_PLAYER_ID.fullmatch(request["player_id"])', b"False"),
+        (b'target.player_id != request["player_id"]', b"False"),
+        (b"self.config.enabled is not True", b"False"),
+        (b"values[CONF_PRIVATE_TRIAL_TARGET] != expected or entry.value != expected", b"False"),
+        (b"any(self.config.get_value(key) is not False for key in _PRIVATE_FLAG_KEYS)", b"False"),
+        (b"or self.get_players()\n", b"or False\n"),
+        (
+            b'any(player.player_id != request["player_id"] for player in self.get_players())',
+            b"False",
+        ),
+    ],
+)
+def test_admission_guard_removal_fails_function_guard(old: bytes, new: bytes) -> None:
+    """Each changed admission guard is rejected by callable verification itself."""
+    source = Path(provider.__file__).read_bytes()
+    assert source.count(old) == 1
+    changed = source.replace(old, new)
+    tree = ast.parse(changed)
+    codes = evidence._codes(compile(changed, "provider.py", "exec"))
+    with pytest.raises(ValueError, match="Code mismatch"):
+        evidence._check_function(
+            codes, tree, provider.AirPlayProvider, "private_trial_admission_mutate"
+        )
+
+
 def test_flag_handler_decorator_and_defaults_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

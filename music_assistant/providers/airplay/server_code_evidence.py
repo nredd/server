@@ -15,6 +15,7 @@ from types import CodeType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.auth import Scope
+from music_assistant_models.config_entries import ConfigEntry
 
 from music_assistant import constants as core_constants
 from music_assistant import mass as mass_module
@@ -90,6 +91,8 @@ def server_code_evidence(
             trees[key] = ast.parse(data)
         for name in (
             "get_private_trial_admission_preflight",
+            "_private_admission_snapshot",
+            "private_trial_admission_mutate",
             "_setup_player",
             "_admits_private_player",
             "private_airplay_flags",
@@ -98,6 +101,7 @@ def server_code_evidence(
             "_register_private_capture_api",
         ):
             _check_function(codes["provider"], trees["provider"], provider.AirPlayProvider, name)
+            _check_globals(inspect.getattr_static(provider.AirPlayProvider, name), provider)
         _check_function(
             codes["players_controller"],
             trees["players_controller"],
@@ -158,8 +162,9 @@ def server_code_evidence(
             "get_decoded_property",
         ):
             _check_function(codes["helpers"], trees["helpers"], helpers, name)
-        for name in ("is_trial_target", "admits_player_id"):
+        for name in ("is_trial_target", "admits_player_id", "parse_trial_target"):
             _check_function(codes["private_trial"], trees["private_trial"], private_trial, name)
+            _check_globals(getattr(private_trial, name), private_trial)
         _check_function(
             codes["private_trial"],
             trees["private_trial"],
@@ -193,6 +198,7 @@ def server_code_evidence(
         if (
             provider.is_trial_target is not private_trial.is_trial_target
             or provider.admits_player_id is not private_trial.admits_player_id
+            or provider.parse_trial_target is not private_trial.parse_trial_target
         ):
             return failure
         for name in (
@@ -251,6 +257,11 @@ def server_code_evidence(
             or provider.CONF_CORE != "core"
             or provider.CONF_PROVIDERS is not core_constants.CONF_PROVIDERS
             or provider.CONF_CORE is not core_constants.CONF_CORE
+            or provider.CONF_PLAYERS is not core_constants.CONF_PLAYERS
+            or provider.ConfigEntry is not ConfigEntry
+            or type(private_trial._MAC) is not re.Pattern
+            or private_trial._MAC.pattern != r"[0-9a-f]{12}"
+            or private_trial._MAC.flags != re.UNICODE
             or provider.CONF_PRIVATE_TRIAL_TARGET != private_trial.CONF_PRIVATE_TRIAL_TARGET
             or tuple(
                 getattr(constants, name)
@@ -286,6 +297,12 @@ def server_code_evidence(
         OverflowError,
     ):
         return failure
+
+
+def _check_globals(function: FunctionType, module: ModuleType) -> None:
+    """Reject selected functions that execute against another globals dictionary."""
+    if function.__globals__ is not vars(module):
+        raise ValueError("Unexpected function globals")
 
 
 def _check_runtime_bindings(controller: object) -> None:

@@ -18,14 +18,44 @@ missing target state fails closed. Nonempty setup data and legacy credentials ar
 rejected; absent volume limits mean 0 and 100. Native MRP for a private TV also requires
 stored credentials.
 
-This permits a discovery-only proof, not default-output, active Music, or playback
-acceptance. It is a snapshot, so the caller must keep the target unset and prevent
-concurrent config changes until it enables discovery. Preflight is read-only and does not
-flush config or prove disk durability. Registration can create a default player config
-record which remains after unregister. Admission and provider unload are rechecked before
-player construction and after registration; stale cleanup removes only that exact player.
-Clearing the core target can omit its default raw key, so a subsequent preflight may fail
-closed until startup writes the explicit empty value again.
+Preflight is read-only and does not flush config or prove disk durability. It is not an
+atomic admission: a writer can change its facts before a separate target save.
+
+The private-only `SYSTEM_MANAGE` command `airplay/private_trial_admission/mutate` accepts one
+uncoerced `request` object with exactly `mode`, `player_id` and `target`. `mode` is `admit`
+or `clear`; `player_id` is canonical `ap` plus 12 lowercase hex digits, and `target` is a
+matching `<12 lowercase hex>@<name>` accepted by the canonical target parser, with no `/`.
+Other request keys or types are refused. The API layer ignores extra top-level arguments.
+
+For `admit`, the available, enabled, loaded AirPlay provider must match its stored identity;
+all three loaded experimental flags must be false, there must be no players or streams, and
+the seven preflight facts must be safe. The existing raw and loaded discovery target must
+both explicitly be empty. For `clear`, both must instead match the exact expected `target`;
+clear permits the matching player or stream but refuses a different active player. Both operations validate existing parents
+before changing only the raw target leaf and loaded entry, without normalization. A missing,
+malformed, mismatched or unavailable provider or target is refused without a write or flush.
+Clear explicitly writes an empty raw leaf. An unloaded or unavailable provider refuses clear;
+there is no blind fallback. Registration may leave a default player config record behind.
+
+The response contains exactly `version`, `status`, `reason`, `memory` and `persistence`.
+`status` is `applied` or `refused`; `reason` is null or `invalid_request`, `profile_inactive`,
+`provider_unavailable`, `unsafe_config`, `target_mismatch` or `unsafe_state`. `memory` is
+`applied` or `unchanged`, and `persistence` is `not_attempted`, `completed` or `unproven`.
+The existing flush runs after the memory change and flushes shared pending config too. A
+failed flush reports `unproven`; cancellation propagates with the change potentially applied.
+A lost response is ambiguous. Never automatically retry or blindly roll back: stop and
+reconcile using separately authorized read-only state and lifecycle evidence. Completed
+means the flush returned and both in-memory target values still matched, not an exclusive
+writer or durable-clear guarantee.
+
+The snapshot and leaf updates run in one event-loop turn. This excludes normal coroutines
+between those operations, but not off-loop mutations, a preexisting stale generic writer
+resuming afterward, another process, or later privileged commands. The operator must establish
+an exclusive config/control writer and no pending external setup or config flows through set;
+otherwise this contract is unsupported. Clear is not proof that in-flight tasks have quiesced.
+Admission and provider unload are rechecked before construction and after registration; stale
+cleanup removes only that exact player. This is discovery-only, not playback acceptance or
+live authorization.
 
 ## Guarded flag compare-and-set
 
