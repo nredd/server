@@ -76,8 +76,6 @@ def _config_tree() -> dict[str, Any]:
         "providers": {
             INSTANCE: _raw_provider(),
             OTHER_ID: {"domain": "airplay_receiver", "values": {"password": SECRET}},
-            "malformed--1": None,
-            "malformed--2": ["not", "a", "mapping"],
             "plain": {"domain": "filesystem_local", "values": "broken"},
         },
         "players": {"ap0123456789ab": {"values": {"password": SECRET, "volume_control": 3}}},
@@ -344,6 +342,17 @@ GUARD_CASES: dict[str, tuple[Callable[[Harness], object], str]] = {
         "unsafe_config",
     ),
     "providers_not_mapping": (lambda h: h.raw.update(providers=[]), "unsafe_config"),
+    "sibling_null": (lambda h: h.raw["providers"].update(sibling=None), "unsafe_config"),
+    "sibling_list": (lambda h: h.raw["providers"].update(sibling=[]), "unsafe_config"),
+    "sibling_domain_missing": (lambda h: h.raw["providers"].update(sibling={}), "unsafe_config"),
+    "sibling_domain_null": (
+        lambda h: h.raw["providers"].update(sibling={"domain": None}),
+        "unsafe_config",
+    ),
+    "sibling_domain_list": (
+        lambda h: h.raw["providers"].update(sibling={"domain": []}),
+        "unsafe_config",
+    ),
     "second_airplay_instance": (
         lambda h: h.raw["providers"].update({"airplay--two": {"domain": "airplay"}}),
         "unsafe_config",
@@ -694,8 +703,7 @@ async def test_next_load_rehydrates_from_disk(harness: Harness) -> None:
     ]
     config = ProviderConfig.parse(entries, {k: v for k, v in raw.items() if k != "last_error"})
     assert [config.values[key].value for key in FLAGS] == [True, False, True]
-    assert reloaded.get("providers/malformed--2") == ["not", "a", "mapping"]
-    assert reloaded.get("providers/malformed--1") is None
+    assert reloaded.get("providers/plain/values") == "broken"
 
 
 async def test_responses_are_closed_and_secret_free(harness: Harness) -> None:

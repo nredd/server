@@ -43,7 +43,9 @@ Any other member, type or value is refused, and extra top-level arguments are ig
 API layer, not the handler. Absent is a state: an inverse CAS (expected and desired swapped)
 removes the key again and restores the original absence, never a guessed default. A stored
 null, string or number, a duplicate flag at the instance top level, a missing or non-mapping
-`values`, or a malformed `providers` section is refused.
+`values`, or a non-mapping `providers` section is refused. Every provider record must be a
+mapping with a string `domain`, so an unreadable sibling cannot hide another AirPlay instance.
+Other fields in unrelated records are not validated or normalized, even if noncanonical.
 
 Guards, checked synchronously with no `await` before the writes: the private Linux ARM
 profile, exactly one raw `airplay` instance whose key, raw `instance_id`, loaded provider
@@ -601,7 +603,9 @@ Previous pins `dae8ae9484cd19d847bf495bb95a85e6d1afc2c2`,
 `ad73c02283350952f535e328f7c001c8b209e9fa`, `a6382b99fad1603176fe89daf0a233406e77f5ad`,
 and `0f7b543127f71c5639d55d4e0e34168ba92d0c33` are observer history only.
 The installer anchor identifies the requested source, not proof of loaded code. The separate
-`server_code_evidence` guard checks selected loaded code, not the entire process. The observer itself
+`server_code_evidence` guard checks selected loaded code, not the entire process. That includes the closed `StrEnum` flag states, modes, statuses and reasons in `constants.py`: each
+source declaration must be plain literal members of one `StrEnum` and match the live class members and
+shape, else the evidence is `unverified`. The observer itself
 is tooling and may be newer than the runtime source it pins. The separate CLI pins (`429c5670`
 source, `cd7d36b` CI label, `fc77ceec` ELF) remain unchanged.
 The pin is a code constant with no argument, so a later merge deliberately differs from it until a new

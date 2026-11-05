@@ -90,6 +90,13 @@ from .constants import (
     STREAMING_MODE_AP2_COMPAT,
     STREAMING_MODE_AUTO,
     AirPlayRemoteCommand,
+    PrivateFlagEffect,
+    PrivateFlagMemory,
+    PrivateFlagMode,
+    PrivateFlagPersistence,
+    PrivateFlagReason,
+    PrivateFlagState,
+    PrivateFlagStatus,
     StreamingProtocol,
 )
 from .control_player import AirPlayControlPlayer
@@ -149,11 +156,11 @@ _PRIVATE_FLAG_KEYS: Final = (
     CONF_EXPERIMENTAL_SESSION_VOLUME,
     CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
 )
-_PRIVATE_FLAG_STATES: Final = ("absent", "true", "false")
+_PRIVATE_FLAG_STATES: Final = tuple(PrivateFlagState)
 _PRIVATE_INSTANCE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
-def _private_flag_states(values: object) -> dict[str, str] | None:
+def _private_flag_states(values: object) -> dict[str, PrivateFlagState] | None:
     """
     Return the closed state of every supported flag in a raw values mapping.
 
@@ -162,20 +169,20 @@ def _private_flag_states(values: object) -> dict[str, str] | None:
     """
     if not isinstance(values, dict):
         return None
-    states: dict[str, str] = {}
+    states: dict[str, PrivateFlagState] = {}
     for key in _PRIVATE_FLAG_KEYS:
         if key not in values:
-            states[key] = "absent"
+            states[key] = PrivateFlagState.ABSENT
         elif values[key] is True:
-            states[key] = "true"
+            states[key] = PrivateFlagState.TRUE
         elif values[key] is False:
-            states[key] = "false"
+            states[key] = PrivateFlagState.FALSE
         else:
             return None
     return states
 
 
-def _private_flag_map(value: object) -> dict[str, str] | None:
+def _private_flag_map(value: object) -> dict[str, PrivateFlagState] | None:
     """
     Validate one closed flag-state mapping of a request.
 
@@ -186,12 +193,12 @@ def _private_flag_map(value: object) -> dict[str, str] | None:
         return None
     if any(type(item) is not str or item not in _PRIVATE_FLAG_STATES for item in value.values()):
         return None
-    return dict(value)
+    return {key: PrivateFlagState(item) for key, item in value.items()}
 
 
 def _private_flag_request(
     request: object,
-) -> tuple[dict[str, str] | None, dict[str, str] | None] | None:
+) -> tuple[dict[str, PrivateFlagState] | None, dict[str, PrivateFlagState] | None] | None:
     """
     Validate the closed request shape, rejecting any unexpected member.
 
@@ -200,9 +207,12 @@ def _private_flag_request(
     """
     if not isinstance(request, dict):
         return None
-    if request == {"mode": "inspect"}:
+    if request == {"mode": PrivateFlagMode.INSPECT}:
         return None, None
-    if set(request) != {"mode", "expected", "desired"} or request["mode"] != "compare_and_set":
+    if (
+        set(request) != {"mode", "expected", "desired"}
+        or request["mode"] != PrivateFlagMode.COMPARE_AND_SET
+    ):
         return None
     expected = _private_flag_map(request["expected"])
     desired = _private_flag_map(request["desired"])
@@ -212,12 +222,12 @@ def _private_flag_request(
 
 
 def _private_flag_response(
-    status: str,
-    reason: str | None,
-    before: dict[str, str] | None,
-    after: dict[str, str] | None,
-    memory: str,
-    persistence: str,
+    status: PrivateFlagStatus,
+    reason: PrivateFlagReason | None,
+    before: dict[str, PrivateFlagState] | None,
+    after: dict[str, PrivateFlagState] | None,
+    memory: PrivateFlagMemory,
+    persistence: PrivateFlagPersistence,
 ) -> dict[str, SerializableType]:
     """
     Build the closed response, which never carries identifiers or stored values.
@@ -238,12 +248,16 @@ def _private_flag_response(
         "after": cast("SerializableType", after),
         "memory": memory,
         "persistence": persistence,
-        "effect": "next_load" if memory == "applied" else "none",
+        "effect": (
+            PrivateFlagEffect.NEXT_LOAD
+            if memory == PrivateFlagMemory.APPLIED
+            else PrivateFlagEffect.NONE
+        ),
     }
 
 
 def _private_flag_refusal(
-    reason: str | None, before: dict[str, str] | None
+    reason: PrivateFlagReason | None, before: dict[str, PrivateFlagState] | None
 ) -> dict[str, SerializableType]:
     """
     Build the closed response of a refusal, which never wrote or flushed anything.
@@ -252,7 +266,14 @@ def _private_flag_refusal(
     :param before: The flag states observed, if the guards got that far.
     :return: The closed refused response.
     """
-    return _private_flag_response("refused", reason, before, None, "unchanged", "not_attempted")
+    return _private_flag_response(
+        PrivateFlagStatus.REFUSED,
+        reason,
+        before,
+        None,
+        PrivateFlagMemory.UNCHANGED,
+        PrivateFlagPersistence.NOT_ATTEMPTED,
+    )
 
 
 def _has_current_private_receipt(child: AsyncProcess) -> bool:
@@ -890,32 +911,42 @@ class AirPlayProvider(PlayerProvider):
         """
         parsed = _private_flag_request(request)
         if parsed is None:
-            return _private_flag_refusal("invalid_request", None)
+            return _private_flag_refusal(PrivateFlagReason.INVALID_REQUEST, None)
         expected, desired = parsed
         if not is_trial_target():
-            return _private_flag_refusal("profile_inactive", None)
+            return _private_flag_refusal(PrivateFlagReason.PROFILE_INACTIVE, None)
         # Nothing may be awaited between these guards and the leaf updates below.
         states, reason = self._private_flag_snapshot()
         if states is None:
             return _private_flag_refusal(reason, None)
         if expected is None or desired is None:
             return _private_flag_response(
-                "inspected", None, states, None, "unchanged", "not_attempted"
+                PrivateFlagStatus.INSPECTED,
+                None,
+                states,
+                None,
+                PrivateFlagMemory.UNCHANGED,
+                PrivateFlagPersistence.NOT_ATTEMPTED,
             )
         if states != expected:
-            return _private_flag_refusal("state_mismatch", states)
+            return _private_flag_refusal(PrivateFlagReason.STATE_MISMATCH, states)
         changed = [key for key in _PRIVATE_FLAG_KEYS if expected[key] != desired[key]]
         if not changed:
             return _private_flag_response(
-                "unchanged", None, states, states, "unchanged", "not_attempted"
+                PrivateFlagStatus.UNCHANGED,
+                None,
+                states,
+                states,
+                PrivateFlagMemory.UNCHANGED,
+                PrivateFlagPersistence.NOT_ATTEMPTED,
             )
         prefix = f"{CONF_PROVIDERS}/{self.instance_id}/values"
         for key in changed:
-            if desired[key] == "absent":
+            if desired[key] == PrivateFlagState.ABSENT:
                 self.mass.config.remove(f"{prefix}/{key}")
             else:
-                self.mass.config.set(f"{prefix}/{key}", desired[key] == "true")
-        persistence = "completed"
+                self.mass.config.set(f"{prefix}/{key}", desired[key] == PrivateFlagState.TRUE)
+        persistence = PrivateFlagPersistence.COMPLETED
         try:
             await self.mass.config.async_save()
         except asyncio.CancelledError:
@@ -923,15 +954,22 @@ class AirPlayProvider(PlayerProvider):
             raise
         except Exception as err:
             self.logger.warning(
-                "Private AirPlay flag flush failed (%s); persistence unproven", type(err).__name__
+                f"Private AirPlay flag flush failed ({type(err).__name__}); persistence unproven"
             )
-            persistence = "unproven"
+            persistence = PrivateFlagPersistence.UNPROVEN
         after = _private_flag_states(
             self.mass.config.get(f"{CONF_PROVIDERS}/{self.instance_id}/values")
         )
         if after != desired:
-            persistence = "unproven"
-        return _private_flag_response("applied", None, states, after, "applied", persistence)
+            persistence = PrivateFlagPersistence.UNPROVEN
+        return _private_flag_response(
+            PrivateFlagStatus.APPLIED,
+            None,
+            states,
+            after,
+            PrivateFlagMemory.APPLIED,
+            persistence,
+        )
 
     def _register_private_capture_api(self) -> None:
         """Atomically claim all private routes within the load-failing lifecycle."""
@@ -984,7 +1022,9 @@ class AirPlayProvider(PlayerProvider):
             and entry.value in (None, "")
         )
 
-    def _private_flag_snapshot(self) -> tuple[dict[str, str] | None, str | None]:
+    def _private_flag_snapshot(
+        self,
+    ) -> tuple[dict[str, PrivateFlagState] | None, PrivateFlagReason | None]:
         """
         Return the stored flag states, or the fixed reason this provider may not touch them.
 
@@ -997,15 +1037,14 @@ class AirPlayProvider(PlayerProvider):
             or not self.available
             or self.mass.get_provider(instance_id, return_unavailable=True) is not self
         ):
-            return None, "provider_unavailable"
+            return None, PrivateFlagReason.PROVIDER_UNAVAILABLE
         providers = self.mass.config.get(CONF_PROVIDERS)
-        if not isinstance(providers, dict):
-            return None, "unsafe_config"
-        airplay = [
-            key
-            for key, raw in providers.items()
-            if isinstance(raw, dict) and raw.get("domain") == "airplay"
-        ]
+        if not isinstance(providers, dict) or any(
+            not isinstance(record, dict) or type(record.get("domain")) is not str
+            for record in providers.values()
+        ):
+            return None, PrivateFlagReason.UNSAFE_CONFIG
+        airplay = [key for key, raw in providers.items() if raw["domain"] == "airplay"]
         raw = providers.get(instance_id)
         if (
             airplay != [instance_id]
@@ -1013,14 +1052,14 @@ class AirPlayProvider(PlayerProvider):
             or raw.get("instance_id") != instance_id
             or any(key in raw for key in _PRIVATE_FLAG_KEYS)
         ):
-            return None, "unsafe_config"
+            return None, PrivateFlagReason.UNSAFE_CONFIG
         states = _private_flag_states(raw.get("values"))
         if states is None:
-            return None, "unsafe_config"
+            return None, PrivateFlagReason.UNSAFE_CONFIG
         if not self._private_target_unset():
-            return None, "target_not_empty"
+            return None, PrivateFlagReason.TARGET_NOT_EMPTY
         if self.get_players():
-            return None, "players_active"
+            return None, PrivateFlagReason.PLAYERS_ACTIVE
         return states, None
 
     def _set_pyatv_log_level(self) -> None:

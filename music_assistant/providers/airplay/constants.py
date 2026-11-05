@@ -36,6 +36,64 @@ class AirPlayRemoteCommand(StrEnum):
     PREVIOUS = "previous"
 
 
+class PrivateFlagState(StrEnum):
+    """Stored state of one private flag."""
+
+    ABSENT = "absent"
+    TRUE = "true"
+    FALSE = "false"
+
+
+class PrivateFlagMode(StrEnum):
+    """Request mode of the private flag API."""
+
+    INSPECT = "inspect"
+    COMPARE_AND_SET = "compare_and_set"
+
+
+class PrivateFlagStatus(StrEnum):
+    """Outcome of a private flag request."""
+
+    INSPECTED = "inspected"
+    UNCHANGED = "unchanged"
+    APPLIED = "applied"
+    REFUSED = "refused"
+
+
+class PrivateFlagReason(StrEnum):
+    """Fixed reason a private flag request was refused."""
+
+    INVALID_REQUEST = "invalid_request"
+    PROFILE_INACTIVE = "profile_inactive"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    UNSAFE_CONFIG = "unsafe_config"
+    TARGET_NOT_EMPTY = "target_not_empty"
+    PLAYERS_ACTIVE = "players_active"
+    STATE_MISMATCH = "state_mismatch"
+
+
+class PrivateFlagMemory(StrEnum):
+    """Whether the stored in-memory config was touched."""
+
+    UNCHANGED = "unchanged"
+    APPLIED = "applied"
+
+
+class PrivateFlagPersistence(StrEnum):
+    """Whether the config flush was attempted and proven."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    COMPLETED = "completed"
+    UNPROVEN = "unproven"
+
+
+class PrivateFlagEffect(StrEnum):
+    """When a flag change takes effect."""
+
+    NONE = "none"
+    NEXT_LOAD = "next_load"
+
+
 class ClockReadiness(StrEnum):
     """
     How a receiver's clock readiness resolved for an anchor decision.

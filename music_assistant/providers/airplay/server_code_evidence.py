@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import enum
 import hashlib
 import inspect
 import re
 import sys
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.auth import Scope
 
@@ -24,6 +25,27 @@ if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
 
 _MAX_SOURCE_SIZE = 1024 * 1024
+_PRIVATE_FLAG_ENUMS = (
+    "PrivateFlagState",
+    "PrivateFlagMode",
+    "PrivateFlagStatus",
+    "PrivateFlagReason",
+    "PrivateFlagMemory",
+    "PrivateFlagPersistence",
+    "PrivateFlagEffect",
+)
+# Stdlib factory building the pristine shape (typed Any, as type checkers want literals).
+_ENUM_FACTORY: Any = enum.StrEnum
+# Class attributes an enum gets from the stdlib and that must stay the stdlib's own objects.
+_ENUM_SHARED_ATTRIBUTES = (
+    "__new__",
+    "__str__",
+    "__format__",
+    "_new_member_",
+    "_member_type_",
+    "_use_args_",
+    "_value_repr_",
+)
 
 
 def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
@@ -155,6 +177,8 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
         ):
             if getattr(control_player, name) is not getattr(helpers, name):
                 return failure
+        for name in _PRIVATE_FLAG_ENUMS:
+            _check_enum(trees["constants"], constants, provider, name)
         credential_names = (
             "CONF_AIRPLAY_CREDENTIALS",
             "CONF_RAOP_CREDENTIALS",
@@ -217,6 +241,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
                 "private_native_volume_capture",
             )
             or provider._PRIVATE_FLAG_STATES != ("absent", "true", "false")
+            or tuple(constants.PrivateFlagState) != provider._PRIVATE_FLAG_STATES
             or type(provider._PRIVATE_INSTANCE_ID) is not re.Pattern
             or provider._PRIVATE_INSTANCE_ID.pattern != r"[A-Za-z0-9_-]{1,128}"
             or provider._PRIVATE_INSTANCE_ID.flags != re.UNICODE
@@ -313,3 +338,86 @@ def _check_function(
     matches = [item for item in compiled if item.co_qualname == qualname]
     if len(matches) != 1 or _normalize(value.__code__) != _normalize(matches[0]):
         raise ValueError("Code mismatch")
+
+
+def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name: str) -> None:
+    """
+    Reject a live string enum that differs from its simple literal source declaration.
+
+    Only `class Name(StrEnum)` bodies of unique `NAME = "literal"` members are supported,
+    so no source is executed and aliases, methods and other bases are refused.
+
+    :param tree: Parsed source of the module declaring the enum.
+    :param module: The loaded module declaring the enum.
+    :param consumer: The loaded module that must be bound to that same enum class.
+    :param name: Expected enum class name.
+    :raises ValueError: If the live enum differs from its source declaration.
+    """
+    imports = [
+        alias
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "enum" and node.level == 0
+        for alias in node.names
+        if alias.name == "StrEnum" or alias.asname == "StrEnum"
+    ]
+    if (
+        len(imports) != 1
+        or imports[0].name != "StrEnum"
+        or imports[0].asname is not None
+        or vars(module).get("StrEnum") is not enum.StrEnum
+    ):
+        raise ValueError("Unexpected StrEnum binding")
+    classes = [item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == name]
+    if len(classes) != 1:
+        raise ValueError("Unexpected enum declaration")
+    declaration = classes[0]
+    if (
+        len(declaration.bases) != 1
+        or not isinstance(declaration.bases[0], ast.Name)
+        or declaration.bases[0].id != "StrEnum"
+        or declaration.keywords
+        or declaration.decorator_list
+        or declaration.type_params
+    ):
+        raise ValueError("Unexpected enum base")
+    declared: list[tuple[str, str]] = []
+    for index, item in enumerate(declaration.body):
+        if (
+            index == 0
+            and isinstance(item, ast.Expr)
+            and isinstance(item.value, ast.Constant)
+            and isinstance(item.value.value, str)
+        ):
+            continue
+        if (
+            not isinstance(item, ast.Assign)
+            or len(item.targets) != 1
+            or not isinstance(item.targets[0], ast.Name)
+            or not isinstance(item.value, ast.Constant)
+            or type(item.value.value) is not str
+        ):
+            raise ValueError("Unsupported enum member")
+        declared.append((item.targets[0].id, item.value.value))
+    if (
+        not declared
+        or len({member for member, _ in declared}) != len(declared)
+        or len({value for _, value in declared}) != len(declared)
+    ):
+        raise ValueError("Unsupported enum members")
+    live: Any = vars(module)[name]
+    if vars(consumer)[name] is not live:
+        raise ValueError("Unexpected enum binding")
+    members: list[tuple[str, Any]] = list(live.__members__.items())
+    reference: Any = _ENUM_FACTORY(name, declared)
+    if (
+        not isinstance(live, type)
+        or type(live) is not enum.EnumType
+        or live.__bases__ != (enum.StrEnum,)
+        or live.__module__ != module.__name__
+        or live.__qualname__ != name
+        or [(key, member.value) for key, member in members] != declared
+        or any(type(member) is not live for _, member in members)
+        or set(vars(live)) - {"__firstlineno__", "__static_attributes__"} != set(vars(reference))
+        or any(vars(live)[key] is not vars(reference)[key] for key in _ENUM_SHARED_ATTRIBUTES)
+    ):
+        raise ValueError("Live enum differs from source")

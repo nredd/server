@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -20,6 +22,9 @@ from music_assistant.providers.airplay import (
 from music_assistant.providers.airplay import (
     server_code_evidence as evidence,
 )
+
+_STR_ENUM: Any = enum.StrEnum
+_ENUM: Any = enum.Enum
 
 
 def test_real_sources_and_raw_hash() -> None:
@@ -223,8 +228,8 @@ def test_swapped_flag_function_fails_closed(monkeypatch: pytest.MonkeyPatch, nam
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        (b'"state_mismatch"', b'"state_mismatcX"'),
-        (b'desired[key] == "true"', b'desired[key] != "true"'),
+        (b"PrivateFlagReason.STATE_MISMATCH", b"PrivateFlagReason.PLAYERS_ACTIVE"),
+        (b"desired[key] == PrivateFlagState.TRUE", b"desired[key] != PrivateFlagState.TRUE"),
         (b"if states != expected:", b"if states == expected:"),
         (b"if not self._private_target_unset():", b"if self._private_target_unset():"),
         (b"if self.get_players():", b"if not self.get_players():"),
@@ -268,3 +273,79 @@ def test_flag_handler_decorator_and_defaults_are_rejected(
     assert defaulted != source
     path.write_bytes(defaulted)
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+def _constants_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: bytes, new: bytes
+) -> None:
+    """Point the loaded constants module at a mutated copy of its source."""
+    source = Path(constants.__file__).read_bytes()
+    assert source.count(old) == 1
+    path = tmp_path / "constants.py"
+    path.write_bytes(source.replace(old, new))
+    monkeypatch.setattr(constants, "__file__", str(path))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'STATE_MISMATCH = "state_mismatch"', b'STATE_MISMATCH = "state_mismatcX"'),
+        (b'    TRUE = "true"\n', b'    TRUE = "yes"\n'),
+        (b'    NEXT_LOAD = "next_load"\n', b'    NEXT_LOAD = "next_load"\n    EXTRA = "extra"\n'),
+        (b'    FALSE = "false"\n', b'    FALSE = "false"\n    OTHER = "false"\n'),
+        (b'    INSPECTED = "inspected"\n', b'    INSPECTED = ("inspected")\n    NEW = f"x"\n'),
+        (b"class PrivateFlagMode(StrEnum):", b"class PrivateFlagMode(str):"),
+        (
+            b'    COMPARE_AND_SET = "compare_and_set"\n',
+            b'    COMPARE_AND_SET = "compare_and_set"\n\n    def __str__(self) -> str:\n'
+            b'        return "x"\n',
+        ),
+        (
+            b"from enum import IntEnum, StrEnum",
+            b"from enum import IntEnum\nfrom enum import StrEnum as E",
+        ),
+    ],
+)
+def test_changed_enum_declaration_on_disk_is_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: bytes, new: bytes
+) -> None:
+    """A source enum declaration that differs from the live enum is never verified."""
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    _constants_on_disk(tmp_path, monkeypatch, old, new)
+    assert evidence.server_code_evidence(provider) == {"schema_version": 1, "status": "unverified"}
+
+
+def test_live_enum_substitutions_are_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replacing a live enum, its members or its shape fails closed."""
+    cls = constants.PrivateFlagReason
+    other = _STR_ENUM("PrivateFlagReason", {m.name: m.value for m in cls})
+    other.__module__ = constants.__name__
+    with monkeypatch.context() as patch:
+        patch.setattr(provider, "PrivateFlagReason", other)
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    renamed = _STR_ENUM("PrivateFlagReason", {**{m.name: m.value for m in cls}, "X": "x"})
+    renamed.__module__ = constants.__name__
+    with monkeypatch.context() as patch:
+        patch.setattr(constants, "PrivateFlagReason", renamed)
+        patch.setattr(provider, "PrivateFlagReason", renamed)
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    plain = _ENUM("PrivateFlagReason", {m.name: m.value for m in cls}, type=str)
+    with monkeypatch.context() as patch:
+        patch.setattr(constants, "PrivateFlagReason", plain)
+        patch.setattr(provider, "PrivateFlagReason", plain)
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    with monkeypatch.context() as patch:
+        patch.setattr(constants, "StrEnum", enum.Enum)
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
+
+
+def test_live_enum_method_injection_is_unverified() -> None:
+    """A method injected into a live enum after import is rejected."""
+    cls = constants.PrivateFlagState
+    type.__setattr__(cls, "__str__", lambda _self: "x")
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        type.__setattr__(cls, "__str__", enum.StrEnum.__str__)
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
