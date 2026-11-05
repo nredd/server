@@ -449,7 +449,7 @@ async def test_profile_inactive_refuses(harness: Harness, monkeypatch: pytest.Mo
 def _bad_requests() -> list[object]:
     """Return malformed requests of every shape."""
     good = _request(ABSENT, _states(**{FLAGS[0]: "true"}))
-    bad: list[object] = [
+    return [
         None,
         [],
         "inspect",
@@ -471,7 +471,6 @@ def _bad_requests() -> list[object]:
         {**good, "desired": {**ABSENT, FLAGS[0]: 1}},
         {**good, "expected": {**ABSENT, FLAGS[0]: ["absent"]}},
     ]
-    return bad
 
 
 @pytest.mark.parametrize("request_", _bad_requests())

@@ -191,24 +191,24 @@ def _private_flag_map(value: object) -> dict[str, str] | None:
 
 def _private_flag_request(
     request: object,
-) -> tuple[str, dict[str, str] | None, dict[str, str] | None] | None:
+) -> tuple[dict[str, str] | None, dict[str, str] | None] | None:
     """
     Validate the closed request shape, rejecting any unexpected member.
 
     :param request: The untrusted request object.
-    :return: The mode with its expected and desired states, or None when invalid.
+    :return: The expected and desired states (both None for inspect), or None when invalid.
     """
     if not isinstance(request, dict):
         return None
     if request == {"mode": "inspect"}:
-        return "inspect", None, None
+        return None, None
     if set(request) != {"mode", "expected", "desired"} or request["mode"] != "compare_and_set":
         return None
     expected = _private_flag_map(request["expected"])
     desired = _private_flag_map(request["desired"])
     if expected is None or desired is None:
         return None
-    return "compare_and_set", expected, desired
+    return expected, desired
 
 
 def _private_flag_response(
@@ -891,7 +891,7 @@ class AirPlayProvider(PlayerProvider):
         parsed = _private_flag_request(request)
         if parsed is None:
             return _private_flag_refusal("invalid_request", None)
-        _, expected, desired = parsed
+        expected, desired = parsed
         if not is_trial_target():
             return _private_flag_refusal("profile_inactive", None)
         # Nothing may be awaited between these guards and the leaf updates below.
@@ -992,8 +992,7 @@ class AirPlayProvider(PlayerProvider):
         """
         instance_id = self.instance_id
         if (
-            not isinstance(instance_id, str)
-            or not _PRIVATE_INSTANCE_ID.fullmatch(instance_id)
+            not _PRIVATE_INSTANCE_ID.fullmatch(instance_id)
             or self.domain != "airplay"
             or not self.available
             or self.mass.get_provider(instance_id, return_unavailable=True) is not self

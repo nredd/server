@@ -736,13 +736,18 @@ async def test_unload_releases_all_four_routes(monkeypatch: pytest.MonkeyPatch) 
     provider, mass = _provider()
     registry = MusicAssistant.__new__(MusicAssistant)
     registry.command_handlers = {}
-    other = registry.register_api_command("other/route", provider.get_private_native_volume_capture)
-    del other
+    registry.register_api_command("other/route", provider.get_private_native_volume_capture)
     keep = registry.command_handlers["other/route"]
     mass.register_api_command.side_effect = registry.register_api_command
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
     provider._register_private_capture_api()
-    assert len(registry.command_handlers) == 5
+    assert set(registry.command_handlers) == {
+        "other/route",
+        _COMMAND,
+        _READINESS_COMMAND,
+        _ADMISSION_COMMAND,
+        _FLAGS_COMMAND,
+    }
     _stub_unload_state(provider)
     await provider.unload()
     assert registry.command_handlers == {"other/route": keep}
