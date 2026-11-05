@@ -896,6 +896,7 @@ class AirPlayProvider(PlayerProvider):
         """Admit one target or clear exactly the expected target in the private profile."""
 
         def refused(reason: PrivateAdmissionReason) -> PrivateAdmissionResult:
+            """Return a secret-free refusal without attempting persistence."""
             return {
                 "version": 1,
                 "status": PrivateAdmissionStatus.REFUSED,

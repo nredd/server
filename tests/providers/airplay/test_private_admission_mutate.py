@@ -114,6 +114,19 @@ def request(mode: str = "admit") -> AdmissionRequest:
     return {"mode": mode, "player_id": PLAYER, "target": TARGET}
 
 
+async def _assert_refused_without_flush(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, value: Any
+) -> None:
+    """Require a refusal without raw mutation or persistence."""
+    cfg = admission.mass.config
+    before = deepcopy(cfg._data)
+    flush = AsyncMock()
+    monkeypatch.setattr(cfg, "async_save", flush)
+    assert (await admission.private_trial_admission_mutate(value))["status"] == "refused"
+    assert cfg._data == before
+    flush.assert_not_awaited()
+
+
 async def test_admit_and_clear_preserve_raw_neighbours(admission: AirPlayProvider) -> None:
     """Only the target leaf changes, including when clearing an active player."""
     cfg = admission.mass.config
@@ -161,13 +174,7 @@ async def test_invalid_refuses_without_flush(
     admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, invalid: Any
 ) -> None:
     """Reject malformed requests without writes or flushes."""
-    before = deepcopy(admission.mass.config._data)
-    flush = AsyncMock()
-    monkeypatch.setattr(admission.mass.config, "async_save", flush)
-    result = await admission.private_trial_admission_mutate(invalid)
-    assert result["status"] == "refused"
-    assert admission.mass.config._data == before
-    flush.assert_not_awaited()
+    await _assert_refused_without_flush(admission, monkeypatch, invalid)
 
 
 @pytest.mark.parametrize(
@@ -210,13 +217,7 @@ async def test_unsafe_state_refuses(
         del cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET]
     else:
         admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value = TARGET
-    before = deepcopy(cfg._data)
-    flush = AsyncMock()
-    monkeypatch.setattr(cfg, "async_save", flush)
-    result = await admission.private_trial_admission_mutate(request())
-    assert result["status"] == "refused"
-    assert cfg._data == before
-    flush.assert_not_awaited()
+    await _assert_refused_without_flush(admission, monkeypatch, request())
 
 
 @pytest.mark.parametrize(
@@ -271,12 +272,7 @@ async def test_additional_refusals(
         cfg._data["players"][PLAYER] = {"values": None}
     else:
         cfg._data["players"][PLAYER] = {"setup_data": None}
-    before = deepcopy(cfg._data)
-    flush = AsyncMock()
-    monkeypatch.setattr(cfg, "async_save", flush)
-    assert (await admission.private_trial_admission_mutate(request()))["status"] == "refused"
-    assert cfg._data == before
-    flush.assert_not_awaited()
+    await _assert_refused_without_flush(admission, monkeypatch, request())
 
 
 async def test_clear_mismatch_and_unavailable_refuse(
