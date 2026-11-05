@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,6 +158,7 @@ def test_unsupported_decorator_and_defaults(
         (provider, "CONF_CORE", "providers"),
         (provider, "CONF_PRIVATE_TRIAL_TARGET", "other"),
         (provider, "asyncio", object()),
+        (provider, "Scope", SimpleNamespace(SYSTEM_MANAGE=None)),
         (constants, "CONF_PRIVATE_NATIVE_VOLUME_CAPTURE", "wrong"),
     ],
 )
@@ -262,9 +264,7 @@ def test_flag_handler_decorator_and_defaults_are_rejected(
     assert decorated != source
     path.write_bytes(decorated)
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
-    defaulted = source.replace(
-        b"self, request: dict[str, Any]) ->", b"self, request: dict[str, Any] = {}) ->"
-    )
+    defaulted = source.replace(b"self, request: Any) ->", b"self, request: Any = None) ->")
     assert defaulted != source
     path.write_bytes(defaulted)
     assert evidence.server_code_evidence(provider)["status"] == "unverified"

@@ -12,6 +12,8 @@ from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
 from typing import TYPE_CHECKING
 
+from music_assistant_models.auth import Scope
+
 from music_assistant import constants as core_constants
 from music_assistant.helpers import private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
@@ -193,6 +195,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             return failure
         if (
             provider.asyncio is not asyncio
+            or provider.Scope is not Scope
             or provider.CONF_PROVIDERS != "providers"
             or provider.CONF_CORE != "core"
             or provider.CONF_PROVIDERS is not core_constants.CONF_PROVIDERS

@@ -875,7 +875,7 @@ class AirPlayProvider(PlayerProvider):
             "no_current_streams": all(player.stream is None for player in self.get_players()),
         }
 
-    async def private_airplay_flags(self, request: dict[str, Any]) -> dict[str, SerializableType]:
+    async def private_airplay_flags(self, request: Any) -> dict[str, SerializableType]:
         """
         Inspect, or compare-and-set, the supported flags in stored provider config.
 

@@ -487,6 +487,24 @@ async def test_malformed_requests_are_refused_without_writes(
     flush.assert_not_called()
 
 
+@pytest.mark.parametrize("raw_args", [{"request": "x"}, {"request": []}, {"request": None}, {}])
+async def test_parser_refuses_malformed_requests_without_writes(
+    harness: Harness, raw_args: dict[str, Any]
+) -> None:
+    """Malformed and missing requests pass through the parser to the closed refusal."""
+    before = deepcopy(harness.raw)
+    flush = _spy_flush(harness)
+    handler = APICommandHandler.parse(
+        "airplay/private_flags", harness.provider.private_airplay_flags
+    )
+    args = parse_arguments(handler.signature, handler.type_hints, raw_args)
+    result = await cast("Awaitable[dict[str, Any]]", handler.target(**args))
+    assert result["status"] == "refused"
+    assert result["reason"] == "invalid_request"
+    assert harness.raw == before
+    flush.assert_not_called()
+
+
 async def test_registered_handler_receives_the_request_object_intact(harness: Harness) -> None:
     """The real API parser passes the closed request through untouched."""
     handler = APICommandHandler.parse(
