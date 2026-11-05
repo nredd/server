@@ -1,4 +1,10 @@
-"""Offline checks for the watchdog's fail-closed readiness contract."""
+"""
+Offline checks for the watchdog's fail-closed readiness contract.
+
+References:
+- https://docs.python.org/3/library/os.html#os.posix_spawn
+- https://docs.python.org/3/library/selectors.html
+"""
 
 from __future__ import annotations
 

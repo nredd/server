@@ -1,10 +1,17 @@
-"""Offline regression for watchdog readiness on high-numbered owned pipe FDs."""
+"""
+Offline regression for watchdog readiness on high-numbered owned pipe FDs.
+
+References:
+- https://docs.python.org/3/library/os.html#os.posix_spawn
+- https://docs.python.org/3/library/fcntl.html
+"""
 
 from __future__ import annotations
 
 import fcntl
 import os
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -24,13 +31,19 @@ def test_real_child_acknowledges_and_stops_at_deadline(
     children: list[int] = []
     owned: list[int] = []
     result = tmp_path / "stop.txt"
-    child_code = (
-        "import sys,time; from pathlib import Path; "
-        "from scripts import private_tv_transport as t; "
-        "result=Path(sys.argv.pop(1)); "
-        "t.MusicAssistantApi=lambda *_: type('OfflineApi', (), "
-        "{'command': lambda self,*a: result.write_text(str(time.monotonic()))})(); "
-        "sys.exit(t.main(sys.argv[1:]))"
+    child_code = textwrap.dedent(
+        """
+        import sys
+        import time
+        from pathlib import Path
+        from scripts import private_tv_transport as transport
+
+        result = Path(sys.argv.pop(1))
+        transport.MusicAssistantApi = lambda *_: type(
+            "OfflineApi", (), {"command": lambda self, *args: result.write_text(str(time.monotonic()))}
+        )()
+        sys.exit(transport.main(sys.argv[1:]))
+        """
     )
 
     def high_pipe() -> tuple[int, int]:
