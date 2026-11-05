@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import ast
 import enum
 import hashlib
 import re
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 
+from music_assistant import mass as mass_module
+from music_assistant.controllers import players as players_package
+from music_assistant.controllers.players import controller as players_controller
 from music_assistant.helpers.private_trial import encode_public_digest
 from music_assistant.providers.airplay import (
     constants,
     control_player,
     player,
     provider,
+    sendspin_bridge,
     trial_binary,
 )
 from music_assistant.providers.airplay import (
@@ -27,9 +32,14 @@ _STR_ENUM: Any = enum.StrEnum
 _ENUM: Any = enum.Enum
 
 
+def _controller() -> players_controller.PlayerController:
+    """Construct an uninitialized real controller for binding checks."""
+    return players_controller.PlayerController.__new__(players_controller.PlayerController)
+
+
 def test_real_sources_and_raw_hash() -> None:
     """Evidence hashes the exact bytes of each selected source."""
-    result = evidence.server_code_evidence(provider)
+    result = evidence.server_code_evidence(provider, _controller())
     assert result["status"] == "verified"
     hashes = result["source_hashes"]
     assert isinstance(hashes, dict)
@@ -38,9 +48,69 @@ def test_real_sources_and_raw_hash() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("package", "Stale players package alias"),
+        ("mass", "Stale mass controller alias"),
+        ("instance", "Unexpected player controller instance"),
+        ("descriptor", "Shadowed unregister"),
+        ("unregister_globals", "Unexpected unregister globals"),
+        ("bridge_globals", "Unexpected bridge globals"),
+        ("cast", "Unexpected bridge cast"),
+        ("closure", "Unexpected bridge closure"),
+    ],
+)
+def test_runtime_binding_guard(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, message: str
+) -> None:
+    """Each runtime guard rejects its own mutation independently of the manifest."""
+    controller: Any = _controller()
+    evidence._check_runtime_bindings(controller)
+    cls = sendspin_bridge.SendspinBridgeManager
+    bridge = cls._lifecycle_allows_bridge
+    unregister = players_controller.PlayerController.unregister
+    if mutation == "package":
+        monkeypatch.setattr(players_package, "PlayerController", object)
+    elif mutation == "mass":
+        monkeypatch.setattr(mass_module, "PlayerController", object)
+    elif mutation == "instance":
+        controller = object()
+    elif mutation == "descriptor":
+        controller.unregister = lambda *_args: None
+    elif mutation == "unregister_globals":
+        replacement = FunctionType(unregister.__code__, dict(unregister.__globals__))
+        monkeypatch.setattr(players_controller.PlayerController, "unregister", replacement)
+    elif mutation == "bridge_globals":
+        replacement = FunctionType(
+            bridge.__code__, dict(bridge.__globals__), closure=bridge.__closure__
+        )
+        monkeypatch.setattr(cls, "_lifecycle_allows_bridge", replacement)
+    elif mutation == "cast":
+        monkeypatch.setattr(sendspin_bridge, "cast", lambda *_args: None)
+    else:
+
+        def capture(value: object) -> Any:
+            return lambda: value
+
+        cell = capture(object()).__closure__
+        replacement = FunctionType(bridge.__code__, bridge.__globals__, closure=cell)
+        monkeypatch.setattr(cls, "_lifecycle_allows_bridge", replacement)
+    with pytest.raises(ValueError, match=message):
+        evidence._check_runtime_bindings(controller)
+
+
+def test_unregister_defaults_require_singleton_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An equal but noncanonical default must not verify."""
+    monkeypatch.setattr(
+        players_controller.PlayerController.unregister, "__defaults__", (0, None, None)
+    )
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
 def test_wrong_provider_module() -> None:
     """A wrong module argument cannot produce verified evidence."""
-    assert evidence.server_code_evidence(control_player) == {
+    assert evidence.server_code_evidence(control_player, _controller()) == {
         "schema_version": 1,
         "status": "unverified",
     }
@@ -56,18 +126,21 @@ def test_stale_code_on_changed_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     path = tmp_path / "provider.py"
     path.write_bytes(changed)
     monkeypatch.setattr(provider, "__file__", str(path))
-    assert evidence.server_code_evidence(provider) == {"schema_version": 1, "status": "unverified"}
+    assert evidence.server_code_evidence(provider, _controller()) == {
+        "schema_version": 1,
+        "status": "unverified",
+    }
 
 
 def test_nonsemantic_raw_change_changes_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A comment changes the raw hash even when selected live code is unchanged."""
-    before = evidence.server_code_evidence(provider)
+    before = evidence.server_code_evidence(provider, _controller())
     path = tmp_path / "provider.py"
     path.write_bytes(Path(provider.__file__).read_bytes() + b"\n# extra\n")
     monkeypatch.setattr(provider, "__file__", str(path))
-    after = evidence.server_code_evidence(provider)
+    after = evidence.server_code_evidence(provider, _controller())
     assert after["status"] == "verified"
     before_hashes, after_hashes = before["source_hashes"], after["source_hashes"]
     assert isinstance(before_hashes, dict)
@@ -79,9 +152,9 @@ def test_missing_and_oversized_source(tmp_path: Path, monkeypatch: pytest.Monkey
     """Unavailable and oversized files fail closed."""
     path = tmp_path / "missing.py"
     monkeypatch.setattr(provider, "__file__", str(path))
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     path.write_bytes(b" " * (evidence._MAX_SOURCE_SIZE + 1))
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def test_property_and_binding_swaps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,16 +163,16 @@ def test_property_and_binding_swaps(monkeypatch: pytest.MonkeyPatch) -> None:
         patch.setattr(
             control_player.AirPlayControlPlayer, "_mrp_endpoint", property(lambda _: None)
         )
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     monkeypatch.setattr(provider, "AirPlayControlPlayer", object)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def test_stale_inherited_player_class(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reject a reloaded player class while the control class inherits the old one."""
     replacement = type("AirPlayPlayer", (player.AirPlayPlayer,), {})
     monkeypatch.setattr(player, "AirPlayPlayer", replacement)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def test_stale_mro_with_matching_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,7 +180,7 @@ def test_stale_mro_with_matching_aliases(monkeypatch: pytest.MonkeyPatch) -> Non
     replacement = type("AirPlayPlayer", (player.AirPlayPlayer,), {})
     monkeypatch.setattr(player, "AirPlayPlayer", replacement)
     monkeypatch.setattr(control_player, "AirPlayPlayer", replacement)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def test_shadowed_inherited_getter() -> None:
@@ -116,7 +189,7 @@ def test_shadowed_inherited_getter() -> None:
     assert "_is_airplay2_capable" not in vars(cls)
     type.__setattr__(cls, "_is_airplay2_capable", property(lambda _: False))
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         type.__delattr__(cls, "_is_airplay2_capable")
 
@@ -134,14 +207,14 @@ def test_unsupported_decorator_and_defaults(
     )
     assert decorated != source
     path.write_bytes(decorated)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     defaulted = source.replace(
         b"self, player_id: str\n    ) -> dict[str, SerializableType]:",
         b"self, player_id: str = ''\n    ) -> dict[str, SerializableType]:",
     )
     assert defaulted != source
     path.write_bytes(defaulted)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 @pytest.mark.parametrize(
@@ -173,7 +246,101 @@ def test_binding_inventory_swaps(
 ) -> None:
     """Selected imported aliases, credential constants and inventory fail closed."""
     monkeypatch.setattr(owner, name, replacement)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("module", "old", "new"),
+    [
+        (
+            provider,
+            b"if self.unloading or not self._admits_private_player(player_id):",
+            b"if False:",
+        ),
+        (
+            provider,
+            b"await self.mass.players.register(player)\n        if self.unloading or not self._admits_private_player(player_id):",
+            b"await self.mass.players.register(player)\n        if False:",
+        ),
+        (
+            provider,
+            b"await self.mass.players.unregister(player_id, expected_player=player)",
+            b"await self.mass.players.unregister(player_id)",
+        ),
+        (
+            players_controller,
+            b"if expected_player is not None and self._players.get(player_id) is not player:",
+            b"if False:",
+        ),
+        (
+            sendspin_bridge,
+            b"and provider._admits_private_player(player.player_id)",
+            b"and True",
+        ),
+        (
+            player,
+            b"if prov.unloading or not prov._admits_private_player(self.player_id):",
+            b"if False:",
+        ),
+        (
+            control_player,
+            b"if provider.unloading or not provider._admits_private_player(self.player_id):",
+            b"if False:",
+        ),
+    ],
+)
+def test_registration_guard_source_mutation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleType, old: bytes, new: bytes
+) -> None:
+    """Changed registration guards on disk cannot attest the loaded code."""
+    assert module.__file__ is not None
+    source = Path(module.__file__).read_bytes()
+    assert old in source
+    path = tmp_path / "changed.py"
+    path.write_bytes(source.replace(old, new, 1))
+    monkeypatch.setattr(module, "__file__", str(path))
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("module", "owner", "name", "old", "new", "defaults"),
+    [
+        (
+            players_controller,
+            players_controller.PlayerController,
+            "unregister",
+            b"if expected_player is not None and self._players.get(player_id) is not player:",
+            b"if False:",
+            (False, None, None),
+        ),
+        (
+            sendspin_bridge,
+            sendspin_bridge.SendspinBridgeManager,
+            "_lifecycle_allows_bridge",
+            b"and provider._admits_private_player(player.player_id)",
+            b"and True",
+            (),
+        ),
+    ],
+)
+def test_selected_source_guard_in_isolation(
+    module: ModuleType,
+    owner: type,
+    name: str,
+    old: bytes,
+    new: bytes,
+    defaults: tuple[object, ...],
+) -> None:
+    """A guard mutation fails its selected callable check without any manifest check."""
+    assert module.__file__ is not None
+    source = Path(module.__file__).read_bytes()
+    assert source.count(old) == 1
+    compiled = evidence._codes(compile(source, str(module.__file__), "exec"))
+    evidence._check_function(compiled, ast.parse(source), owner, name, defaults=defaults)
+    changed = source.replace(old, new)
+    compiled = evidence._codes(compile(changed, str(module.__file__), "exec"))
+    with pytest.raises(ValueError, match="Code mismatch"):
+        evidence._check_function(compiled, ast.parse(changed), owner, name, defaults=defaults)
 
 
 def test_stale_control_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,7 +351,7 @@ def test_stale_control_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     path = tmp_path / "control_player.py"
     path.write_bytes(changed)
     monkeypatch.setattr(control_player, "__file__", str(path))
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def test_nested_filename_normalization() -> None:
@@ -214,16 +381,16 @@ _FLAG_FUNCTIONS = (
 @pytest.mark.parametrize("name", _FLAG_METHODS)
 def test_swapped_flag_method_fails_closed(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """A live flag handler or guard that differs from its source is never verified."""
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
     monkeypatch.setattr(provider.AirPlayProvider, name, lambda *_args: None)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 @pytest.mark.parametrize("name", _FLAG_FUNCTIONS)
 def test_swapped_flag_function_fails_closed(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """A live module level flag helper that differs from its source is never verified."""
     monkeypatch.setattr(provider, name, lambda *_args: None)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 @pytest.mark.parametrize(
@@ -253,7 +420,10 @@ def test_changed_flag_source_on_disk_rejects_live_code(
     path = tmp_path / "provider.py"
     path.write_bytes(source.replace(old, new, 1))
     monkeypatch.setattr(provider, "__file__", str(path))
-    assert evidence.server_code_evidence(provider) == {"schema_version": 1, "status": "unverified"}
+    assert evidence.server_code_evidence(provider, _controller()) == {
+        "schema_version": 1,
+        "status": "unverified",
+    }
 
 
 def test_flag_handler_decorator_and_defaults_are_rejected(
@@ -269,11 +439,11 @@ def test_flag_handler_decorator_and_defaults_are_rejected(
     )
     assert decorated != source
     path.write_bytes(decorated)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     defaulted = source.replace(b"self, request: Any) ->", b"self, request: Any = None) ->")
     assert defaulted != source
     path.write_bytes(defaulted)
-    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
 def _constants_on_disk(
@@ -311,9 +481,12 @@ def test_changed_enum_declaration_on_disk_is_unverified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: bytes, new: bytes
 ) -> None:
     """A source enum declaration that differs from the live enum is never verified."""
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
     _constants_on_disk(tmp_path, monkeypatch, old, new)
-    assert evidence.server_code_evidence(provider) == {"schema_version": 1, "status": "unverified"}
+    assert evidence.server_code_evidence(provider, _controller()) == {
+        "schema_version": 1,
+        "status": "unverified",
+    }
 
 
 def test_live_enum_substitutions_are_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,22 +496,22 @@ def test_live_enum_substitutions_are_unverified(monkeypatch: pytest.MonkeyPatch)
     other.__module__ = constants.__name__
     with monkeypatch.context() as patch:
         patch.setattr(provider, "PrivateFlagReason", other)
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     renamed = _STR_ENUM("PrivateFlagReason", {**{m.name: m.value for m in cls}, "X": "x"})
     renamed.__module__ = constants.__name__
     with monkeypatch.context() as patch:
         patch.setattr(constants, "PrivateFlagReason", renamed)
         patch.setattr(provider, "PrivateFlagReason", renamed)
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     plain = _ENUM("PrivateFlagReason", {m.name: m.value for m in cls}, type=str)
     with monkeypatch.context() as patch:
         patch.setattr(constants, "PrivateFlagReason", plain)
         patch.setattr(provider, "PrivateFlagReason", plain)
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     with monkeypatch.context() as patch:
         patch.setattr(constants, "StrEnum", enum.Enum)
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
 
 
 def test_live_enum_method_injection_is_unverified() -> None:
@@ -346,10 +519,10 @@ def test_live_enum_method_injection_is_unverified() -> None:
     cls = constants.PrivateFlagState
     type.__setattr__(cls, "__str__", lambda _self: "x")
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         type.__setattr__(cls, "__str__", enum.StrEnum.__str__)
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
 
 
 @pytest.mark.parametrize("attribute", ["_value2member_map_", "_member_names_", "TRUE"])
@@ -365,10 +538,10 @@ def test_live_enum_lookup_corruption_is_unverified(attribute: str) -> None:
         replacement = cls.FALSE
     type.__setattr__(cls, attribute, replacement)
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         type.__setattr__(cls, attribute, original)
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
 
 
 def test_live_enum_member_name_corruption_is_unverified() -> None:
@@ -376,10 +549,10 @@ def test_live_enum_member_name_corruption_is_unverified() -> None:
     member = constants.PrivateFlagState.TRUE
     member._name_ = "X"
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         member._name_ = "TRUE"
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
 
 
 def test_live_enum_hashable_values_corruption_is_unverified() -> None:
@@ -388,10 +561,10 @@ def test_live_enum_hashable_values_corruption_is_unverified() -> None:
     original = vars(cls)["_hashable_values_"]
     type.__setattr__(cls, "_hashable_values_", [*original, "extra"])
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         type.__setattr__(cls, "_hashable_values_", original)
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
 
 
 def test_live_enum_name_corruption_is_unverified() -> None:
@@ -399,7 +572,7 @@ def test_live_enum_name_corruption_is_unverified() -> None:
     cls = constants.PrivateFlagState
     type.__setattr__(cls, "__name__", "Other")
     try:
-        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+        assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     finally:
         type.__setattr__(cls, "__name__", "PrivateFlagState")
-    assert evidence.server_code_evidence(provider)["status"] == "verified"
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"

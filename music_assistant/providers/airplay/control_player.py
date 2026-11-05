@@ -7,7 +7,7 @@ import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from ipaddress import AddressValueError, IPv4Address
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import pyatv
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
@@ -483,6 +483,9 @@ class AirPlayControlPlayer(AirPlayPlayer):
     async def on_config_updated(self) -> None:
         """Reconnect control services when player configuration changes."""
         await super().on_config_updated()
+        provider = cast("AirPlayProvider", self.provider)
+        if provider.unloading or not provider._admits_private_player(self.player_id):
+            return
         self._schedule_connection(force=True)
 
     async def on_unload(self) -> None:

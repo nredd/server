@@ -14,6 +14,7 @@ import pytest
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import PlaybackState
 
+from music_assistant.controllers.players import PlayerController
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.mass import MusicAssistant
@@ -101,7 +102,8 @@ async def test_readiness_reports_verified_real_server_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Real readiness wiring reports verified evidence on the private profile."""
-    provider, _ = _provider()
+    provider, mass = _provider()
+    mass.players = PlayerController.__new__(PlayerController)
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(provider, "get_players", list)
@@ -121,6 +123,8 @@ async def test_readiness_reports_verified_real_server_code(
         "trial_binary",
         "private_trial",
         "server_code_evidence",
+        "players_controller",
+        "sendspin_bridge",
     }
 
 

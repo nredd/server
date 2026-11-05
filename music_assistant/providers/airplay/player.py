@@ -1061,6 +1061,10 @@ class AirPlayPlayer(Player):
         """Handle logic when the player config is updated."""
         await super().on_config_updated()
         prov = cast("AirPlayProvider", self.provider)
+        if prov.unloading or not prov._admits_private_player(self.player_id):
+            return
+        if trial_binary.is_trial_target() and not self.initialized.is_set():
+            return
         await prov.bridge_manager.evaluate_bridge(self)
 
     async def on_unload(self) -> None:

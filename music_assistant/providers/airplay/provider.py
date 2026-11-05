@@ -734,7 +734,9 @@ class AirPlayProvider(PlayerProvider):
             msg = "Private native-volume capture is unavailable outside the trial target"
             raise RuntimeError(msg)
         provenance = await asyncio.to_thread(installer_provenance)
-        code_evidence = await asyncio.to_thread(server_code_evidence, sys.modules[__name__])
+        code_evidence = await asyncio.to_thread(
+            server_code_evidence, sys.modules[__name__], self.mass.players
+        )
         daemon, ptp_event = self._ptp_daemon, self._ptp_daemon_ready
         streams = [
             (
@@ -1111,11 +1113,8 @@ class AirPlayProvider(PlayerProvider):
                 RAOP_DISCOVERY_TYPE, display_name, timeout=10.0
             )
 
-        if airplay_discovery_info:
-            model_discovery_info = airplay_discovery_info
-        elif raop_discovery_info:
-            model_discovery_info = raop_discovery_info
-        else:
+        model_discovery_info = airplay_discovery_info or raop_discovery_info
+        if not model_discovery_info:
             return  # should not happen, but guard just in case
         manufacturer, model = get_model_info(model_discovery_info)
 
@@ -1123,9 +1122,6 @@ class AirPlayProvider(PlayerProvider):
         address = get_primary_ip_address_from_zeroconf(discovery_info, prefer_ipv6=prefer_ipv6)
         if not address:
             return  # should not happen, but guard just in case
-
-        # if we reach this point, all preflights are ok and we can create the player
-        self.logger.debug("Discovered AirPlay device %s on %s", display_name, address)
 
         # Get stored volume from playerconfig
         volume = int(
@@ -1141,13 +1137,6 @@ class AirPlayProvider(PlayerProvider):
                 "Player %s already registered during setup, skipping registration", player_id
             )
             return
-
-        self.logger.debug(
-            "Setting up player %s: manufacturer=%s, model=%s",
-            display_name,
-            manufacturer,
-            model,
-        )
 
         player_addresses = self._get_discovery_addresses(
             airplay_discovery_info,
@@ -1180,6 +1169,9 @@ class AirPlayProvider(PlayerProvider):
                 ),
             )
 
+        if self.unloading or not self._admits_private_player(player_id):
+            return
+
         player: AirPlayPlayer
         if enhanced_control:
             player = AirPlayControlPlayer(
@@ -1208,6 +1200,9 @@ class AirPlayProvider(PlayerProvider):
                 initial_volume=volume,
             )
         await self.mass.players.register(player)
+        if self.unloading or not self._admits_private_player(player_id):
+            await self.mass.players.unregister(player_id, expected_player=player)
+            return
 
         # A receiver only publishes its audio formats (and so whether it can do
         # 24-bit) in its /info response, never in its mDNS records, so ask it
@@ -1220,6 +1215,9 @@ class AirPlayProvider(PlayerProvider):
 
         # Set up Sendspin bridge for protocol linking (if Sendspin provider is available)
         await self._bridge_manager.evaluate_bridge(player)
+        if self.unloading or not self._admits_private_player(player_id):
+            await self.mass.players.unregister(player_id, expected_player=player)
+            return
 
         # Track control players (Apple TVs) for dashboard eligibility
         if isinstance(player, AirPlayControlPlayer):

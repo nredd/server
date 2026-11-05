@@ -20,7 +20,12 @@ stored credentials.
 
 This permits a discovery-only proof, not default-output, active Music, or playback
 acceptance. It is a snapshot, so the caller must keep the target unset and prevent
-concurrent config changes until it enables discovery.
+concurrent config changes until it enables discovery. Preflight is read-only and does not
+flush config or prove disk durability. Registration can create a default player config
+record which remains after unregister. Admission and provider unload are rechecked before
+player construction and after registration; stale cleanup removes only that exact player.
+Clearing the core target can omit its default raw key, so a subsequent preflight may fail
+closed until startup writes the explicit empty value again.
 
 ## Guarded flag compare-and-set
 
@@ -202,10 +207,14 @@ Readiness schema version `1` has exactly these top-level fields:
   finite provenance/asset/child receipt schemas, with only `ptp` and `stream` roles.
 - `server_code_evidence`: version 1, either exactly `schema_version` and `status: unverified`, or
   `schema_version`, `status: verified` and `source_hashes`. The latter has exactly `provider`,
-  `control_player`, `player`, `helpers`, `constants`, `trial_binary`, `private_trial` and
-  `server_code_evidence`, each encoded as `u32be-v1` with eight SHA-256 words. Compare every hash
-  with an externally generated manifest for the final reviewed commit. This is approved source
-  hashes plus selected live-code and binding checks, not loaded-commit proof. Source reads and
+  `control_player`, `player`, `helpers`, `constants`, `trial_binary`, `private_trial`,
+  `server_code_evidence`, `players_controller` and `sendspin_bridge`, each encoded as
+  `u32be-v1` with eight SHA-256 words. Clients expecting the earlier eight-source inventory
+  must fail closed until independently updated and reviewed. Compare every hash
+  with an externally generated manifest for the final reviewed commit. The selected checks bind
+  the provider's actual player controller and its consumer aliases, plus the bridge admission
+  guard's live globals and class closure. This is approved source hashes plus selected live-code
+  and binding checks, not loaded-commit proof. Source reads and
   compilation are bounded and read-only; unsupported descriptors, mismatched code or bindings,
   including the control class's inherited AirPlay capability getter, unreadable or oversized
   files fail closed. This does not check all runtime globals and does not

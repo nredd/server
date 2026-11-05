@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from music_assistant.mass import MusicAssistant
 from music_assistant.providers.airplay import provider as provider_module
 from music_assistant.providers.airplay.provider import AirPlayProvider
 
@@ -76,6 +77,22 @@ async def test_malformed_snapshot_fails_closed(raw: object) -> None:
     assert (await provider.get_private_trial_admission_preflight(PLAYER_ID))[
         "config_state"
     ] == "unsafe"
+
+
+@pytest.mark.parametrize("present", [False, True])
+async def test_real_config_none_and_missing_are_unsafe(
+    mass_minimal: MusicAssistant, present: bool
+) -> None:
+    """The real config controller collapses missing and null to the same default."""
+    provider = AirPlayProvider.__new__(AirPlayProvider)
+    provider.mass = mass_minimal
+    provider.__dict__["get_players"] = MagicMock(return_value=[])
+    mass_minimal.discovery.config = MagicMock()
+    mass_minimal.discovery.config.values = {}
+    if present:
+        mass_minimal.config.set("players", None)
+    result = await provider.get_private_trial_admission_preflight(PLAYER_ID)
+    assert result["config_state"] == "unsafe"
 
 
 @pytest.mark.parametrize("setup", [{"unknown": None}, {"native_mrp_credentials": "secret"}])

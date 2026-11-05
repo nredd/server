@@ -1246,6 +1246,7 @@ async def test_provider_selects_player_model_from_device_identity(
 ) -> None:
     """The player model follows the device identity, not discovered capabilities."""
     provider = AirPlayProvider.__new__(AirPlayProvider)
+    provider.unloading = False
     provider.mass = MagicMock()
     provider.logger = logging.getLogger("test.airplay.provider")
     provider.config = MagicMock()
@@ -1290,6 +1291,7 @@ async def test_provider_selects_player_model_from_device_identity(
 async def test_apple_device_setup_attaches_discovered_companion_service() -> None:
     """An Apple device picks up its Companion service discovered by name."""
     provider = AirPlayProvider.__new__(AirPlayProvider)
+    provider.unloading = False
     provider.mass = MagicMock()
     provider.logger = logging.getLogger("test.airplay.provider")
     provider.config = MagicMock()
@@ -1461,6 +1463,7 @@ async def test_late_companion_discovery_never_changes_player_model() -> None:
 async def test_generic_device_setup_skips_control_discovery() -> None:
     """A non-Apple receiver registers without Companion/MRP service lookups."""
     provider = AirPlayProvider.__new__(AirPlayProvider)
+    provider.unloading = False
     provider.mass = MagicMock()
     provider.logger = logging.getLogger("test.airplay.provider")
     provider.config = MagicMock()
