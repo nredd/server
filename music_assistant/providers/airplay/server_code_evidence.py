@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import inspect
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
 from typing import TYPE_CHECKING
 
+from music_assistant import constants as core_constants
 from music_assistant.helpers import private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 
@@ -59,8 +61,19 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             "get_private_trial_admission_preflight",
             "_setup_player",
             "_admits_private_player",
+            "private_airplay_flags",
+            "_private_flag_snapshot",
+            "_private_target_unset",
+            "_register_private_capture_api",
         ):
             _check_function(codes["provider"], trees["provider"], provider.AirPlayProvider, name)
+        for name in (
+            "_private_flag_states",
+            "_private_flag_map",
+            "_private_flag_request",
+            "_private_flag_response",
+        ):
+            _check_function(codes["provider"], trees["provider"], provider, name)
         for name in ("_connect_mrp",):
             _check_function(
                 codes["control_player"],
@@ -175,6 +188,34 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             type(provider._PRIVATE_PLAYER_ID) is not re.Pattern
             or provider._PRIVATE_PLAYER_ID.pattern != r"ap[0-9a-f]{12}"
             or provider._PRIVATE_PLAYER_ID.flags != re.UNICODE
+        ):
+            return failure
+        if (
+            provider.asyncio is not asyncio
+            or provider.CONF_PROVIDERS != "providers"
+            or provider.CONF_CORE != "core"
+            or provider.CONF_PROVIDERS is not core_constants.CONF_PROVIDERS
+            or provider.CONF_CORE is not core_constants.CONF_CORE
+            or provider.CONF_PRIVATE_TRIAL_TARGET != private_trial.CONF_PRIVATE_TRIAL_TARGET
+            or tuple(
+                getattr(constants, name)
+                for name in (
+                    "CONF_EXPERIMENTAL_HOMEPOD_REMOTE",
+                    "CONF_EXPERIMENTAL_SESSION_VOLUME",
+                    "CONF_PRIVATE_NATIVE_VOLUME_CAPTURE",
+                )
+            )
+            != provider._PRIVATE_FLAG_KEYS
+            or provider._PRIVATE_FLAG_KEYS
+            != (
+                "experimental_homepod_remote",
+                "experimental_session_volume",
+                "private_native_volume_capture",
+            )
+            or provider._PRIVATE_FLAG_STATES != ("absent", "true", "false")
+            or type(provider._PRIVATE_INSTANCE_ID) is not re.Pattern
+            or provider._PRIVATE_INSTANCE_ID.pattern != r"[A-Za-z0-9_-]{1,128}"
+            or provider._PRIVATE_INSTANCE_ID.flags != re.UNICODE
         ):
             return failure
         return {"schema_version": 1, "status": "verified", "source_hashes": hashes}

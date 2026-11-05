@@ -31,6 +31,8 @@ from music_assistant.providers.airplay.stream import AirPlayStream, PrivateCaptu
 
 _COMMAND = "airplay/private_native_volume_capture/get"
 _READINESS_COMMAND = "airplay/private_native_volume_capture/readiness/get"
+_ADMISSION_COMMAND = "airplay/private_trial_admission/preflight"
+_FLAGS_COMMAND = "airplay/private_flags"
 
 
 def _provider() -> tuple[AirPlayProvider, MagicMock]:
@@ -44,7 +46,19 @@ def _provider() -> tuple[AirPlayProvider, MagicMock]:
     provider._trial_identity = {}
     provider._unregister_private_capture_api = None
     provider._unregister_private_capture_readiness_api = None
+    provider._unregister_private_flags_api = None
     return provider, mass
+
+
+def _stub_unload_state(provider: AirPlayProvider) -> None:
+    """Give a bare provider the idle state `unload` reads after the route release."""
+    provider.__dict__.update(
+        dashboards=None,
+        _bridge_manager=None,
+        _ptp_daemon_stdout_task=None,
+        _dacp_server=None,
+        _dacp_info=None,
+    )
 
 
 def _child() -> trial_binary.TrialAsyncProcess:
@@ -118,10 +132,12 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     unregister_capture = MagicMock()
     unregister_readiness = MagicMock()
     unregister_admission = MagicMock()
+    unregister_flags = MagicMock()
     mass.register_api_command.side_effect = (
         unregister_capture,
         unregister_readiness,
         unregister_admission,
+        unregister_flags,
     )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
@@ -143,7 +159,12 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
             ),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
+        (
+            (_FLAGS_COMMAND, provider.private_airplay_flags),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
     ]
+    assert provider._unregister_private_flags_api is unregister_flags
     assert provider._unregister_private_admission_api is unregister_admission
     assert provider._unregister_private_capture_api is unregister_capture
     assert provider._unregister_private_capture_readiness_api is unregister_readiness
@@ -677,3 +698,51 @@ async def test_unload_unregisters_private_route(monkeypatch: pytest.MonkeyPatch)
     unregister.assert_called_once_with()
     unregister_readiness.assert_called_once_with()
     assert provider._unregister_private_capture_api is None
+
+
+@pytest.mark.parametrize(
+    "collision", [_COMMAND, _READINESS_COMMAND, _ADMISSION_COMMAND, _FLAGS_COMMAND]
+)
+async def test_every_route_collision_retains_only_the_incumbent(
+    monkeypatch: pytest.MonkeyPatch, collision: str
+) -> None:
+    """A collision on any private route releases every route this provider claimed."""
+    provider, mass = _provider()
+    registry = MusicAssistant.__new__(MusicAssistant)
+    registry.command_handlers = {}
+    registry.register_api_command(collision, provider.get_private_native_volume_capture)
+    incumbent = registry.command_handlers[collision]
+    mass.register_api_command.side_effect = registry.register_api_command
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
+
+    with pytest.raises(RuntimeError, match="already registered"):
+        provider._register_private_capture_api()
+
+    assert registry.command_handlers == {collision: incumbent}
+    for name in (
+        "_unregister_private_capture_api",
+        "_unregister_private_capture_readiness_api",
+        "_unregister_private_admission_api",
+        "_unregister_private_flags_api",
+    ):
+        assert getattr(provider, name) is None
+    _stub_unload_state(provider)
+    await provider.unload()
+    assert registry.command_handlers == {collision: incumbent}
+
+
+async def test_unload_releases_all_four_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unload unregisters the flag route together with the other private routes."""
+    provider, mass = _provider()
+    registry = MusicAssistant.__new__(MusicAssistant)
+    registry.command_handlers = {}
+    other = registry.register_api_command("other/route", provider.get_private_native_volume_capture)
+    del other
+    keep = registry.command_handlers["other/route"]
+    mass.register_api_command.side_effect = registry.register_api_command
+    monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
+    provider._register_private_capture_api()
+    assert len(registry.command_handlers) == 5
+    _stub_unload_state(provider)
+    await provider.unload()
+    assert registry.command_handlers == {"other/route": keep}
