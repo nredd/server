@@ -15,6 +15,7 @@ import pytest
 from music_assistant import mass as mass_module
 from music_assistant.controllers import players as players_package
 from music_assistant.controllers.players import controller as players_controller
+from music_assistant.helpers import private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 from music_assistant.providers.airplay import (
     constants,
@@ -209,8 +210,8 @@ def test_unsupported_decorator_and_defaults(
     path.write_bytes(decorated)
     assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     defaulted = source.replace(
-        b"self, player_id: str\n    ) -> dict[str, SerializableType]:",
-        b"self, player_id: str = ''\n    ) -> dict[str, SerializableType]:",
+        b"self, player_id: str\n    ) -> PrivateAdmissionSnapshot:",
+        b"self, player_id: str = ''\n    ) -> PrivateAdmissionSnapshot:",
     )
     assert defaulted != source
     path.write_bytes(defaulted)
@@ -426,6 +427,78 @@ def test_changed_flag_source_on_disk_rejects_live_code(
     }
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'not _PRIVATE_PLAYER_ID.fullmatch(request["player_id"])', b"False"),
+        (b'target.player_id != request["player_id"]', b"False"),
+        (b"self.config.enabled is not True", b"False"),
+        (b"values[CONF_PRIVATE_TRIAL_TARGET] != expected or entry.value != expected", b"False"),
+        (b"any(self.config.get_value(key) is not False for key in _PRIVATE_FLAG_KEYS)", b"False"),
+        (b"or self.get_players()\n", b"or False\n"),
+        (b"current_values.get(CONF_PRIVATE_TRIAL_TARGET) != desired", b"False"),
+        (b"current_entry.value != desired", b"False"),
+        (
+            b'any(player.player_id != request["player_id"] for player in self.get_players())',
+            b"False",
+        ),
+    ],
+)
+def test_admission_guard_removal_fails_function_guard(old: bytes, new: bytes) -> None:
+    """Each changed admission guard is rejected by callable verification itself."""
+    source = Path(provider.__file__).read_bytes()
+    assert source.count(old) == 1
+    changed = source.replace(old, new)
+    tree = ast.parse(changed)
+    codes = evidence._codes(compile(changed, "provider.py", "exec"))
+    with pytest.raises(ValueError, match="Code mismatch"):
+        evidence._check_function(
+            codes, tree, provider.AirPlayProvider, "private_trial_admission_mutate"
+        )
+
+
+@pytest.mark.parametrize("name", ["private_trial_admission_mutate", "_private_admission_snapshot"])
+def test_admission_globals_guard_rejects_cloned_globals(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Selected admission callables must retain the provider's actual globals."""
+    function = getattr(provider.AirPlayProvider, name)
+    clone = FunctionType(function.__code__, dict(function.__globals__))
+    with pytest.raises(ValueError, match="Unexpected function globals"):
+        evidence._check_globals(clone, provider)
+    monkeypatch.setattr(provider.AirPlayProvider, name, clone)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+def test_parser_globals_guard_rejects_cloned_globals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The canonical parser may not execute against copied globals."""
+    module = private_trial
+    function = module.parse_trial_target
+    clone = FunctionType(function.__code__, dict(function.__globals__))
+    with pytest.raises(ValueError, match="Unexpected function globals"):
+        evidence._check_globals(clone, module)
+    monkeypatch.setattr(module, "parse_trial_target", clone)
+    monkeypatch.setattr(provider, "parse_trial_target", clone)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+@pytest.mark.parametrize("binding", ["parser", "entry", "players", "mac"])
+def test_admission_live_bindings_reject_substitution(
+    monkeypatch: pytest.MonkeyPatch, binding: str
+) -> None:
+    """Each admission dependency is checked against its canonical live binding."""
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
+    if binding == "parser":
+        monkeypatch.setattr(provider, "parse_trial_target", lambda _value: None)
+    elif binding == "entry":
+        monkeypatch.setattr(provider, "ConfigEntry", object)
+    elif binding == "players":
+        monkeypatch.setattr(provider, "CONF_PLAYERS", "not_players")
+    else:
+        monkeypatch.setattr(private_trial, "_MAC", re.compile("[0-9a-f]+"))
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
 def test_flag_handler_decorator_and_defaults_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -461,6 +534,7 @@ def _constants_on_disk(
     ("old", "new"),
     [
         (b'STATE_MISMATCH = "state_mismatch"', b'STATE_MISMATCH = "state_mismatcX"'),
+        (b'TARGET_MISMATCH = "target_mismatch"', b'TARGET_MISMATCH = "target_mismatcX"'),
         (b'    TRUE = "true"\n', b'    TRUE = "yes"\n'),
         (b'    NEXT_LOAD = "next_load"\n', b'    NEXT_LOAD = "next_load"\n    EXTRA = "extra"\n'),
         (b'    FALSE = "false"\n', b'    FALSE = "false"\n    OTHER = "false"\n'),

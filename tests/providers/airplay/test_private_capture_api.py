@@ -34,6 +34,7 @@ _COMMAND = "airplay/private_native_volume_capture/get"
 _READINESS_COMMAND = "airplay/private_native_volume_capture/readiness/get"
 _ADMISSION_COMMAND = "airplay/private_trial_admission/preflight"
 _FLAGS_COMMAND = "airplay/private_flags"
+_MUTATE_COMMAND = "airplay/private_trial_admission/mutate"
 
 
 def _provider() -> tuple[AirPlayProvider, MagicMock]:
@@ -137,11 +138,13 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     unregister_readiness = MagicMock()
     unregister_admission = MagicMock()
     unregister_flags = MagicMock()
+    unregister_mutate = MagicMock()
     mass.register_api_command.side_effect = (
         unregister_capture,
         unregister_readiness,
         unregister_admission,
         unregister_flags,
+        unregister_mutate,
     )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
@@ -167,7 +170,12 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
             (_FLAGS_COMMAND, provider.private_airplay_flags),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
+        (
+            (_MUTATE_COMMAND, provider.private_trial_admission_mutate),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
     ]
+    assert provider._unregister_private_admission_mutate_api is unregister_mutate
     assert provider._unregister_private_flags_api is unregister_flags
     assert provider._unregister_private_admission_api is unregister_admission
     assert provider._unregister_private_capture_api is unregister_capture
@@ -705,7 +713,7 @@ async def test_unload_unregisters_private_route(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.parametrize(
-    "collision", [_COMMAND, _READINESS_COMMAND, _ADMISSION_COMMAND, _FLAGS_COMMAND]
+    "collision", [_COMMAND, _READINESS_COMMAND, _ADMISSION_COMMAND, _FLAGS_COMMAND, _MUTATE_COMMAND]
 )
 async def test_every_route_collision_retains_only_the_incumbent(
     monkeypatch: pytest.MonkeyPatch, collision: str
@@ -728,6 +736,7 @@ async def test_every_route_collision_retains_only_the_incumbent(
         "_unregister_private_capture_readiness_api",
         "_unregister_private_admission_api",
         "_unregister_private_flags_api",
+        "_unregister_private_admission_mutate_api",
     ):
         assert getattr(provider, name) is None
     _stub_unload_state(provider)
@@ -735,7 +744,7 @@ async def test_every_route_collision_retains_only_the_incumbent(
     assert registry.command_handlers == {collision: incumbent}
 
 
-async def test_unload_releases_all_four_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unload_releases_all_five_routes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unload unregisters the flag route together with the other private routes."""
     provider, mass = _provider()
     registry = MusicAssistant.__new__(MusicAssistant)
@@ -751,6 +760,7 @@ async def test_unload_releases_all_four_routes(monkeypatch: pytest.MonkeyPatch) 
         _READINESS_COMMAND,
         _ADMISSION_COMMAND,
         _FLAGS_COMMAND,
+        _MUTATE_COMMAND,
     }
     _stub_unload_state(provider)
     await provider.unload()

@@ -36,6 +36,39 @@ class AirPlayRemoteCommand(StrEnum):
     PREVIOUS = "previous"
 
 
+class PrivateAdmissionConfigState(StrEnum):
+    """Safety state of the stored private player configuration."""
+
+    UNSAFE = "unsafe"
+    ABSENT = "absent"
+    PRESENT = "present"
+
+
+class PrivateAdmissionMode(StrEnum):
+    """Request mode of the private admission API."""
+
+    ADMIT = "admit"
+    CLEAR = "clear"
+
+
+class PrivateAdmissionStatus(StrEnum):
+    """Outcome of a private admission request."""
+
+    APPLIED = "applied"
+    REFUSED = "refused"
+
+
+class PrivateAdmissionReason(StrEnum):
+    """Fixed reason a private admission request was refused."""
+
+    INVALID_REQUEST = "invalid_request"
+    PROFILE_INACTIVE = "profile_inactive"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    UNSAFE_CONFIG = "unsafe_config"
+    TARGET_MISMATCH = "target_mismatch"
+    UNSAFE_STATE = "unsafe_state"
+
+
 class PrivateFlagState(StrEnum):
     """Stored state of one private flag."""
 

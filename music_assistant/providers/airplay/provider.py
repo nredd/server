@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 from ipaddress import IPv4Address, IPv6Address, ip_address
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
@@ -47,6 +47,7 @@ from music_assistant.helpers.private_trial import (
     encode_public_digest,
     installer_provenance,
     is_trial_target,
+    parse_trial_target,
     private_child_env,
 )
 from music_assistant.helpers.process import AsyncProcess
@@ -90,6 +91,10 @@ from .constants import (
     STREAMING_MODE_AP2_COMPAT,
     STREAMING_MODE_AUTO,
     AirPlayRemoteCommand,
+    PrivateAdmissionConfigState,
+    PrivateAdmissionMode,
+    PrivateAdmissionReason,
+    PrivateAdmissionStatus,
     PrivateFlagEffect,
     PrivateFlagMemory,
     PrivateFlagMode,
@@ -158,6 +163,28 @@ _PRIVATE_FLAG_KEYS: Final = (
 )
 _PRIVATE_FLAG_STATES: Final = tuple(PrivateFlagState)
 _PRIVATE_INSTANCE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+class PrivateAdmissionSnapshot(TypedDict):
+    """Secret-free preflight facts."""
+
+    version: int
+    config_state: PrivateAdmissionConfigState
+    setup_data_empty: bool
+    credentials_absent: bool
+    default_volume_bounds: bool
+    target_unset: bool
+    no_current_streams: bool
+
+
+class PrivateAdmissionResult(TypedDict):
+    """Closed mutation disposition."""
+
+    version: int
+    status: PrivateAdmissionStatus
+    reason: PrivateAdmissionReason | None
+    memory: PrivateFlagMemory
+    persistence: PrivateFlagPersistence
 
 
 def _private_flag_states(values: object) -> dict[str, PrivateFlagState] | None:
@@ -355,6 +382,7 @@ class AirPlayProvider(PlayerProvider):
     _ptp_daemon_warns_in_window: int = 0
     _ptp_daemon_warns_suppressed: int = 0
     _unregister_private_admission_api: Callable[[], None] | None = None
+    _unregister_private_admission_mutate_api: Callable[[], None] | None = None
     _unregister_private_capture_api: Callable[[], None] | None = None
     _unregister_private_capture_readiness_api: Callable[[], None] | None = None
     _unregister_private_flags_api: Callable[[], None] | None = None
@@ -524,6 +552,7 @@ class AirPlayProvider(PlayerProvider):
         self._unregister_private_capture_api = None
         self._unregister_private_capture_readiness_api = None
         self._unregister_private_flags_api = None
+        self._unregister_private_admission_mutate_api = None
 
         # Initialize Sendspin bridge manager for protocol linking
         self._bridge_manager = SendspinBridgeManager(self)
@@ -629,6 +658,9 @@ class AirPlayProvider(PlayerProvider):
         if unregister := getattr(self, "_unregister_private_admission_api", None):
             unregister()
             self._unregister_private_admission_api = None
+        if unregister := getattr(self, "_unregister_private_admission_mutate_api", None):
+            unregister()
+            self._unregister_private_admission_mutate_api = None
         if unregister := getattr(self, "_unregister_private_capture_api", None):
             unregister()
             self._unregister_private_capture_api = None
@@ -847,7 +879,7 @@ class AirPlayProvider(PlayerProvider):
 
     async def get_private_trial_admission_preflight(
         self, player_id: str
-    ) -> dict[str, SerializableType]:
+    ) -> PrivateAdmissionSnapshot:
         """
         Return secret-free facts about the unmodified private admission state.
 
@@ -859,43 +891,120 @@ class AirPlayProvider(PlayerProvider):
             raise RuntimeError("Private trial admission is unavailable")
         if not isinstance(player_id, str) or not _PRIVATE_PLAYER_ID.fullmatch(player_id):
             raise ValueError("Invalid private trial player ID")
-        players = self.mass.config.get(CONF_PLAYERS)
-        state = "unsafe"
-        setup_empty = credentials_absent = default_bounds = False
-        if isinstance(players, dict):
-            if player_id not in players:
-                state = "absent"
-                setup_empty = credentials_absent = default_bounds = True
-            elif isinstance(raw := players[player_id], dict):
-                values = raw.get("values", {})
-                setup = raw.get("setup_data", {})
-                if isinstance(values, dict) and isinstance(setup, dict):
-                    state = "present"
-                    setup_empty = not setup
-                    credentials_absent = (
-                        all(
-                            key not in values or values[key] is None or values[key] == ""
-                            for key in _PRIVATE_CREDENTIAL_KEYS
-                        )
-                        and setup_empty
-                    )
-                    minimum = values.get(CONF_MIN_VOLUME, 0)
-                    maximum = values.get(CONF_MAX_VOLUME, 100)
-                    default_bounds = (
-                        type(minimum) is int
-                        and minimum == 0
-                        and type(maximum) is int
-                        and maximum == 100
-                    )
-        target_unset = self._private_target_unset()
+        return self._private_admission_snapshot(player_id)
+
+    async def private_trial_admission_mutate(self, request: Any) -> PrivateAdmissionResult:
+        """Admit one target or clear exactly the expected target in the private profile."""
+
+        def refused(reason: PrivateAdmissionReason) -> PrivateAdmissionResult:
+            """Return a secret-free refusal without attempting persistence."""
+            return {
+                "version": 1,
+                "status": PrivateAdmissionStatus.REFUSED,
+                "reason": reason,
+                "memory": PrivateFlagMemory.UNCHANGED,
+                "persistence": PrivateFlagPersistence.NOT_ATTEMPTED,
+            }
+
+        if (
+            type(request) is not dict
+            or set(request) != {"mode", "player_id", "target"}
+            or type(request["mode"]) is not str
+            or request["mode"] not in (PrivateAdmissionMode.ADMIT, PrivateAdmissionMode.CLEAR)
+            or type(request["player_id"]) is not str
+            or not _PRIVATE_PLAYER_ID.fullmatch(request["player_id"])
+            or type(request["target"]) is not str
+            or "/" in request["target"]
+        ):
+            return refused(PrivateAdmissionReason.INVALID_REQUEST)
+        target = parse_trial_target(request["target"])
+        if target is None or target.player_id != request["player_id"]:
+            return refused(PrivateAdmissionReason.INVALID_REQUEST)
+        if not is_trial_target():
+            return refused(PrivateAdmissionReason.PROFILE_INACTIVE)
+        if (
+            not _PRIVATE_INSTANCE_ID.fullmatch(self.instance_id)
+            or self.domain != "airplay"
+            or not self.available
+            or self.unloading
+            or self.config.enabled is not True
+            or self.mass.get_provider(self.instance_id, return_unavailable=True) is not self
+        ):
+            return refused(PrivateAdmissionReason.PROVIDER_UNAVAILABLE)
+        providers = self.mass.config.get(CONF_PROVIDERS)
+        if (
+            not isinstance(providers, dict)
+            or not isinstance(raw_provider := providers.get(self.instance_id), dict)
+            or raw_provider.get("domain") != "airplay"
+            or raw_provider.get("instance_id") != self.instance_id
+            or raw_provider.get("enabled", True) is not True
+        ):
+            return refused(PrivateAdmissionReason.UNSAFE_CONFIG)
+        core = self.mass.config.get(CONF_CORE)
+        if not isinstance(core, dict) or not isinstance(discovery := core.get("discovery"), dict):
+            return refused(PrivateAdmissionReason.UNSAFE_CONFIG)
+        values = discovery.get("values")
+        loaded = getattr(self.mass.discovery, "config", None)
+        entries = getattr(loaded, "values", None)
+        if (
+            not isinstance(values, dict)
+            or CONF_PRIVATE_TRIAL_TARGET not in values
+            or not isinstance(entries, dict)
+            or not isinstance(entry := entries.get(CONF_PRIVATE_TRIAL_TARGET), ConfigEntry)
+        ):
+            return refused(PrivateAdmissionReason.UNSAFE_CONFIG)
+        expected = "" if request["mode"] == PrivateAdmissionMode.ADMIT else request["target"]
+        if values[CONF_PRIVATE_TRIAL_TARGET] != expected or entry.value != expected:
+            return refused(PrivateAdmissionReason.TARGET_MISMATCH)
+        if request["mode"] == PrivateAdmissionMode.ADMIT:
+            snapshot = self._private_admission_snapshot(request["player_id"])
+            if (
+                any(self.config.get_value(key) is not False for key in _PRIVATE_FLAG_KEYS)
+                or self.get_players()
+                or snapshot["config_state"]
+                not in (PrivateAdmissionConfigState.ABSENT, PrivateAdmissionConfigState.PRESENT)
+                or snapshot["setup_data_empty"] is not True
+                or snapshot["credentials_absent"] is not True
+                or snapshot["default_volume_bounds"] is not True
+                or snapshot["target_unset"] is not True
+                or snapshot["no_current_streams"] is not True
+            ):
+                return refused(PrivateAdmissionReason.UNSAFE_STATE)
+        elif any(player.player_id != request["player_id"] for player in self.get_players()):
+            return refused(PrivateAdmissionReason.UNSAFE_STATE)
+        desired = request["target"] if request["mode"] == PrivateAdmissionMode.ADMIT else ""
+        self.mass.config.set(f"{CONF_CORE}/discovery/values/{CONF_PRIVATE_TRIAL_TARGET}", desired)
+        entry.value = desired
+        persistence = PrivateFlagPersistence.COMPLETED
+        try:
+            await self.mass.config.async_save()
+        except asyncio.CancelledError:
+            self.logger.warning("Private admission flush cancelled; persistence unproven")
+            raise
+        except Exception as err:
+            self.logger.warning(f"Private admission flush failed ({type(err).__name__})")
+            persistence = PrivateFlagPersistence.UNPROVEN
+        current_core = self.mass.config.get(CONF_CORE)
+        current_loaded = getattr(self.mass.discovery, "config", None)
+        current_entries = getattr(current_loaded, "values", None)
+        if (
+            not isinstance(current_core, dict)
+            or not isinstance(current_discovery := current_core.get("discovery"), dict)
+            or not isinstance(current_values := current_discovery.get("values"), dict)
+            or current_values.get(CONF_PRIVATE_TRIAL_TARGET) != desired
+            or not isinstance(current_entries, dict)
+            or not isinstance(
+                current_entry := current_entries.get(CONF_PRIVATE_TRIAL_TARGET), ConfigEntry
+            )
+            or current_entry.value != desired
+        ):
+            persistence = PrivateFlagPersistence.UNPROVEN
         return {
             "version": 1,
-            "config_state": state,
-            "setup_data_empty": setup_empty,
-            "credentials_absent": credentials_absent,
-            "default_volume_bounds": default_bounds,
-            "target_unset": target_unset,
-            "no_current_streams": all(player.stream is None for player in self.get_players()),
+            "status": PrivateAdmissionStatus.APPLIED,
+            "reason": None,
+            "memory": PrivateFlagMemory.APPLIED,
+            "persistence": persistence,
         }
 
     async def private_airplay_flags(self, request: Any) -> dict[str, SerializableType]:
@@ -973,6 +1082,47 @@ class AirPlayProvider(PlayerProvider):
             persistence,
         )
 
+    def _private_admission_snapshot(self, player_id: str) -> PrivateAdmissionSnapshot:
+        """Return the existing secret-free admission facts without yielding."""
+        players = self.mass.config.get(CONF_PLAYERS)
+        state = PrivateAdmissionConfigState.UNSAFE
+        setup_empty = credentials_absent = default_bounds = False
+        if isinstance(players, dict):
+            if player_id not in players:
+                state = PrivateAdmissionConfigState.ABSENT
+                setup_empty = credentials_absent = default_bounds = True
+            elif isinstance(raw := players[player_id], dict):
+                values = raw.get("values", {})
+                setup = raw.get("setup_data", {})
+                if isinstance(values, dict) and isinstance(setup, dict):
+                    state = PrivateAdmissionConfigState.PRESENT
+                    setup_empty = not setup
+                    credentials_absent = (
+                        all(
+                            key not in values or values[key] is None or values[key] == ""
+                            for key in _PRIVATE_CREDENTIAL_KEYS
+                        )
+                        and setup_empty
+                    )
+                    minimum = values.get(CONF_MIN_VOLUME, 0)
+                    maximum = values.get(CONF_MAX_VOLUME, 100)
+                    default_bounds = (
+                        type(minimum) is int
+                        and minimum == 0
+                        and type(maximum) is int
+                        and maximum == 100
+                    )
+        target_unset = self._private_target_unset()
+        return {
+            "version": 1,
+            "config_state": state,
+            "setup_data_empty": setup_empty,
+            "credentials_absent": credentials_absent,
+            "default_volume_bounds": default_bounds,
+            "target_unset": target_unset,
+            "no_current_streams": all(player.stream is None for player in self.get_players()),
+        }
+
     def _register_private_capture_api(self) -> None:
         """Atomically claim all private routes within the load-failing lifecycle."""
         if not is_trial_target():
@@ -988,6 +1138,7 @@ class AirPlayProvider(PlayerProvider):
                 self.get_private_trial_admission_preflight,
             ),
             ("airplay/private_flags", self.private_airplay_flags),
+            ("airplay/private_trial_admission/mutate", self.private_trial_admission_mutate),
         )
         claimed: list[Callable[[], None]] = []
         try:
@@ -1007,6 +1158,7 @@ class AirPlayProvider(PlayerProvider):
             self._unregister_private_capture_readiness_api,
             self._unregister_private_admission_api,
             self._unregister_private_flags_api,
+            self._unregister_private_admission_mutate_api,
         ) = claimed
 
     def _private_target_unset(self) -> bool:
