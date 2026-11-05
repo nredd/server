@@ -180,6 +180,7 @@ def _private_flag_map(value: object) -> dict[str, str] | None:
     Validate one closed flag-state mapping of a request.
 
     :param value: The untrusted `expected` or `desired` request member.
+    :return: A copy of the validated mapping, or None when it is not exactly closed.
     """
     if not isinstance(value, dict) or set(value) != set(_PRIVATE_FLAG_KEYS):
         return None
@@ -227,6 +228,7 @@ def _private_flag_response(
     :param after: The flag states read back after the write.
     :param memory: Whether the stored in-memory config was unchanged or applied.
     :param persistence: Whether a flush was not_attempted, completed or unproven.
+    :return: The closed response mapping.
     """
     return {
         "version": 1,
@@ -238,6 +240,19 @@ def _private_flag_response(
         "persistence": persistence,
         "effect": "next_load" if memory == "applied" else "none",
     }
+
+
+def _private_flag_refusal(
+    reason: str | None, before: dict[str, str] | None
+) -> dict[str, SerializableType]:
+    """
+    Build the closed response of a refusal, which never wrote or flushed anything.
+
+    :param reason: The fixed refusal reason.
+    :param before: The flag states observed, if the guards got that far.
+    :return: The closed refused response.
+    """
+    return _private_flag_response("refused", reason, before, None, "unchanged", "not_attempted")
 
 
 def _has_current_private_receipt(child: AsyncProcess) -> bool:
@@ -871,31 +886,24 @@ class AirPlayProvider(PlayerProvider):
 
         :param request: Either `{"mode": "inspect"}` or `{"mode": "compare_and_set",
             "expected": ..., "desired": ...}` mapping each flag to absent, true or false.
+        :return: The closed response, see `PRIVATE_NATIVE_AIRPLAY_TRIAL.md`.
         """
         parsed = _private_flag_request(request)
         if parsed is None:
-            return _private_flag_response(
-                "refused", "invalid_request", None, None, "unchanged", "not_attempted"
-            )
+            return _private_flag_refusal("invalid_request", None)
         _, expected, desired = parsed
         if not is_trial_target():
-            return _private_flag_response(
-                "refused", "profile_inactive", None, None, "unchanged", "not_attempted"
-            )
+            return _private_flag_refusal("profile_inactive", None)
         # Nothing may be awaited between these guards and the leaf updates below.
         states, reason = self._private_flag_snapshot()
         if states is None:
-            return _private_flag_response(
-                "refused", reason, None, None, "unchanged", "not_attempted"
-            )
+            return _private_flag_refusal(reason, None)
         if expected is None or desired is None:
             return _private_flag_response(
                 "inspected", None, states, None, "unchanged", "not_attempted"
             )
         if states != expected:
-            return _private_flag_response(
-                "refused", "state_mismatch", states, None, "unchanged", "not_attempted"
-            )
+            return _private_flag_refusal("state_mismatch", states)
         changed = [key for key in _PRIVATE_FLAG_KEYS if expected[key] != desired[key]]
         if not changed:
             return _private_flag_response(
@@ -980,7 +988,7 @@ class AirPlayProvider(PlayerProvider):
         """
         Return the stored flag states, or the fixed reason this provider may not touch them.
 
-        Read-only and synchronous, so a caller may mutate in the same event loop step.
+        :return: The closed flag states with no reason, or no states with the fixed reason.
         """
         instance_id = self.instance_id
         if (

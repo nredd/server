@@ -481,7 +481,7 @@ async def test_malformed_requests_are_refused_without_writes(
     """Unexpected members, wrong types and non-enum states are all refused."""
     before = deepcopy(harness.raw)
     flush = _spy_flush(harness)
-    result = await harness.provider.private_airplay_flags(request_)  # type: ignore[arg-type]
+    result = await harness.provider.private_airplay_flags(cast("dict[str, Any]", request_))
     assert result["status"] == "refused"
     assert result["reason"] == "invalid_request"
     assert harness.raw == before

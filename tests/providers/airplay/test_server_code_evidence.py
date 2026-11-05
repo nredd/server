@@ -199,6 +199,7 @@ _FLAG_FUNCTIONS = (
     "_private_flag_map",
     "_private_flag_request",
     "_private_flag_response",
+    "_private_flag_refusal",
 )
 
 

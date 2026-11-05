@@ -72,6 +72,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             "_private_flag_map",
             "_private_flag_request",
             "_private_flag_response",
+            "_private_flag_refusal",
         ):
             _check_function(codes["provider"], trees["provider"], provider, name)
         for name in ("_connect_mrp",):
