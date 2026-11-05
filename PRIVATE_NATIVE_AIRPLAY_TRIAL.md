@@ -456,6 +456,10 @@ CLI pin/source attestation, manual sibling-stop/catalog preflight, independent l
 lease/watchdog, no-target hold, stable single-player admission checks and receipted
 cleanup remain mandatory. No deployment or live window is authorized by this repair.
 
+The TV transport stop watchdog waits for its child acknowledgement using the platform's default
+selector, including for high-numbered file descriptors. The same absolute stop deadline and HTTP
+reserve apply; an invalid or missing acknowledgement still prevents playback.
+
 Live results 2026-10-28 (evidence `/data/airplay-native-probe/WINDOW_EVIDENCE_20261028.json`
 on the host, pcaps 0600): the old `13df592bf` source registered office-pod and hit it on
 tcp/7000 and 49153 (295 frames); `9b6639899` with no target registered no AirPlay player
