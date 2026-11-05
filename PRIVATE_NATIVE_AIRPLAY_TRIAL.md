@@ -639,12 +639,13 @@ are refused). The file holds a length, a SHA-256 prefix identity and a journal c
 contains machine and boot identifiers), never log content, so it is never printed or passed on
 argv. A boot is current only if the current log is
 an append-only continuation of that baseline and contains a new exact
-`nredd/server@3ff62b9cf15a93a49aeec9789a871d1112faa15f` installer anchor after it.
+`nredd/server@6c593acb8e0580ac6c92ef35104cc3cc1d942a9e` installer anchor after it.
 
-The observer's runtime source pin is the merge `3ff62b9cf15a93a49aeec9789a871d1112faa15f` (PR #67),
-whose tree equals reviewed source `7332a7f76aac78825d76e114ad37209234984efa` (tree
-`5c8a42820317e6c4e2c3265eb9be54f451cc5983`). This pin does not authorize private flags invocation
-or real receiver admission. Previous pins `208e9c069163a1c9e1a4ed6da16015d69d972d34`,
+The observer's runtime source pin is the merge `6c593acb8e0580ac6c92ef35104cc3cc1d942a9e` (PR #77).
+The merge also contains the separately reviewed observer and watchdog changes from PRs #74 and #76;
+it is not the same tree as the reviewed PR #77 head `2de93bce`. This pin does not authorize private
+flags invocation or real receiver admission. Previous pins `3ff62b9cf15a93a49aeec9789a871d1112faa15f`,
+`208e9c069163a1c9e1a4ed6da16015d69d972d34`,
 `4799bd57c86dff1bb39a7333c2a5e9bf91f8812b`,
 `dae8ae9484cd19d847bf495bb95a85e6d1afc2c2`,
 `ad73c02283350952f535e328f7c001c8b209e9fa`, `a6382b99fad1603176fe89daf0a233406e77f5ad`,

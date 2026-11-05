@@ -937,7 +937,8 @@ NEAR_MISSES = [
 ]
 
 
-RUNTIME_SHA = "3ff62b9cf15a93a49aeec9789a871d1112faa15f"
+RUNTIME_SHA = "6c593acb8e0580ac6c92ef35104cc3cc1d942a9e"
+IMMEDIATE_PRIOR_RUNTIME_SHA = "3ff62b9cf15a93a49aeec9789a871d1112faa15f"
 REPLACED_RUNTIME_SHA = "208e9c069163a1c9e1a4ed6da16015d69d972d34"
 SUPERSEDED_RUNTIME_SHA = "4799bd57c86dff1bb39a7333c2a5e9bf91f8812b"
 PRIOR_RUNTIME_SHA = "dae8ae9484cd19d847bf495bb95a85e6d1afc2c2"
@@ -966,6 +967,7 @@ def test_real_runtime_sha_anchors_and_previous_sha_does_not(template: str) -> No
     good = old + current(template.format(RUNTIME_SHA))
     assert observer._find_anchor(good, len(old)) == len(old)
     for stale_sha in (
+        IMMEDIATE_PRIOR_RUNTIME_SHA,
         REPLACED_RUNTIME_SHA,
         SUPERSEDED_RUNTIME_SHA,
         PRIOR_RUNTIME_SHA,
