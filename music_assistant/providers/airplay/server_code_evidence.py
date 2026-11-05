@@ -98,7 +98,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             "_private_flag_refusal",
         ):
             _check_function(codes["provider"], trees["provider"], provider, name)
-        for name in ("_connect_mrp",):
+        for name in ("_connect_mrp", "on_config_updated"):
             _check_function(
                 codes["control_player"],
                 trees["control_player"],
@@ -120,6 +120,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
                 name,
                 prop=True,
             )
+        _check_function(codes["player"], trees["player"], player.AirPlayPlayer, "on_config_updated")
         _check_function(
             codes["player"],
             trees["player"],

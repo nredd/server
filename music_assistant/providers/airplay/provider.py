@@ -1124,9 +1124,6 @@ class AirPlayProvider(PlayerProvider):
         if not address:
             return  # should not happen, but guard just in case
 
-        # if we reach this point, all preflights are ok and we can create the player
-        self.logger.debug("Discovered AirPlay device %s on %s", display_name, address)
-
         # Get stored volume from playerconfig
         volume = int(
             self.mass.config.get_raw_player_config_value(
@@ -1141,13 +1138,6 @@ class AirPlayProvider(PlayerProvider):
                 "Player %s already registered during setup, skipping registration", player_id
             )
             return
-
-        self.logger.debug(
-            "Setting up player %s: manufacturer=%s, model=%s",
-            display_name,
-            manufacturer,
-            model,
-        )
 
         player_addresses = self._get_discovery_addresses(
             airplay_discovery_info,
@@ -1180,6 +1170,9 @@ class AirPlayProvider(PlayerProvider):
                 ),
             )
 
+        if self.unloading or not self._admits_private_player(player_id):
+            return
+
         player: AirPlayPlayer
         if enhanced_control:
             player = AirPlayControlPlayer(
@@ -1208,6 +1201,9 @@ class AirPlayProvider(PlayerProvider):
                 initial_volume=volume,
             )
         await self.mass.players.register(player)
+        if self.unloading or not self._admits_private_player(player_id):
+            await self.mass.players.unregister(player_id, expected_player=player)
+            return
 
         # A receiver only publishes its audio formats (and so whether it can do
         # 24-bit) in its /info response, never in its mDNS records, so ask it

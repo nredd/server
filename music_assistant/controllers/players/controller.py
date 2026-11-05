@@ -1815,6 +1815,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         player_id: str,
         permanent: bool = False,
         replacement_player_id: str | None = None,
+        expected_player: Player | None = None,
     ) -> None:
         """
         Unregister a player from the player controller.
@@ -1829,13 +1830,16 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                           If False, the player config will not be removed.
         :param replacement_player_id: Player ID that takes this player's place, only
                                       used for a permanent removal.
+        :param expected_player: Only remove this exact player, if provided.
         """
         player = self._players.get(player_id)
-        if player is None:
+        if player is None or (expected_player is not None and player is not expected_player):
             return
         # a player that is going away is done with any live source it was playing,
         # so let the owning plugin release an upstream session pointing at us
         await self._release_audio_source(player_id)
+        if expected_player is not None and self._players.get(player_id) is not player:
+            return
         del self._players[player_id]
         # clean up all lock entries for this player
         for prefix in [p.value for p in PlayerLockPurpose]:
@@ -1850,6 +1854,8 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             await player.on_unload()
         except Exception:
             self.logger.exception("Error unloading player %s", player.name)
+        if expected_player is not None and player_id in self._players:
+            return
         if permanent:
             # player permanent removal: cleanup protocol links, delete config
             # and signal PLAYER_REMOVED event.

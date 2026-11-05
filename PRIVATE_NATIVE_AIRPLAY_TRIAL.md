@@ -20,7 +20,12 @@ stored credentials.
 
 This permits a discovery-only proof, not default-output, active Music, or playback
 acceptance. It is a snapshot, so the caller must keep the target unset and prevent
-concurrent config changes until it enables discovery.
+concurrent config changes until it enables discovery. Preflight is read-only and does not
+flush config or prove disk durability. Registration can create a default player config
+record which remains after unregister. Admission and provider unload are rechecked before
+player construction and after registration; stale cleanup removes only that exact player.
+Clearing the core target can omit its default raw key, so a subsequent preflight may fail
+closed until startup writes the explicit empty value again.
 
 ## Guarded flag compare-and-set
 

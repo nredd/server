@@ -6,7 +6,7 @@ import enum
 import hashlib
 import re
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -173,6 +173,49 @@ def test_binding_inventory_swaps(
 ) -> None:
     """Selected imported aliases, credential constants and inventory fail closed."""
     monkeypatch.setattr(owner, name, replacement)
+    assert evidence.server_code_evidence(provider)["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("module", "old", "new"),
+    [
+        (
+            provider,
+            b"if self.unloading or not self._admits_private_player(player_id):",
+            b"if False:",
+        ),
+        (
+            provider,
+            b"await self.mass.players.register(player)\n        if self.unloading or not self._admits_private_player(player_id):",
+            b"await self.mass.players.register(player)\n        if False:",
+        ),
+        (
+            provider,
+            b"await self.mass.players.unregister(player_id, expected_player=player)",
+            b"await self.mass.players.unregister(player_id)",
+        ),
+        (
+            player,
+            b"if prov.unloading or not prov._admits_private_player(self.player_id):",
+            b"if False:",
+        ),
+        (
+            control_player,
+            b"if provider.unloading or not provider._admits_private_player(self.player_id):",
+            b"if False:",
+        ),
+    ],
+)
+def test_registration_guard_source_mutation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleType, old: bytes, new: bytes
+) -> None:
+    """Changed registration guards on disk cannot attest the loaded code."""
+    assert module.__file__ is not None
+    source = Path(module.__file__).read_bytes()
+    assert old in source
+    path = tmp_path / "changed.py"
+    path.write_bytes(source.replace(old, new, 1))
+    monkeypatch.setattr(module, "__file__", str(path))
     assert evidence.server_code_evidence(provider)["status"] == "unverified"
 
 
