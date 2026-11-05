@@ -36,6 +36,14 @@ class AirPlayRemoteCommand(StrEnum):
     PREVIOUS = "previous"
 
 
+class PrivateAdmissionConfigState(StrEnum):
+    """Safety state of the stored private player configuration."""
+
+    UNSAFE = "unsafe"
+    ABSENT = "absent"
+    PRESENT = "present"
+
+
 class PrivateAdmissionMode(StrEnum):
     """Request mode of the private admission API."""
 

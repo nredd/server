@@ -91,6 +91,7 @@ from .constants import (
     STREAMING_MODE_AP2_COMPAT,
     STREAMING_MODE_AUTO,
     AirPlayRemoteCommand,
+    PrivateAdmissionConfigState,
     PrivateAdmissionMode,
     PrivateAdmissionReason,
     PrivateAdmissionStatus,
@@ -168,7 +169,7 @@ class PrivateAdmissionSnapshot(TypedDict):
     """Secret-free preflight facts."""
 
     version: int
-    config_state: str
+    config_state: PrivateAdmissionConfigState
     setup_data_empty: bool
     credentials_absent: bool
     default_volume_bounds: bool
@@ -960,7 +961,8 @@ class AirPlayProvider(PlayerProvider):
             if (
                 any(self.config.get_value(key) is not False for key in _PRIVATE_FLAG_KEYS)
                 or self.get_players()
-                or snapshot["config_state"] not in ("absent", "present")
+                or snapshot["config_state"]
+                not in (PrivateAdmissionConfigState.ABSENT, PrivateAdmissionConfigState.PRESENT)
                 or snapshot["setup_data_empty"] is not True
                 or snapshot["credentials_absent"] is not True
                 or snapshot["default_volume_bounds"] is not True
@@ -1070,17 +1072,17 @@ class AirPlayProvider(PlayerProvider):
     def _private_admission_snapshot(self, player_id: str) -> PrivateAdmissionSnapshot:
         """Return the existing secret-free admission facts without yielding."""
         players = self.mass.config.get(CONF_PLAYERS)
-        state = "unsafe"
+        state = PrivateAdmissionConfigState.UNSAFE
         setup_empty = credentials_absent = default_bounds = False
         if isinstance(players, dict):
             if player_id not in players:
-                state = "absent"
+                state = PrivateAdmissionConfigState.ABSENT
                 setup_empty = credentials_absent = default_bounds = True
             elif isinstance(raw := players[player_id], dict):
                 values = raw.get("values", {})
                 setup = raw.get("setup_data", {})
                 if isinstance(values, dict) and isinstance(setup, dict):
-                    state = "present"
+                    state = PrivateAdmissionConfigState.PRESENT
                     setup_empty = not setup
                     credentials_absent = (
                         all(

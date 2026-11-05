@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 _MAX_SOURCE_SIZE = 1024 * 1024
 _PRIVATE_FLAG_ENUMS = (
+    "PrivateAdmissionConfigState",
     "PrivateAdmissionMode",
     "PrivateAdmissionStatus",
     "PrivateAdmissionReason",

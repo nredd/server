@@ -743,6 +743,7 @@ async def test_route_registration_is_system_manage_scoped(harness: Harness) -> N
 @pytest.mark.parametrize(
     "enum_class",
     [
+        constants.PrivateAdmissionConfigState,
         constants.PrivateAdmissionMode,
         constants.PrivateAdmissionStatus,
         constants.PrivateAdmissionReason,
