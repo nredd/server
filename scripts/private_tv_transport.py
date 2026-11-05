@@ -8,6 +8,7 @@ independent unconditional stop request within a nine-second monotonic budget.
 
 References:
 - https://music-assistant.io/
+- https://docs.python.org/3/library/selectors.html
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import io
 import json
 import math
 import os
-import select
+import selectors
 import signal
 import struct
 import sys
@@ -232,8 +233,12 @@ class StopWatchdog:
             os.close(ready_write)
             ready_write = -1
             remaining = deadline - time.monotonic() - HTTP_TIMEOUT_SECONDS
-            if remaining <= 0 or not select.select([ready_read], [], [], remaining)[0]:
+            if remaining <= 0:
                 raise TransportError("stop watchdog did not become ready")
+            with selectors.DefaultSelector() as selector:
+                selector.register(ready_read, selectors.EVENT_READ)
+                if not selector.select(remaining):
+                    raise TransportError("stop watchdog did not become ready")
             if os.read(ready_read, 1) != b"1":
                 raise TransportError("stop watchdog did not become ready")
         except OSError as err:
