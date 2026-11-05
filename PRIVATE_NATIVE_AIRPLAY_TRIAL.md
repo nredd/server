@@ -22,6 +22,66 @@ This permits a discovery-only proof, not default-output, active Music, or playba
 acceptance. It is a snapshot, so the caller must keep the target unset and prevent
 concurrent config changes until it enables discovery.
 
+## Guarded flag compare-and-set
+
+The private-only `SYSTEM_MANAGE` command `airplay/private_flags` inspects or compare-and-sets
+exactly `experimental_homepod_remote`, `experimental_session_volume` and
+`private_native_volume_capture` in the stored AirPlay provider config. The generic
+`config/providers/save` path reconstructs, prunes and normalizes unrelated stored values and
+reloads the provider, so this route never uses it, `set_raw_provider_config_value` or any
+generic parse/`to_raw`. It writes only the differing leaf keys through the config controller's
+raw `set`/`remove` and every other stored value, including unknown, noncanonical and
+credential-bearing neighbours and player configs, stays untouched.
+
+The API passes only named arguments, so the whole closed request is ONE `request` object:
+
+- `{"mode": "inspect"}`: read-only, never flushes or mutates
+- `{"mode": "compare_and_set", "expected": E, "desired": D}`: `E` and `D` map each of the
+  three flag names, and nothing else, to `"absent"`, `"true"` or `"false"`
+
+Any other member, type or value is refused, and extra top-level arguments are ignored by the
+API layer, not the handler. Absent is a state: an inverse CAS (expected and desired swapped)
+removes the key again and restores the original absence, never a guessed default. A stored
+null, string or number, a duplicate flag at the instance top level, a missing or non-mapping
+`values`, or a non-mapping `providers` section is refused. Every provider record must be a
+mapping with a string `domain`, so an unreadable sibling cannot hide another AirPlay instance.
+Other fields in unrelated records are not validated or normalized, even if noncanonical.
+
+Guards, checked synchronously with no `await` before the writes: the private Linux ARM
+profile, exactly one raw `airplay` instance whose key, raw `instance_id`, loaded provider
+and path-safe id agree, a current available provider, the raw and loaded discovery target
+explicitly empty, and zero players or streams. Expected must equal the stored states or the
+call is refused with `state_mismatch` and nothing is written. Equal expected, desired and
+stored states are a no-op without a flush.
+
+The response always has exactly `version`, `status`, `reason`, `before`, `after`, `memory`,
+`persistence` and `effect`, with fixed enum values and no identifiers, paths, stored values or
+exception text:
+
+- `status`: `inspected`, `unchanged`, `applied` or `refused`; refusals set `reason` to one of
+  `invalid_request`, `profile_inactive`, `provider_unavailable`, `unsafe_config`,
+  `target_not_empty`, `players_active` or `state_mismatch`
+- `memory`: `applied` once the stored in-memory config changed, else `unchanged`
+- `persistence`: `not_attempted`, `completed` or `unproven`
+- `effect`: `next_load` when memory applied, else `none`. The loaded provider config is never
+  changed, nothing is reloaded or signalled and no player or device is controlled
+
+After writing, the existing `ConfigController.async_save` is awaited. `completed` means only that
+this flush returned and the stored flags still read back as `desired`. It is not an atomicity,
+rollback or durability claim: a flush can fail or be cancelled after the memory write, and
+other writers run during the await. A failed flush, an unusable or different readback after
+the await (e.g. a concurrent writer) reports `unproven`. The old in-memory state is NEVER
+blindly restored, which could clobber newer writes. Cancellation propagates as a cancellation
+and is never reported as success; the applied memory change stays pending in the config
+store. Recovery from any ambiguity is an explicit inverse CAS followed by a readback after the
+next boot (an `inspect`, or the stored file), not an assumption.
+
+Registration joins the other private routes: a collision on any name releases only this
+provider's own claims, retains the incumbent and fails loading. The selected-code evidence
+binds this handler, its guards, helpers, route scope and constants to the loaded code; the
+evidence stays at the existing eight source hashes. A future client must read that evidence
+before writing.
+
 ## Discovery identity
 
 For a private trial Apple TV, registration retains the reported AirPlay ID but does not
@@ -546,6 +606,9 @@ The installer anchor identifies the requested source, not proof of loaded code. 
 `server_code_evidence` guard checks selected loaded code, not the entire process. The observer itself
 is tooling and may be newer than the runtime source it pins. The separate CLI pins (`429c5670`
 source, `cd7d36b` CI label, `fc77ceec` ELF) remain unchanged.
+The closed `StrEnum` flag states, modes, statuses and reasons in `constants.py` are covered too: each
+source declaration must be plain literal members of one `StrEnum` and match the live class members and
+shape, else the evidence is `unverified`.
 The pin is a code constant with no argument, so a later merge deliberately differs from it until a new
 reviewed runtime is chosen.
 
