@@ -480,6 +480,23 @@ async def test_lost_response_is_not_retried(
     assert stored["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == TARGET
 
 
+def _receiver_info(admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Isolate discovery services and return one synthetic receiver record."""
+    mass = admission.mass
+    monkeypatch.setattr(mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None))
+    monkeypatch.setattr(mass, "streams", MagicMock(publish_ip="192.0.2.2"), raising=False)
+    monkeypatch.setattr(provider_module, "get_model_info", lambda _: ("Other", "Receiver"))
+    monkeypatch.setattr(
+        provider_module,
+        "get_primary_ip_address_from_zeroconf",
+        lambda *_args, **_kwargs: "192.0.2.1",
+    )
+    info = MagicMock(type="_raop._tcp.local.", port=0)
+    info.parsed_addresses.return_value = ["192.0.2.1"]
+    info.decoded_properties = {}
+    return info
+
+
 @pytest.mark.parametrize("change", ["clear", "unload"])
 async def test_change_before_real_construction(
     admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, change: str
@@ -495,18 +512,8 @@ async def test_change_before_real_construction(
         return False
 
     monkeypatch.setattr(admission, "_is_own_airplay_receiver", receiver)
-    monkeypatch.setattr(mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None))
     monkeypatch.setattr(mass, "players", MagicMock(), raising=False)
-    monkeypatch.setattr(mass, "streams", MagicMock(publish_ip="192.0.2.2"), raising=False)
-    monkeypatch.setattr(provider_module, "get_model_info", lambda _: ("Other", "Receiver"))
-    monkeypatch.setattr(
-        provider_module,
-        "get_primary_ip_address_from_zeroconf",
-        lambda *_args, **_kwargs: "192.0.2.1",
-    )
-    info = MagicMock(type="_raop._tcp.local.", port=0)
-    info.parsed_addresses.return_value = ["192.0.2.1"]
-    info.decoded_properties = {}
+    info = _receiver_info(admission, monkeypatch)
     task = asyncio.create_task(admission._setup_player(PLAYER, "Example TV", info))
     try:
         await asyncio.wait_for(entered.wait(), 5)
@@ -522,11 +529,13 @@ async def test_change_before_real_construction(
     assert mass.config.get(f"players/{PLAYER}") is None
 
 
-@pytest.mark.parametrize("replacement", [False, True])
-async def test_clear_during_real_registration_retains_config(
-    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, replacement: bool
+@pytest.mark.parametrize(
+    ("change", "replacement"), [("clear", False), ("clear", True), ("unload", False)]
+)
+async def test_change_during_real_registration_retains_config(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, change: str, replacement: bool
 ) -> None:
-    """Clear during actual registration removes only the player, retaining its disk config."""
+    """Clear or unload during registration retains its player config on disk."""
     mass = admission.mass
     assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
     controller = PlayerController(mass)
@@ -536,28 +545,18 @@ async def test_clear_during_real_registration_retains_config(
     admission._bridge_manager = MagicMock(evaluate_bridge=AsyncMock())
     admission.dashboards = MagicMock()
     monkeypatch.setattr(admission, "_is_own_airplay_receiver", AsyncMock(return_value=False))
-    monkeypatch.setattr(mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None))
+    info = _receiver_info(admission, monkeypatch)
     monkeypatch.setattr(mass.cache, "get", AsyncMock(return_value=False))
     monkeypatch.setattr(
         mass, "player_queues", MagicMock(on_player_register=AsyncMock()), raising=False
     )
     cast("MagicMock", mass.player_queues).get.return_value = None
     monkeypatch.setattr(mass, "metadata", MagicMock(), raising=False)
-    monkeypatch.setattr(mass, "streams", MagicMock(publish_ip="192.0.2.2"), raising=False)
     monkeypatch.setattr(mass, "signal_event", MagicMock())
     monkeypatch.setattr(controller, "_resolve_mac_addresses", AsyncMock())
     monkeypatch.setattr(controller, "_save_underlying_player_id", MagicMock())
     monkeypatch.setattr(controller, "_evaluate_protocol_links", MagicMock())
     monkeypatch.setattr(controller, "_schedule_update_all_players", MagicMock())
-    monkeypatch.setattr(provider_module, "get_model_info", lambda _: ("Other", "Receiver"))
-    monkeypatch.setattr(
-        provider_module,
-        "get_primary_ip_address_from_zeroconf",
-        lambda *_args, **_kwargs: "192.0.2.1",
-    )
-    info = MagicMock(type="_raop._tcp.local.", port=0)
-    info.parsed_addresses.return_value = ["192.0.2.1"]
-    info.decoded_properties = {}
     entered, resume = asyncio.Event(), asyncio.Event()
 
     async def get_config(player_id: str) -> object:
@@ -571,9 +570,12 @@ async def test_clear_during_real_registration_retains_config(
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert controller.get_player(PLAYER) is not None
-        assert (await admission.private_trial_admission_mutate(request("clear")))[
-            "status"
-        ] == "applied"
+        if change == "clear":
+            assert (await admission.private_trial_admission_mutate(request("clear")))[
+                "status"
+            ] == "applied"
+        else:
+            admission.unloading = True
         if replacement:
             controller._players[PLAYER] = successor
     finally:
@@ -617,6 +619,19 @@ async def test_scheduled_credentialless_tv_and_later_insertion(
     )
     await asyncio.create_task(player._connect_control_services())
     assert build.call_count == 2
+
+
+async def test_generic_core_to_raw_omits_defaults_and_unknowns(admission: AirPlayProvider) -> None:
+    """Generic serialization drops default and unknown values unlike the leaf mutation."""
+    cfg = admission.mass.config
+    raw = cfg.get("core/discovery")
+    assert raw["values"][CONF_PRIVATE_TRIAL_TARGET] == ""
+    assert raw["values"]["unknown"] == {"keep": [1, None]}
+    serialized = (await cfg.get_core_config("discovery")).to_raw()
+    assert CONF_PRIVATE_TRIAL_TARGET not in serialized["values"]
+    assert "unknown" not in serialized["values"]
+    assert "unknown" not in serialized
+    assert cfg.get("core/discovery") == raw
 
 
 async def test_real_disk_reopen(
