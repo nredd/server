@@ -209,8 +209,8 @@ def test_unsupported_decorator_and_defaults(
     path.write_bytes(decorated)
     assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
     defaulted = source.replace(
-        b"self, player_id: str\n    ) -> dict[str, SerializableType]:",
-        b"self, player_id: str = ''\n    ) -> dict[str, SerializableType]:",
+        b"self, player_id: str\n    ) -> PrivateAdmissionSnapshot:",
+        b"self, player_id: str = ''\n    ) -> PrivateAdmissionSnapshot:",
     )
     assert defaulted != source
     path.write_bytes(defaulted)

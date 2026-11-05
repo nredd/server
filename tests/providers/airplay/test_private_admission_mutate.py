@@ -1,12 +1,20 @@
-"""Tests for the private atomic admission mutation."""
+"""
+Tests for the private atomic admission mutation.
+
+References:
+    https://github.com/nredd/server/issues/73
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from collections.abc import Awaitable
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,10 +22,12 @@ from aiohttp import web
 from aiohttp.streams import StreamReader
 from aiohttp.test_utils import make_mocked_request
 from music_assistant_models.auth import Scope
-from music_assistant_models.config_entries import ConfigEntry, CoreConfig, ProviderConfig
+from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.controllers.config import ConfigController
+from music_assistant.controllers.discovery import controller as discovery_module
+from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.webserver import controller as webserver_module
 from music_assistant.controllers.webserver.controller import WebserverController
 from music_assistant.helpers.api import APICommandHandler, parse_arguments
@@ -25,8 +35,16 @@ from music_assistant.helpers.json import json_dumps
 from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
 from music_assistant.mass import MusicAssistant
 from music_assistant.providers.airplay import provider as provider_module
-from music_assistant.providers.airplay.constants import CONF_PRIVATE_NATIVE_VOLUME_CAPTURE
+from music_assistant.providers.airplay import trial_binary
+from music_assistant.providers.airplay.constants import (
+    CONF_COMPANION_CREDENTIALS,
+    CONF_MRP_CREDENTIALS,
+    CONF_NATIVE_MRP_CREDENTIALS,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    MRP_DISCOVERY_TYPE,
+)
 from music_assistant.providers.airplay.provider import AirPlayProvider
+from tests.providers.airplay.test_control_player import _make_control_player, _service_info
 
 INSTANCE = "airplay--abc123"
 PLAYER = "ap0123456789ab"
@@ -67,25 +85,31 @@ async def admission(
     ]
     provider = AirPlayProvider.__new__(AirPlayProvider)
     provider.mass = mass_minimal
-    provider.__dict__["manifest"] = SimpleNamespace(domain="airplay")
+    provider.__dict__["manifest"] = SimpleNamespace(domain="airplay", name="AirPlay")
     provider.__dict__["config"] = ProviderConfig.parse(entries, raw)
     provider.__dict__["get_players"] = MagicMock(return_value=[])
     provider.__dict__["logger"] = MagicMock()
     provider.available = True
+    provider.unloading = False
     mass_minimal._providers[INSTANCE] = provider
-    target = ConfigEntry(key=CONF_PRIVATE_TRIAL_TARGET, type=ConfigEntryType.STRING, value="")
-    monkeypatch.setattr(
-        mass_minimal.discovery,
-        "config",
-        CoreConfig.parse([target], {"domain": "discovery", "values": {}}),
-        raising=False,
-    )
-    mass_minimal.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value = ""
+    monkeypatch.setattr(discovery_module, "is_trial_target", lambda: True)
+    monkeypatch.setattr(mass_minimal.discovery, "_setup_mdns_browser", AsyncMock())
+    monkeypatch.setattr(mass_minimal.discovery, "_register_mass_service", AsyncMock())
+    monkeypatch.setattr(mass_minimal.discovery, "_schedule_periodic_upnp_discovery", lambda: None)
+    await mass_minimal.discovery.setup(await mass_minimal.config.get_core_config("discovery"))
     await mass_minimal.config.async_save()
     return provider
 
 
-def request(mode: str = "admit") -> dict[str, str]:
+class AdmissionRequest(TypedDict):
+    """Closed request for the mutation route."""
+
+    mode: str
+    player_id: str
+    target: str
+
+
+def request(mode: str = "admit") -> AdmissionRequest:
     """Return a valid closed request."""
     return {"mode": mode, "player_id": PLAYER, "target": TARGET}
 
@@ -185,6 +209,66 @@ async def test_unsafe_state_refuses(
     flush.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "profile",
+        "disabled",
+        "raw_disabled",
+        "wrong_instance",
+        "wrong_domain",
+        "missing_core",
+        "discovery_null",
+        "values_null",
+        "entry_missing",
+        "entry_invalid",
+        "nonempty_target",
+        "player_null",
+        "player_values_null",
+        "player_setup_null",
+    ],
+)
+async def test_additional_refusals(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Each malformed or unavailable state fails without mutation or a flush."""
+    cfg = admission.mass.config
+    if case == "profile":
+        monkeypatch.setattr(provider_module, "is_trial_target", lambda: False)
+    elif case == "disabled":
+        admission.config.enabled = False
+    elif case == "raw_disabled":
+        cfg._data["providers"][INSTANCE]["enabled"] = False
+    elif case == "wrong_instance":
+        cfg._data["providers"][INSTANCE]["instance_id"] = "wrong"
+    elif case == "wrong_domain":
+        cfg._data["providers"][INSTANCE]["domain"] = "wrong"
+    elif case == "missing_core":
+        del cfg._data["core"]
+    elif case == "discovery_null":
+        cfg._data["core"]["discovery"] = None
+    elif case == "values_null":
+        cfg._data["core"]["discovery"]["values"] = None
+    elif case == "entry_missing":
+        del admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET]
+    elif case == "entry_invalid":
+        cast("Any", admission.mass.discovery.config.values)[CONF_PRIVATE_TRIAL_TARGET] = None
+    elif case == "nonempty_target":
+        cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] = TARGET
+    elif case == "player_null":
+        cfg._data["players"][PLAYER] = None
+    elif case == "player_values_null":
+        cfg._data["players"][PLAYER] = {"values": None}
+    else:
+        cfg._data["players"][PLAYER] = {"setup_data": None}
+    before = deepcopy(cfg._data)
+    flush = AsyncMock()
+    monkeypatch.setattr(cfg, "async_save", flush)
+    assert (await admission.private_trial_admission_mutate(request()))["status"] == "refused"
+    assert cfg._data == before
+    flush.assert_not_awaited()
+
+
 async def test_clear_mismatch_and_unavailable_refuse(
     admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -201,6 +285,11 @@ async def test_clear_mismatch_and_unavailable_refuse(
         "reason"
     ] == "provider_unavailable"
     admission.available = True
+    admission.unloading = True
+    assert (await admission.private_trial_admission_mutate(request("clear")))[
+        "reason"
+    ] == "provider_unavailable"
+    admission.unloading = False
     del admission.mass._providers[INSTANCE]
     assert (await admission.private_trial_admission_mutate(request("clear")))[
         "reason"
@@ -231,9 +320,12 @@ async def test_queued_writer_runs_only_after_atomic_mutation(
     cfg = admission.mass.config
     observed: list[str] = []
     loop = asyncio.get_running_loop()
-    loop.call_soon(
-        lambda: observed.append(cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET])
-    )
+
+    def writer() -> None:
+        observed.append(cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET])
+        cfg.set(f"players/{PLAYER}/setup_data", {"password": "later"})
+
+    loop.call_soon(writer)
 
     async def flush() -> None:
         await asyncio.sleep(0)
@@ -242,15 +334,53 @@ async def test_queued_writer_runs_only_after_atomic_mutation(
     result = await admission.private_trial_admission_mutate(request())
     assert result["status"] == "applied"
     assert observed == [TARGET]
+    assert cfg.get(f"players/{PLAYER}/setup_data") == {"password": "later"}
 
 
-async def test_later_stale_writer_is_not_serialized(admission: AirPlayProvider) -> None:
-    """An older writer can still overwrite the new target after admission."""
+async def test_old_two_call_preflight_race(admission: AirPlayProvider) -> None:
+    """A real core writer can intervene between old preflight and generic target save."""
     cfg = admission.mass.config
-    stale = deepcopy(cfg._data["core"]["discovery"])
+    seen = asyncio.Event()
+    continue_save = asyncio.Event()
+
+    async def old_client() -> None:
+        assert (await admission.get_private_trial_admission_preflight(PLAYER))[
+            "target_unset"
+        ] is True
+        seen.set()
+        await continue_save.wait()
+        await cfg.save_core_config("discovery", {CONF_PRIVATE_TRIAL_TARGET: TARGET})
+
+    task = asyncio.create_task(old_client())
+    await seen.wait()
+    await cfg.save_core_config("discovery", {CONF_PRIVATE_TRIAL_TARGET: "ffffffffffff@Other"})
+    continue_save.set()
+    await task
+    assert cfg.get("core/discovery/values/private_trial_target") == TARGET
+
+
+async def test_later_stale_writer_is_not_serialized(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A suspended real generic core save can overwrite the later admission."""
+    cfg = admission.mass.config
+    entered, resume = asyncio.Event(), asyncio.Event()
+    real_get = cfg.get_core_config
+
+    async def stale_get(domain: str) -> Any:
+        result = await real_get(domain)
+        entered.set()
+        await resume.wait()
+        return result
+
+    monkeypatch.setattr(cfg, "get_core_config", stale_get)
+    monkeypatch.setattr(admission.mass.discovery, "update_config", AsyncMock())
+    writer = asyncio.create_task(cfg.save_core_config("discovery", {"upnp_network_scan": True}))
+    await entered.wait()
     assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
-    cfg.set("core/discovery", stale)
-    assert cfg._data["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == ""
+    resume.set()
+    await writer
+    assert cfg.get("core/discovery/values/private_trial_target") != TARGET
     assert admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value == TARGET
     assert (await admission.private_trial_admission_mutate(request("clear")))["status"] == "refused"
 
@@ -299,6 +429,194 @@ async def test_preflight_never_flushes(
     monkeypatch.setattr(admission.mass.config, "async_save", flush)
     await admission.get_private_trial_admission_preflight(PLAYER)
     flush.assert_not_awaited()
+
+
+async def test_cancel_during_real_disk_write(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation cannot undo or retry a disk write already running in a thread."""
+    cfg = admission.mass.config
+    entered, done = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_write = cfg._save_to_disk
+    writes: list[str] = []
+
+    def delayed_write(data: str) -> None:
+        writes.append(data)
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(5):
+            raise TimeoutError("test disk gate timed out")
+        real_write(data)
+        loop.call_soon_threadsafe(done.set)
+
+    monkeypatch.setattr(cfg, "_save_to_disk", delayed_write)
+    task = asyncio.create_task(admission.private_trial_admission_mutate(request()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cfg.get("core/discovery/values/private_trial_target") == TARGET
+    finally:
+        release.set()
+    await asyncio.wait_for(done.wait(), 5)
+    assert len(writes) == 1
+    stored = json.loads(Path(cfg.filename).read_text(encoding="utf-8"))
+    assert stored["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == TARGET
+
+
+async def test_lost_response_is_not_retried(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discarding a completed response does not cause an implicit second write."""
+    cfg = admission.mass.config
+    real_save = cfg.async_save
+    flush = AsyncMock(side_effect=real_save)
+    monkeypatch.setattr(cfg, "async_save", flush)
+    await admission.private_trial_admission_mutate(request())
+    flush.assert_awaited_once()
+    stored = json.loads(Path(cfg.filename).read_text(encoding="utf-8"))
+    assert stored["core"]["discovery"]["values"][CONF_PRIVATE_TRIAL_TARGET] == TARGET
+
+
+@pytest.mark.parametrize("change", ["clear", "unload"])
+async def test_change_before_real_construction(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A clear or unload during discovery prevents player construction and its record."""
+    mass = admission.mass
+    assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def receiver(*_args: object) -> bool:
+        entered.set()
+        await resume.wait()
+        return False
+
+    monkeypatch.setattr(admission, "_is_own_airplay_receiver", receiver)
+    monkeypatch.setattr(mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None))
+    monkeypatch.setattr(mass, "players", MagicMock(), raising=False)
+    monkeypatch.setattr(mass, "streams", MagicMock(publish_ip="192.0.2.2"), raising=False)
+    monkeypatch.setattr(provider_module, "get_model_info", lambda _: ("Other", "Receiver"))
+    monkeypatch.setattr(
+        provider_module,
+        "get_primary_ip_address_from_zeroconf",
+        lambda *_args, **_kwargs: "192.0.2.1",
+    )
+    info = MagicMock(type="_raop._tcp.local.", port=0)
+    info.parsed_addresses.return_value = ["192.0.2.1"]
+    info.decoded_properties = {}
+    task = asyncio.create_task(admission._setup_player(PLAYER, "Example TV", info))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        if change == "clear":
+            assert (await admission.private_trial_admission_mutate(request("clear")))[
+                "status"
+            ] == "applied"
+        else:
+            admission.unloading = True
+    finally:
+        resume.set()
+    await task
+    assert mass.config.get(f"players/{PLAYER}") is None
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_clear_during_real_registration_retains_config(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    """Clear during actual registration removes only the player, retaining its disk config."""
+    mass = admission.mass
+    assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
+    controller = PlayerController(mass)
+    mass.players = controller
+    del admission.__dict__["get_players"]
+    admission.unloading = False
+    admission._bridge_manager = MagicMock(evaluate_bridge=AsyncMock())
+    admission.dashboards = MagicMock()
+    monkeypatch.setattr(admission, "_is_own_airplay_receiver", AsyncMock(return_value=False))
+    monkeypatch.setattr(mass.discovery, "async_find_mdns_service", AsyncMock(return_value=None))
+    monkeypatch.setattr(mass.cache, "get", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        mass, "player_queues", MagicMock(on_player_register=AsyncMock()), raising=False
+    )
+    cast("MagicMock", mass.player_queues).get.return_value = None
+    monkeypatch.setattr(mass, "metadata", MagicMock(), raising=False)
+    monkeypatch.setattr(mass, "streams", MagicMock(publish_ip="192.0.2.2"), raising=False)
+    monkeypatch.setattr(mass, "signal_event", MagicMock())
+    monkeypatch.setattr(controller, "_resolve_mac_addresses", AsyncMock())
+    monkeypatch.setattr(controller, "_save_underlying_player_id", MagicMock())
+    monkeypatch.setattr(controller, "_evaluate_protocol_links", MagicMock())
+    monkeypatch.setattr(controller, "_schedule_update_all_players", MagicMock())
+    monkeypatch.setattr(provider_module, "get_model_info", lambda _: ("Other", "Receiver"))
+    monkeypatch.setattr(
+        provider_module,
+        "get_primary_ip_address_from_zeroconf",
+        lambda *_args, **_kwargs: "192.0.2.1",
+    )
+    info = MagicMock(type="_raop._tcp.local.", port=0)
+    info.parsed_addresses.return_value = ["192.0.2.1"]
+    info.decoded_properties = {}
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def get_config(player_id: str) -> object:
+        entered.set()
+        await resume.wait()
+        return mass.config.get_base_player_config(player_id, admission.instance_id)
+
+    monkeypatch.setattr(mass.config, "get_player_config", get_config)
+    task = asyncio.create_task(admission._setup_player(PLAYER, "Example TV", info))
+    successor = MagicMock()
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert controller.get_player(PLAYER) is not None
+        assert (await admission.private_trial_admission_mutate(request("clear")))[
+            "status"
+        ] == "applied"
+        if replacement:
+            controller._players[PLAYER] = successor
+    finally:
+        resume.set()
+    await task
+    assert controller.get_player(PLAYER) is (successor if replacement else None)
+    retained = deepcopy(mass.config.get(f"players/{PLAYER}"))
+    assert retained
+    await mass.config.async_save()
+    stored = json.loads(Path(mass.config.filename).read_text(encoding="utf-8"))
+    assert stored["players"][PLAYER] == retained
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_scheduled_credentialless_tv_and_later_insertion(
+    admission: AirPlayProvider, monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    """A later credential insertion changes connection reachability outside the contract."""
+    assert (await admission.private_trial_admission_mutate(request()))["status"] == "applied"
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: True)
+    player = _make_control_player(setup_data={})
+    if native:
+        player.mrp_discovery_info = _service_info(MRP_DISCOVERY_TYPE)
+    monkeypatch.setattr(
+        player,
+        "get_setup_value",
+        lambda key: admission.mass.config.get(f"players/{PLAYER}/setup_data", {}).get(key),
+    )
+    build = MagicMock(return_value=None)
+    monkeypatch.setattr(player, "_build_config", build)
+    await asyncio.create_task(player._connect_control_services())
+    assert player.implicit_receiver_writes_blocked
+    assert not player.allow_implicit_power_on
+    build.assert_not_called()
+    admission.mass.config.set(
+        f"players/{PLAYER}/setup_data",
+        {
+            CONF_COMPANION_CREDENTIALS: "later-companion",
+            (CONF_NATIVE_MRP_CREDENTIALS if native else CONF_MRP_CREDENTIALS): "later-mrp",
+        },
+    )
+    await asyncio.create_task(player._connect_control_services())
+    assert build.call_count == 2
 
 
 async def test_real_disk_reopen(

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 from ipaddress import IPv4Address, IPv6Address, ip_address
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
@@ -159,6 +159,28 @@ _PRIVATE_FLAG_KEYS: Final = (
 )
 _PRIVATE_FLAG_STATES: Final = tuple(PrivateFlagState)
 _PRIVATE_INSTANCE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+class PrivateAdmissionSnapshot(TypedDict):
+    """Secret-free preflight facts."""
+
+    version: int
+    config_state: str
+    setup_data_empty: bool
+    credentials_absent: bool
+    default_volume_bounds: bool
+    target_unset: bool
+    no_current_streams: bool
+
+
+class PrivateAdmissionResult(TypedDict):
+    """Closed mutation disposition."""
+
+    version: int
+    status: Literal["applied", "refused"]
+    reason: str | None
+    memory: Literal["applied", "unchanged"]
+    persistence: Literal["not_attempted", "completed", "unproven"]
 
 
 def _private_flag_states(values: object) -> dict[str, PrivateFlagState] | None:
@@ -853,7 +875,7 @@ class AirPlayProvider(PlayerProvider):
 
     async def get_private_trial_admission_preflight(
         self, player_id: str
-    ) -> dict[str, SerializableType]:
+    ) -> PrivateAdmissionSnapshot:
         """
         Return secret-free facts about the unmodified private admission state.
 
@@ -867,10 +889,10 @@ class AirPlayProvider(PlayerProvider):
             raise ValueError("Invalid private trial player ID")
         return self._private_admission_snapshot(player_id)
 
-    async def private_trial_admission_mutate(self, request: Any) -> dict[str, SerializableType]:
+    async def private_trial_admission_mutate(self, request: Any) -> PrivateAdmissionResult:
         """Admit one target or clear exactly the expected target in the private profile."""
 
-        def refused(reason: str) -> dict[str, SerializableType]:
+        def refused(reason: str) -> PrivateAdmissionResult:
             return {
                 "version": 1,
                 "status": "refused",
@@ -899,6 +921,7 @@ class AirPlayProvider(PlayerProvider):
             not _PRIVATE_INSTANCE_ID.fullmatch(self.instance_id)
             or self.domain != "airplay"
             or not self.available
+            or self.unloading
             or self.config.enabled is not True
             or self.mass.get_provider(self.instance_id, return_unavailable=True) is not self
         ):
@@ -946,7 +969,7 @@ class AirPlayProvider(PlayerProvider):
         desired = request["target"] if request["mode"] == "admit" else ""
         self.mass.config.set(f"{CONF_CORE}/discovery/values/{CONF_PRIVATE_TRIAL_TARGET}", desired)
         entry.value = desired
-        persistence = "completed"
+        persistence: Literal["completed", "unproven"] = "completed"
         try:
             await self.mass.config.async_save()
         except asyncio.CancelledError:
@@ -1040,7 +1063,7 @@ class AirPlayProvider(PlayerProvider):
             persistence,
         )
 
-    def _private_admission_snapshot(self, player_id: str) -> dict[str, SerializableType]:
+    def _private_admission_snapshot(self, player_id: str) -> PrivateAdmissionSnapshot:
         """Return the existing secret-free admission facts without yielding."""
         players = self.mass.config.get(CONF_PLAYERS)
         state = "unsafe"
