@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import re
 import sys
+import typing
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any
@@ -217,6 +218,7 @@ def server_code_evidence(provider: ModuleType) -> dict[str, SerializableType]:
             return failure
         if (
             provider.asyncio is not asyncio
+            or provider.cast is not typing.cast
             or provider.Scope is not Scope
             or provider.CONF_PROVIDERS != "providers"
             or provider.CONF_CORE != "core"
@@ -413,6 +415,7 @@ def _check_enum(tree: ast.Module, module: ModuleType, consumer: ModuleType, name
         or live.__bases__ != (enum.StrEnum,)
         or live.__module__ != module.__name__
         or live.__qualname__ != name
+        or live.__name__ != name
         or [(key, member.value) for key, member in members] != declared
         or any(type(member) is not live for _, member in members)
         or set(vars(live)) - {"__firstlineno__", "__static_attributes__"} != set(vars(reference))

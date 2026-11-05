@@ -163,6 +163,7 @@ def test_unsupported_decorator_and_defaults(
         (provider, "CONF_CORE", "providers"),
         (provider, "CONF_PRIVATE_TRIAL_TARGET", "other"),
         (provider, "asyncio", object()),
+        (provider, "cast", lambda *_args: None),
         (provider, "Scope", SimpleNamespace(SYSTEM_MANAGE=None)),
         (constants, "CONF_PRIVATE_NATIVE_VOLUME_CAPTURE", "wrong"),
     ],
@@ -390,4 +391,15 @@ def test_live_enum_hashable_values_corruption_is_unverified() -> None:
         assert evidence.server_code_evidence(provider)["status"] == "unverified"
     finally:
         type.__setattr__(cls, "_hashable_values_", original)
+    assert evidence.server_code_evidence(provider)["status"] == "verified"
+
+
+def test_live_enum_name_corruption_is_unverified() -> None:
+    """A live enum whose `__name__` differs from its declaration is rejected."""
+    cls = constants.PrivateFlagState
+    type.__setattr__(cls, "__name__", "Other")
+    try:
+        assert evidence.server_code_evidence(provider)["status"] == "unverified"
+    finally:
+        type.__setattr__(cls, "__name__", "PrivateFlagState")
     assert evidence.server_code_evidence(provider)["status"] == "verified"
