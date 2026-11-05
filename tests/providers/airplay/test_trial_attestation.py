@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import textwrap
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -81,11 +82,16 @@ def install_host_spawn(
         if mode == "wrong":
             payload["nonce"] = "0" * 32
         line = "[ATTEST] " + json.dumps(payload) + "\n"
-        body = f"import os,sys,time\nassert os.pread({fd},4,0)==b'\\x7fELF'\n"
+        body = textwrap.dedent(f"""\
+            import os,sys,time
+            assert os.pread({fd},4,0)==b'\\x7fELF'
+        """)
         if expected_environment is not None:
-            body += f"expected = {expected_environment!r}\n"
-            body += "assert all(os.getenv(key) == value for key, value in expected.items())\n"
-            body += "assert 'SUPERVISOR_TOKEN' not in os.environ\n"
+            body += textwrap.dedent(f"""\
+                expected = {expected_environment!r}
+                assert all(os.getenv(key) == value for key, value in expected.items())
+                assert 'SUPERVISOR_TOKEN' not in os.environ
+            """)
         if mode == "delay":
             body += "os.write(2,b'connected\\n')\nsys.stdin.buffer.read(1)\n"
         if mode != "silent":
@@ -232,14 +238,14 @@ async def test_stream_environment_reaches_a_real_child(
         )
         monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=[str(fixed_asset)]))
     else:
-        child_code = (
-            "import os,time\n"
-            f"expected = {expected_environment!r}\n"
-            "assert all(os.getenv(key) == value for key, value in expected.items())\n"
-            "assert 'SUPERVISOR_TOKEN' not in os.environ\n"
-            "os.write(1, b'[TEST] environment-verified\\n')\n"
-            "time.sleep(10)\n"
-        )
+        child_code = textwrap.dedent(f"""\
+            import os,time
+            expected = {expected_environment!r}
+            assert all(os.getenv(key) == value for key, value in expected.items())
+            assert 'SUPERVISOR_TOKEN' not in os.environ
+            os.write(1, b'[TEST] environment-verified\\n')
+            time.sleep(10)
+        """)
         children = []
         monkeypatch.setattr(
             stream, "_build_cli_args", AsyncMock(return_value=[sys.executable, "-c", child_code])
