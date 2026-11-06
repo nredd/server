@@ -30,6 +30,11 @@ from music_assistant.helpers.private_transport import (
     resolved_media_route,
 )
 from music_assistant.providers.airplay import provider as provider_module
+from music_assistant.providers.airplay.constants import (
+    CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+    CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+    StreamingProtocol,
+)
 from music_assistant.providers.airplay.provider import AirPlayProvider
 from music_assistant.providers.airplay.stream import AirPlayStream
 from tests.providers.airplay.test_stream import _make_player
@@ -543,4 +548,41 @@ async def test_pending_latches_incomplete_at_observation() -> None:
     assert attempt.media_snapshot()["state"] == "pending"
     attempt.observe_at = attempt.loop.time() - 0.001
     assert attempt.media_snapshot()["state"] == "incomplete"
+    await retire(attempt)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+async def test_capture_eligible_connect_is_refused_only_for_v2(version: int) -> None:
+    """A flag flip across connect's awaits cannot give a v2 receipt attempt native capture."""
+    player = _make_player()
+    player.protocol = StreamingProtocol.AIRPLAY2
+    player.protocol_override = None
+    stream: Any = AirPlayStream(player)
+    stream.prov.config.get_value = lambda key, _default=None: (
+        key
+        in (
+            CONF_EXPERIMENTAL_HOMEPOD_REMOTE,
+            CONF_PRIVATE_NATIVE_VOLUME_CAPTURE,
+        )
+    )
+    attempt = PrivateTransportAttempt(TOKEN, player, object(), "x", lambda: True, version, TARGET)
+    stream.private_attempt = attempt
+    process = AsyncMock(side_effect=RuntimeError("spawned"))
+    with (
+        patch(
+            "music_assistant.providers.airplay.stream.trial_binary.is_trial_target", lambda: True
+        ),
+        patch.object(stream, "_build_cli_args", AsyncMock(return_value=["binary"])),
+        patch.object(stream, "_create_private_pipe", AsyncMock()) as pipe,
+        patch(
+            "music_assistant.providers.airplay.stream.trial_binary.create_private_process",
+            process,
+        ),
+    ):
+        expected = ValueError if version == 2 else RuntimeError
+        with pytest.raises(expected):
+            await stream.connect()
+    assert process.await_count == (0 if version == 2 else 1)
+    assert pipe.await_count == (0 if version == 2 else 1)
+    assert stream.native_volume_capture is None
     await retire(attempt)

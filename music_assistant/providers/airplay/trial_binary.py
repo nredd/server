@@ -139,6 +139,11 @@ class TrialAsyncProcess(AsyncProcess):
         """Return whether the receipt stream was rejected and is only being discarded."""
         return self._receipt_rejected
 
+    @property
+    def receipt_eof(self) -> bool:
+        """Return whether the receipt reader has seen stdout EOF."""
+        return self._receipt_eof
+
     def has_current_receipt(self) -> bool:
         """Return whether this exact owned child has a current acknowledgement receipt."""
         return self._current_receipt() is not None
@@ -231,6 +236,23 @@ class TrialAsyncProcess(AsyncProcess):
                 except TrialBinaryError:
                     self.reject_receipt_stream()
                     raise
+        finally:
+            self._receipt_reading = False
+
+    async def discard_receipt_stream(self) -> None:
+        """
+        Discard stdout to EOF as its exclusive reader after the receipt reader was joined.
+
+        :raises TrialBinaryError: If another reader is active or the pipe is unavailable.
+        """
+        if self._receipt_reading or self.proc is None or self.proc.stdout is None:
+            raise TrialBinaryError("Private receipt discard is not permitted")
+        self._receipt_rejected = True
+        self._receipt_reading = True
+        try:
+            while await self._receipt_read(MAX_RECEIPT_CHUNK):
+                pass
+            self._receipt_eof = True
         finally:
             self._receipt_reading = False
 

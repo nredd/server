@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 import textwrap
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from music_assistant.helpers.private_transport import PrivateTransportAttempt
+from music_assistant.helpers.private_transport import PrivateTransportAttempt, ReceiptScanner
 from music_assistant.providers.airplay import trial_binary as trial
 from music_assistant.providers.airplay.stream import AirPlayStream
 from tests.providers.airplay.test_stream import _make_player
@@ -447,7 +448,13 @@ async def test_second_start_never_completes(pinned: Path) -> None:
 async def test_old_cancelled_reader_control_loses_the_final(
     pinned: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Control: the pre-change release cancelled the stdout reader and lost the final."""
+    """
+    Control: cancelling the owner before EOF (the pre-change release) loses the final.
+
+    The old assertion was `returncode == 0`: the child was left to exit on its own and was
+    merely read-starved. Ownership loss now contains at once (SIGKILL) and discards to EOF, so
+    the exact expectation is `-SIGKILL`, with cleanup complete and media never complete.
+    """
     original = AirPlayStream.private_release
 
     async def old_release(self: AirPlayStream) -> None:
@@ -459,10 +466,11 @@ async def test_old_cancelled_reader_control_loses_the_final(
 
     monkeypatch.setattr(AirPlayStream, "private_release", old_release)
     run = await start(pinned, route_and("raop", rec()))
-    await run.finish()
+    result = await run.finish()
     assert run.proc.proc is not None
-    assert run.proc.proc.returncode == 0
-    assert run.media["state"] != "complete"
+    assert run.proc.proc.returncode == -signal.SIGKILL
+    assert result["cleanup_complete"] is True
+    assert run.media["state"] == "incomplete"
 
 
 async def test_wrapper_close_and_kill_before_eof_never_steal_stdout(pinned: Path) -> None:
@@ -647,3 +655,48 @@ async def test_unscreened_reader_error_terminates_without_spinning(
     await run.go()
     await run.finish()
     assert run.media["state"] == "incomplete"
+
+
+BIG = 300 * 1024
+FLOOD = prog(f"w(b'x' * {BIG})", "wait_go()")
+
+
+async def _lost_owner_run(pinned: Path, how: str, monkeypatch: pytest.MonkeyPatch) -> Run:
+    """Start a child flooding stdout past the pipe buffer, then lose its owner before EOF."""
+    if how == "mode":
+
+        def broken(_self: trial.TrialAsyncProcess) -> None:
+            """Fail before the first read, like a start-mode failure."""
+            raise RuntimeError("mode")
+
+        monkeypatch.setattr(trial.TrialAsyncProcess, "enter_receipt_mode", broken)
+    elif how == "parser":
+
+        def feed(_self: ReceiptScanner, _chunk: bytes) -> list[bytes]:
+            """Raise like a parser bug."""
+            raise RuntimeError("parser")
+
+        monkeypatch.setattr(ReceiptScanner, "feed", feed)
+    run = await start(pinned, FLOOD, deadlines=(30, 40, 50))
+    if how == "cancel":
+        run.attempt.stdout_owners[run.proc].cancel()
+    return run
+
+
+@pytest.mark.parametrize("how", ["mode", "parser", "cancel"])
+async def test_dead_owner_with_flooding_child_still_reaps(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """A dead owner must not strand a >pipe-buffer child: contain at once, discard to EOF."""
+    run = await _lost_owner_run(pinned, how, monkeypatch)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    result = await run.finish(timeout=10)
+    # Far below the 40s drain deadline: containment was immediate, not deadline-forced.
+    assert loop.time() - began < 8
+    assert result["cleanup_complete"] is True
+    assert run.media["state"] == "incomplete"
+    assert run.proc.proc is not None
+    assert run.proc.proc.returncode is not None
+    assert run.proc.receipt_rejected
+    assert not run.proc.has_current_receipt()

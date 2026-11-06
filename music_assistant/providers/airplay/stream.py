@@ -422,7 +422,7 @@ class AirPlayStream:
             ),
         }
         if self.private_attempt is not None:
-            self.private_attempt.check_current()
+            self._check_private_start(capture_eligible)
             await self._create_private_pipe()
             self.private_attempt.check_current()
         if trial_binary.is_trial_target():
@@ -1152,6 +1152,23 @@ class AirPlayStream:
         else:
             self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
 
+    def _check_private_start(self, capture_eligible: bool) -> None:
+        """
+        Reject a stale owner, and a v2 receipt attempt that would own native volume capture.
+
+        Flags are re-read across connect's awaits, so ARM's all-flags-off check alone does not
+        prove capture is off here.
+
+        :raises ValueError: If a v2 attempt would enable native volume capture.
+        """
+        attempt = self.private_attempt
+        if attempt is None:
+            return
+        attempt.check_current()
+        if self._uses_private_receipt() and capture_eligible:
+            attempt.request_stop("capture-refused")
+            raise ValueError("Private media receipt refuses native volume capture")
+
     def _uses_private_receipt(self) -> bool:
         """Whether this stream is a v2 private attempt owning its stdout through EOF."""
         attempt = self.private_attempt
@@ -1652,7 +1669,9 @@ class AirPlayStream:
             self._report_unreported_homepod_remote_admission()
             await backend.close()
         except BaseException:
+            # Ownership is lost: contain now; the attempt hands stdout to its discard drainer.
             attempt.fail_media()
+            process.reject_receipt_stream()
             raise
 
     def _private_owner_current(

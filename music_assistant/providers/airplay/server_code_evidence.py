@@ -18,7 +18,7 @@ import typing
 import urllib.parse
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
@@ -33,6 +33,7 @@ from music_assistant.controllers.player_queues import queue_loader
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players import controller as players_controller
 from music_assistant.helpers import ffmpeg, private_transport, private_trial
+from music_assistant.helpers import process as process_module
 from music_assistant.helpers.private_trial import encode_public_digest
 
 from . import (
@@ -356,6 +357,16 @@ def _check_transport_boundaries(
             ),
         ),
         (
+            "trial_binary",
+            trial_binary,
+            (
+                "_parse_attestation_line",
+                "_reject_duplicate_json_keys",
+                "create_private_process",
+                "_open_private_asset_fd",
+            ),
+        ),
+        (
             "private_transport",
             private_transport.ReceiptScanner,
             ("__init__", "feed", "finish", "_complete_line"),
@@ -368,7 +379,20 @@ def _check_transport_boundaries(
                 "enter_receipt_mode",
                 "read_receipt_chunk",
                 "reject_receipt_stream",
+                "discard_receipt_stream",
                 "read_stdout",
+                "write",
+                "verified_stdin_fd",
+                "_release_after_exit",
+                "_release_asset_fd",
+                "read",
+                "readexactly",
+                "communicate",
+                "start",
+                "_verify_acknowledgement",
+                "_read_attestation_line",
+                "_current_receipt",
+                "_kill_and_reap",
                 "close",
                 "kill",
                 "has_historical_receipt",
@@ -404,6 +428,7 @@ def _check_transport_boundaries(
                 "_release",
                 "_read_pipe",
                 "_drain",
+                "_hand_off_stdout",
             ),
         ),
         ("queue_helpers", queue_helpers, ("handle_play_action",)),
@@ -440,6 +465,7 @@ def _check_transport_boundaries(
                 "_private_owner_current",
                 "_attach_stdout_reader",
                 "_uses_private_receipt",
+                "_check_private_start",
                 "_parse_route_status",
             ),
         ),
@@ -460,7 +486,7 @@ def _check_transport_boundaries(
     ):
         raise ValueError("Unexpected transport boundary binding")
     _check_transport_globals(trees["private_transport"])
-    _check_receipt_bindings(modules, trees)
+    _check_receipt_bindings(modules, codes, trees)
     for name, module, qualname in (
         ("_handle_play_media", queue_loader, "QueueLoaderMixin._handle_play_media"),
         ("play_index", queue_controller, "PlayerQueuesController.play_index"),
@@ -501,7 +527,11 @@ def _check_transport_globals(tree: ast.Module) -> None:
             raise ValueError("Unexpected transport pattern")
 
 
-def _check_receipt_bindings(modules: dict[str, ModuleType], trees: dict[str, ast.Module]) -> None:
+def _check_receipt_bindings(
+    modules: dict[str, ModuleType],
+    modules_codes: dict[str, list[CodeType]],
+    trees: dict[str, ast.Module],
+) -> None:
     """Seal the receipt parser's constants, shapes and imported dependencies."""
     _check_literal_globals(
         trees["private_transport"],
@@ -536,6 +566,58 @@ def _check_receipt_bindings(modules: dict[str, ModuleType], trees: dict[str, ast
     ):
         raise ValueError("Unexpected receipt dependency bindings")
     _check_receipt_shapes()
+    process_class = trial_binary.TrialAsyncProcess
+    if (
+        vars(trial_binary)["TrialAsyncProcess"] is not process_class
+        or vars(trial_binary)["AsyncProcess"] is not process_module.AsyncProcess
+        or process_class.__bases__ != (process_module.AsyncProcess,)
+        or type(process_class) is not type
+    ):
+        raise ValueError("Unexpected private process class")
+    if (
+        set(vars(process_class)) - {"__firstlineno__", "__static_attributes__"}
+        != _TRIAL_PROCESS_NAMES
+    ):
+        raise ValueError("Unexpected private process members")
+    for name in ("receipt_rejected", "receipt_eof"):
+        _check_function(
+            modules_codes["trial_binary"], trees["trial_binary"], process_class, name, prop=True
+        )
+
+
+_TRIAL_PROCESS_NAMES: Final = frozenset(
+    {
+        "__module__",
+        "__doc__",
+        "__init__",
+        "start",
+        "has_historical_receipt",
+        "receipt_rejected",
+        "receipt_eof",
+        "has_current_receipt",
+        "verified_stdin_fd",
+        "write",
+        "read",
+        "readexactly",
+        "enter_receipt_mode",
+        "read_receipt_chunk",
+        "discard_receipt_stream",
+        "reject_receipt_stream",
+        "communicate",
+        "read_stdout",
+        "close",
+        "kill",
+        "_release_receipt_owner",
+        "_receipt_read",
+        "_screen_receipt_bytes",
+        "_verify_acknowledgement",
+        "_read_attestation_line",
+        "_kill_and_reap",
+        "_release_after_exit",
+        "_release_asset_fd",
+        "_current_receipt",
+    }
+)
 
 
 def _check_receipt_shapes() -> None:

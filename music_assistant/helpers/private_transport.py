@@ -16,7 +16,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Final, Protocol, TypedDict
+from typing import Any, Final, Protocol, TypedDict, cast
 from urllib.parse import urlsplit
 
 _TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -121,6 +121,20 @@ class MediaReceipt:
     addr: str | None
     port: int
     setup_port: int
+
+
+class ReceiptProcess(Protocol):
+    """Wrapper whose stdout is owned by a single receipt reader."""
+
+    @property
+    def receipt_eof(self) -> bool:
+        """Whether the reader saw EOF."""
+
+    def reject_receipt_stream(self) -> None:
+        """Revoke trust and signal the child once."""
+
+    async def discard_receipt_stream(self) -> None:
+        """Discard stdout to EOF as its exclusive reader."""
 
 
 class OwnedProcess(Protocol):
@@ -666,6 +680,16 @@ class PrivateTransportAttempt:
                 else TransportOutcome.NATURAL_CLEANUP
             )
 
+    async def _hand_off_stdout(self, process: OwnedProcess, owner: asyncio.Task[None]) -> None:
+        """Join the owner; if it ended before EOF, kill and discard as the exclusive reader."""
+        outcome = (await asyncio.gather(owner, return_exceptions=True))[0]
+        receipt = cast("ReceiptProcess", process)
+        if outcome is None and receipt.receipt_eof:
+            return
+        self.fail_media()
+        receipt.reject_receipt_stream()
+        await receipt.discard_receipt_stream()
+
     def _force(self) -> None:
         """Record forced containment; media evidence can never survive it."""
         self.forced = True
@@ -712,6 +736,8 @@ class PrivateTransportAttempt:
             for pipe in (proc.stdout, proc.stderr)
             if pipe is not None and not (pipe is proc.stdout and owner is not None)
         ]
+        if owner is not None:
+            readers.append(asyncio.create_task(self._hand_off_stdout(process, owner)))
         waiter = asyncio.create_task(proc.wait())
         reaped, _ = await asyncio.wait({waiter}, timeout=max(0, self.drain_at - self.loop.time()))
         if not reaped and proc.returncode is None:
@@ -720,10 +746,6 @@ class PrivateTransportAttempt:
                 proc.kill()
         await waiter
         await asyncio.gather(*readers)
-        if owner is not None:
-            outcome = (await asyncio.gather(owner, return_exceptions=True))[0]
-            if outcome is not None:
-                self.fail_media()
         if proc.returncode is not None and proc.returncode < 0:
             self._force()
         # The child is already reaped and both pipes reached EOF. This only
