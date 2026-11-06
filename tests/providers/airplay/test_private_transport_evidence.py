@@ -303,3 +303,10 @@ def test_factory_subclass_and_extra_members_are_rejected(
     assert evidence()["status"] == "unverified"
     monkeypatch.undo()
     assert evidence()["status"] == "verified"
+
+
+@pytest.mark.parametrize("name", ["cast", "suppress"])
+def test_owner_handoff_dependencies_are_bound(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """A substituted `cast`/`suppress` could forge the discard decision; both are sealed."""
+    monkeypatch.setattr(private_transport, name, lambda *_a, **_k: None)
+    assert evidence()["status"] == "unverified"

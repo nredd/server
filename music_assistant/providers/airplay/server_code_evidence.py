@@ -557,6 +557,10 @@ def _check_receipt_bindings(
         or vars(private_transport)["dataclass"] is not dataclasses.dataclass
         or vars(private_transport)["MediaReceiptError"] is not private_transport.MediaReceiptError
         or vars(trial_binary)["suppress"] is not contextlib.suppress
+        or vars(private_transport)["cast"] is not typing.cast
+        or vars(private_transport)["suppress"] is not contextlib.suppress
+        or vars(private_transport)["TransportOutcome"] is not private_transport.TransportOutcome
+        or vars(private_transport)["MediaState"] is not private_transport.MediaState
         or stream_globals["ReceiptScanner"] is not private_transport.ReceiptScanner
         or stream_globals["resolved_media_route"] is not private_transport.resolved_media_route
         or stream_globals["PrivateTransportAttempt"]

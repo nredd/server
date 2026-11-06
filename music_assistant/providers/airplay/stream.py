@@ -1156,8 +1156,9 @@ class AirPlayStream:
         """
         Reject a stale owner, and a v2 receipt attempt that would own native volume capture.
 
-        Flags are re-read across connect's awaits, so ARM's all-flags-off check alone does not
-        prove capture is off here.
+        `capture_eligible` is computed before connect's awaits. `check_current` re-checks the
+        flags now, so a flag set and cleared again in between passes it while eligibility is
+        still stale; refuse that before any side effect.
 
         :raises ValueError: If a v2 attempt would enable native volume capture.
         """
