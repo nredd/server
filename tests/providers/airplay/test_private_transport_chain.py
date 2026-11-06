@@ -124,6 +124,31 @@ class Chain:
             },
         )
 
+    async def http(self, command: str, args: dict[str, Any]) -> Any:
+        """Use actual JSON/argument parsing with synthetic authentication."""
+        request: Any = SimpleNamespace(
+            remote="127.0.0.1",
+            can_read_body=True,
+            headers={},
+            read=AsyncMock(return_value=json.dumps({"command": command, "args": args}).encode()),
+        )
+        return await WebserverController._handle_jsonrpc_api_command(self.web, request)
+
+    async def private(self, mode: str) -> Any:
+        """Dispatch an actual private HTTP command."""
+        request = {"mode": mode, "attempt_id": TOKEN}
+        if mode == "arm":
+            request |= {"player_id": PLAYER, "media": URL}
+        return await self.http("airplay/private_trial_transport", {"request": request})
+
+    def assert_drained(self) -> None:
+        """Check actual controller/queue/provider lock bookkeeping after cancellation."""
+        assert self.data.play_action_refcount == 0
+        assert not self.players._task_held_locks
+        assert not self.players._state_update_subscribers
+        assert all(not lock.locked() for lock in self.players._player_command_locks.values())
+        assert not self.player._lock.locked()
+
     def _setup_queue(self) -> None:
         """Replace bookkeeping/audio boundaries while keeping real queue actions."""
         queues: Any = self.queues
@@ -265,31 +290,6 @@ class Chain:
         monkeypatch.setattr(
             "music_assistant.providers.airplay.provider.is_trial_target", lambda: True
         )
-
-    async def http(self, command: str, args: dict[str, Any]) -> Any:
-        """Use actual JSON/argument parsing with synthetic authentication."""
-        request: Any = SimpleNamespace(
-            remote="127.0.0.1",
-            can_read_body=True,
-            headers={},
-            read=AsyncMock(return_value=json.dumps({"command": command, "args": args}).encode()),
-        )
-        return await WebserverController._handle_jsonrpc_api_command(self.web, request)
-
-    async def private(self, mode: str) -> Any:
-        """Dispatch an actual private HTTP command."""
-        request = {"mode": mode, "attempt_id": TOKEN}
-        if mode == "arm":
-            request |= {"player_id": PLAYER, "media": URL}
-        return await self.http("airplay/private_trial_transport", {"request": request})
-
-    def assert_drained(self) -> None:
-        """Check actual controller/queue/provider lock bookkeeping after cancellation."""
-        assert self.data.play_action_refcount == 0
-        assert not self.players._task_held_locks
-        assert not self.players._state_update_subscribers
-        assert all(not lock.locked() for lock in self.players._player_command_locks.values())
-        assert not self.player._lock.locked()
 
 
 @pytest.mark.parametrize("mode", ["stop", "expiry"])
