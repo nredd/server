@@ -165,19 +165,25 @@ extract or copy `app_secrets`, credentials or original databases. Do not redistr
 an image derived from the official server image. The old local DEV app in ERROR and
 its previous seed are NOT a rollback target.
 
-The private CLI candidate source is `429c5670fb6cdf1ddbf28ca5cfab0e5db7d2aea4`,
-merged as `7a03fcfd45ebfb584921d942bef7b68b660cea03`. GitHub workflow `41769386002`
-passed, including the fully static Linux ARM64 artifact job. The artifact was built from
-CI synthetic merge `cd7d36b`; its tree equals the reviewed source and merged trees
-`20c188938ed3ab3d547dd8f099cb8f5e9324b79e`. It has ELF SHA256
-`fc77ceec40e796fffa89a06b95c384f5838d6308bdedda3cc2491d3a53cf7fb8` (6415680 bytes)
-and build label `vcd7d36b`. Receiver-free current-image attestation and the reviewed v2
-synthetic-loopback suite passed: natural handshake rejection, test-only two-second
-`child_deadline`, rejection, STOP, SIGTERM, and SIGINT cases. This acceptance excludes
-receiver identity, snapshot freshness, receiver admission, playback, native volume behavior,
-and deployment. The candidate remains an immutable acceptance artifact only;
-`launch_authorized` stays false and no trial deployment is authorized. Earlier assets stay
-staged as history.
+The private CLI candidate source is `7e9f1756ad7f10cdebc89fee71a8c0a1bf7dda48`
+(`nredd/airplay-cli` PR #29). GitHub workflow `42159577709` passed, including the
+fully static Linux ARM64 artifact job and Alpine/Debian checks. Artifact `13476207483`
+has ZIP SHA256 `d5e2d4806b4d45c4c1f4fa1e8fe9e14e50a704fabe4047ba09689e726330d4b2`.
+The ELF has SHA256
+`e7cc51d557c31a9ea05e26f6a284d938a5a1cdad37e04078b87dd29004d8ce67` (6415680 bytes)
+and measured `--check` output `cliairplay v7e9f175 check` (newline-terminated,
+empty stderr, exit zero). Receiver-free FD-bound current-image attestation matched both
+pinned digests. The source passed 72 native strict-peer PTP dispatch cases. These are
+artifact/source checks, not receiver identity, snapshot freshness, receiver admission,
+playback, native volume behavior, or deployment acceptance. The candidate remains an
+immutable acceptance artifact only; `launch_authorized` stays false. No release tag or
+distribution pin changes here. Earlier assets remain history.
+
+The runtime pin, launch-record source/digest/label/path, and the standalone
+`scripts/private_trial_window.sh` digest/label remain consistent. Only those two shell
+constants change: that standalone tool is not the accepted production path. The runtime
+startup, descriptor/nonce attestation, and strict PTP parser are unchanged. Controlled
+host test fixtures do not execute the Linux ARM artifact or prove a live runtime image.
 
 ## Private aggregate volume capture
 
@@ -520,7 +526,7 @@ executable must match SHA256 and ELF64 little-endian AArch64 headers before `--c
 The build check executes a retained validated descriptor too, never a pathname which can
 be swapped and restored between pre/post validation. It has a five-second deadline,
 4096-byte combined-output limit and at most one
-second of cleanup, and must report `cliairplay`, `check` and `vcd7d36b` with exit zero.
+second of cleanup, and must report `cliairplay`, `check` and `v7e9f175` with exit zero.
 Only the fixed build label is retained, never arbitrary check output. The bytes are
 validated again after the check. There is no successful-validation cache on mutable media.
 Delayed pairing revalidates immediately before constructing its execution arguments.
@@ -651,8 +657,10 @@ or real receiver admission. Previous pins `208e9c069163a1c9e1a4ed6da16015d69d972
 and `0f7b543127f71c5639d55d4e0e34168ba92d0c33` are observer history only.
 The installer anchor identifies the requested source, not proof of loaded code. The separate
 `server_code_evidence` guard checks selected loaded code, not the entire process. The observer itself
-is tooling and may be newer than the runtime source it pins. The separate CLI pins (`429c5670`
-source, `cd7d36b` CI label, `fc77ceec` ELF) remain unchanged.
+is tooling and may be newer than the runtime source it pins. The separate current CLI pin is
+`7e9f1756ad7f10cdebc89fee71a8c0a1bf7dda48` source, `v7e9f175` build label, and
+`e7cc51d557c31a9ea05e26f6a284d938a5a1cdad37e04078b87dd29004d8ce67` ELF SHA256;
+changing it does not update or validate this observer's runtime source anchor.
 The closed `StrEnum` flag states, modes, statuses and reasons in `constants.py` are covered too: each
 source declaration must be plain literal members of one `StrEnum` and match the live class members and
 shape, else the evidence is `unverified`.
