@@ -18,6 +18,7 @@ from music_assistant_models.queue_item import QueueItem, QueueItemOrigin
 
 from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS
 from music_assistant.controllers.player_queues.constants import ArtistOrder
+from music_assistant.helpers.private_transport import CURRENT_ATTEMPT
 
 if TYPE_CHECKING:
     from music_assistant_models.enums import ContentType, PlaybackState
@@ -92,6 +93,9 @@ def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
     @functools.wraps(func)
     async def wrapper(self: PlayActionHostT, /, *args: P.args, **kwargs: P.kwargs) -> R:
         """Execute function with playback lock and play action flag set."""
+        attempt = CURRENT_ATTEMPT.get()
+        if attempt is not None:
+            attempt.check_current()
         queue_id = kwargs.get("queue_id") or args[0]
         assert isinstance(queue_id, str)  # for type checking
         queue_data = self._queue_data.get(queue_id)
@@ -102,6 +106,10 @@ def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
         # player from it first, which takes the group's lock - so that one is taken before
         # the player's own (see PlayerController.get_group_and_player_lock)
         async with self.mass.players.get_group_and_player_lock(queue_id, strict=True):
+            if attempt is not None:
+                attempt.check_current()
+                if queue is not attempt.queue:
+                    raise ValueError("Private transport queue changed")
             prev_in_progress = queue.extra_attributes.get(ATTR_PLAY_ACTION_IN_PROGRESS, False)
             try:
                 queue_data.play_action_refcount += 1

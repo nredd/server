@@ -14,6 +14,7 @@ from music_assistant_models.errors import MusicAssistantError, PlayerCommandFail
 from music_assistant.constants import CONF_SYNC_ADJUST
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
 from music_assistant.helpers.ffmpeg import FFMpeg
+from music_assistant.helpers.private_transport import CURRENT_ATTEMPT
 
 from . import trial_binary
 from .constants import (
@@ -84,6 +85,8 @@ class AirPlayStreamSession:
         self.pcm_format = pcm_format
         self.media = media
         self.sync_clients = sync_clients
+        self.private_attempt = CURRENT_ATTEMPT.get()
+        self._private_stream: AirPlayStream | None = None
         self._audio_source_task: asyncio.Task[None] | None = None
         self._player_ffmpeg: dict[str, FFMpeg] = {}
         self._lock = asyncio.Lock()
@@ -204,6 +207,8 @@ class AirPlayStreamSession:
             # anchor with a short lead. Readiness is fully event-driven
             # (connected + audio), so no guessed setup time is needed; the
             # binary bursts the receiver pre-fill after START.
+            if self.private_attempt is not None:
+                self.private_attempt.check_current()
             self._audio_source_task = asyncio.create_task(self._audio_streamer(audio_source))
             await self._wait_members_audio_present()
             # Members of a group have to agree on one instant, and a freshly
@@ -217,7 +222,10 @@ class AirPlayStreamSession:
                 position_ms, self._anchor_start_unix_ms(ready_at_unix_ms=ready_at_unix_ms)
             )
         except asyncio.CancelledError:
-            await self.stop()
+            if self.private_attempt is not None:
+                self.private_attempt.request_stop("session-cancelled")
+            else:
+                await self.stop()
             raise
         except Exception as err:
             # playback failed to start, cleanup. This runs for every failure. A
@@ -229,7 +237,10 @@ class AirPlayStreamSession:
                 len(self.sync_clients),
                 err,
             )
-            await self.stop()
+            if self.private_attempt is not None:
+                self.private_attempt.request_stop("session-failed")
+            else:
+                await self.stop()
             # A member can fail for a specific, user-actionable reason (a device
             # that needs its password configured, for example). That error must
             # reach the caller intact instead of being flattened into the generic
@@ -366,8 +377,19 @@ class AirPlayStreamSession:
         self.parked = True
         return True
 
+    async def private_release(self) -> None:
+        """Release captured private producers and publication, never a newer stream."""
+        if self._audio_source_task is not None:
+            self._audio_source_task.cancel()
+            await asyncio.gather(self._audio_source_task, return_exceptions=True)
+        if self._private_stream is not None:
+            await self._private_stream.private_release()
+
     async def stop(self) -> None:
         """Stop playback and cleanup."""
+        if self.private_attempt is not None:
+            self.private_attempt.request_stop("session-stop")
+            return
         if self._audio_source_task and not self._audio_source_task.done():
             self._audio_source_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -935,6 +957,8 @@ class AirPlayStreamSession:
         :return: True if there are still running clients, False otherwise.
         """
         async with self._lock:
+            if self.private_attempt is not None:
+                self.private_attempt.check_current()
             sync_clients = [x for x in self.sync_clients if x.stream and x.stream.running]
             if not sync_clients:
                 return False
@@ -1137,6 +1161,11 @@ class AirPlayStreamSession:
         # process is connected and published, so a Sendspin bridge start cannot
         # put a second cli process on the same receiver in between.
         async with airplay_player.stream_spawn_lock:
+            attempt = self.private_attempt
+            if attempt is not None:
+                attempt.check_current()
+                if airplay_player is not attempt.player or airplay_player.stream is not None:
+                    raise ValueError("Private transport cannot displace publication")
             if airplay_player.stream:
                 # Stopped unconditionally, not just while it reads as running: a
                 # stream stops reporting that the moment its own stop() starts,
@@ -1146,9 +1175,15 @@ class AirPlayStreamSession:
                 await airplay_player.stream.stop()
             stream_pcm_format = airplay_player.get_stream_pcm_format(self.pcm_format)
             stream = AirPlayStream(airplay_player, pcm_format=stream_pcm_format)
+            if attempt is not None:
+                attempt.bind_stream(stream)
+                self._private_stream = stream
+                attempt.check_current()
             airplay_player.stream = stream
             stream.session = self
             await stream.connect(use_shared_ptp)
+            if attempt is not None:
+                attempt.check_current()
             # Wiring the audio producer to the cli stdin belongs to the same
             # claim: a displacement landing between the connect and this would
             # leave an ffmpeg feeding a process that is already gone, with
@@ -1445,7 +1480,10 @@ class AirPlayStreamSession:
             filter_params=output_plan.filter_params,
             audio_output=audio_output,
         )
-        await ffmpeg.start()
+        if self.private_attempt is not None:
+            await self.private_attempt.spawn(ffmpeg)
+        else:
+            await ffmpeg.start()
         self._player_ffmpeg[player.player_id] = ffmpeg
 
 

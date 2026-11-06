@@ -6,6 +6,10 @@ binary-path setting, downloader, image distribution or production deployment pro
 
 ## Discovery admission
 
+The opt-in attempt-owned ARM/PLAY/STOP/GET contract is documented in
+[the private transport contract](docs/private-trial-transport.md). It requires separate
+client integration and is not audio evidence or live-adoption approval.
+
 Before enabling the private target, call the private-only `SYSTEM_MANAGE` command
 `airplay/private_trial_admission/preflight` with `player_id` set to the canonical
 `ap` plus 12 lowercase hex digits. Require `version` 1, `config_state` of `absent`

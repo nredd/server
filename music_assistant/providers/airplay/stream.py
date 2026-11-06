@@ -26,6 +26,7 @@ from music_assistant_models.media_items import Radio
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
+from music_assistant.helpers.private_transport import CURRENT_ATTEMPT
 from music_assistant.helpers.private_trial import private_child_env
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import sanitize_http_header_value
@@ -168,7 +169,9 @@ class AirPlayStream:
         self.active_remote_id: str = generate_active_remote_id(remote_seed)
         self._stream_id = uuid4().hex
         self.prevent_playback: bool = False
+        self.private_attempt = CURRENT_ATTEMPT.get()
         self._cli_proc: AsyncProcess | None = None
+        self._private_pipe_create_task: asyncio.Task[None] | None = None
         self.commands_pipe = AsyncNamedPipeWriter(
             f"/tmp/{self.player.protocol.value}-{self.player.player_id}-"  # noqa: S108
             f"{self.active_remote_id}-{self._stream_id}-cmd",
@@ -411,6 +414,10 @@ class AirPlayStream:
                 else "0"
             ),
         }
+        if self.private_attempt is not None:
+            self.private_attempt.check_current()
+            await self._create_private_pipe()
+            self.private_attempt.check_current()
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(
                 args,
@@ -434,13 +441,20 @@ class AirPlayStream:
             self.native_volume_capture = PrivateVolumeCapture()
             self.native_volume_capture.require_stdout_validation()
         try:
-            await self.commands_pipe.create()
-            await self._cli_proc.start()
+            if self.private_attempt is None:
+                await self.commands_pipe.create()
+            if self.private_attempt is not None:
+                await self.private_attempt.spawn(self._cli_proc)
+            else:
+                await self._cli_proc.start()
             if self.native_volume_capture:
                 self.native_volume_capture.trust(self._cli_proc)
             self._cli_proc.attach_stderr_reader(self.mass.create_task(self._stderr_reader()))
             self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
         except BaseException:
+            if self.private_attempt is not None:
+                self.private_attempt.request_stop("connect-failed")
+                raise
             try:
                 await self._cleanup_failed_start()
             except Exception as err:
@@ -505,6 +519,32 @@ class AirPlayStream:
         # on top of the identity push above
         self.player.on_player_media_updated()
 
+    async def private_release(self) -> None:
+        """Detach exact owned state before the attempt drains its captured processes."""
+        self._stopping = self._stopped = True
+        self._teardown_started.set()
+        tasks = [
+            task
+            for task in (
+                self._stdout_reader_task,
+                self._cli_proc._stderr_reader_task if self._cli_proc is not None else None,
+            )
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        process = self._cli_proc
+        if process is not None and process.proc is not None and process.proc.returncode is None:
+            # EOF alone can park a CLI awaiting another START. Deliver teardown
+            # directly, without either ordinary stop/metadata lock, before unlinking.
+            await self._write_cli_command("ACTION=STOP")
+        if self._private_pipe_create_task is not None:
+            await asyncio.gather(self._private_pipe_create_task, return_exceptions=True)
+        await self.commands_pipe.remove()
+        if self.player.stream is self:
+            self.player.stream = None
+
     async def stop(self, force: bool = False) -> None:
         """
         Stop playback and cleanup.
@@ -515,6 +555,9 @@ class AirPlayStream:
             valid capture record. The demoted path runs under one deadline
             (`_CAPTURE_GRACEFUL_STOP_TIMEOUT`) and falls back to the kill past it.
         """
+        if self.private_attempt is not None:
+            self.private_attempt.request_stop("stream-stop")
+            return
         async with self._stop_lock:
             if self._cleanup_complete:
                 return
@@ -812,6 +855,8 @@ class AirPlayStream:
             the binary reports that it scheduled no instant, or it never
             acknowledged the start.
         """
+        if self.private_attempt is not None:
+            self.private_attempt.check_current()
         if not self.running or not self.connected:
             raise RuntimeError("Cannot start playback without a connected cliairplay process")
         # A START re-anchors playout from scratch — the binary zeroes its own
@@ -841,7 +886,15 @@ class AirPlayStream:
         finally:
             self._start_waiting.clear()
         try:
-            if not await self._write_cli_command(start_cmd):
+            attempt = self.private_attempt
+            if attempt is not None and not attempt.claim_start():
+                raise ValueError("Private START already consumed")
+            delivered = (
+                await self._write_cli_command(start_cmd, guard=attempt.start_allowed)
+                if attempt is not None
+                else await self._write_cli_command(start_cmd)
+            )
+            if not delivered:
                 # Surfacing the dropped delivery lets the session fall back to a
                 # cold restart instead of waiting on an anchor that never happens.
                 raise PlayerCommandFailed(
@@ -1079,6 +1132,11 @@ class AirPlayStream:
                 await self._render_and_send_artwork(
                     artwork_url, metadata_generation, artwork_render
                 )
+
+    async def _create_private_pipe(self) -> None:
+        """Retain FIFO creation when the private start is cancelled."""
+        self._private_pipe_create_task = asyncio.create_task(self.commands_pipe.create())
+        await asyncio.shield(self._private_pipe_create_task)
 
     async def _kill_child(self, stdout_reader_task: asyncio.Task[None] | None) -> None:
         """Cancel the stdout reader and kill the child immediately."""

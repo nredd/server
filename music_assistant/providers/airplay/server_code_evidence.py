@@ -4,27 +4,43 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import enum
 import hashlib
 import inspect
 import re
 import sys
 import typing
+import urllib.parse
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.enums import QueueOption
 
 from music_assistant import constants as core_constants
 from music_assistant import mass as mass_module
 from music_assistant.controllers import players as players_package
+from music_assistant.controllers.player_queues import controller as queue_controller
+from music_assistant.controllers.player_queues import helpers as queue_helpers
+from music_assistant.controllers.player_queues import queue_loader
+from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players import controller as players_controller
-from music_assistant.helpers import private_trial
+from music_assistant.helpers import ffmpeg, private_transport, private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 
-from . import constants, control_player, helpers, player, sendspin_bridge, trial_binary
+from . import (
+    constants,
+    control_player,
+    helpers,
+    player,
+    sendspin_bridge,
+    stream,
+    stream_session,
+    trial_binary,
+)
 
 if TYPE_CHECKING:
     from music_assistant.helpers.json import SerializableType
@@ -78,6 +94,10 @@ def server_code_evidence(
             "server_code_evidence": sys.modules[__name__],
             "players_controller": players_controller,
             "sendspin_bridge": sendspin_bridge,
+            "private_transport": private_transport,
+            "queue_helpers": queue_helpers,
+            "stream_session": stream_session,
+            "stream": stream,
         }
         hashes: dict[str, SerializableType] = {}
         codes: dict[str, list[CodeType]] = {}
@@ -94,6 +114,8 @@ def server_code_evidence(
             )
             trees[key] = ast.parse(data)
         for name in (
+            "private_trial_transport",
+            "_private_transport_current",
             "get_private_trial_admission_preflight",
             "_private_admission_snapshot",
             "private_trial_admission_mutate",
@@ -120,7 +142,9 @@ def server_code_evidence(
             "_lifecycle_allows_bridge",
         )
         _check_runtime_bindings(controller)
+        _check_transport_boundaries(modules, codes, trees)
         for name in (
+            "_has_current_private_receipt",
             "_private_flag_states",
             "_private_flag_map",
             "_private_flag_request",
@@ -301,6 +325,236 @@ def server_code_evidence(
         OverflowError,
     ):
         return failure
+
+
+def _check_transport_boundaries(
+    modules: dict[str, ModuleType], codes: dict[str, list[CodeType]], trees: dict[str, ast.Module]
+) -> None:
+    """Check actual ownership boundaries, defaults and module-global bindings."""
+    owners = (
+        ("private_transport", private_transport, ("validate_request",)),
+        (
+            "private_transport",
+            private_transport.PrivateTransportAttempt,
+            (
+                "__init__",
+                "check_current",
+                "bind_session",
+                "bind_stream",
+                "spawn",
+                "claim_start",
+                "start_allowed",
+                "play",
+                "invalidate",
+                "request_stop",
+                "snapshot",
+                "_play",
+                "_watchdog",
+                "_cleanup",
+                "_release",
+                "_read_pipe",
+                "_drain",
+            ),
+        ),
+        ("queue_helpers", queue_helpers, ("handle_play_action",)),
+        ("player", player.AirPlayPlayer, ("play_media",)),
+        (
+            "stream_session",
+            stream_session.AirPlayStreamSession,
+            (
+                "__init__",
+                "start",
+                "stop",
+                "private_release",
+                "_start_client",
+                "_start_player_ffmpeg",
+                "_write_chunk_to_all_players",
+            ),
+        ),
+        (
+            "stream",
+            stream.AirPlayStream,
+            (
+                "__init__",
+                "connect",
+                "start",
+                "stop",
+                "private_release",
+                "_write_cli_command",
+                "_connect_volume_allowed",
+                "_create_private_pipe",
+            ),
+        ),
+    )
+    for key, owner, names in owners:
+        for name in names:
+            _check_boundary(codes[key], trees[key], owner, name, modules[key])
+    for module in (queue_helpers, player, stream_session, stream):
+        if vars(module)["CURRENT_ATTEMPT"] is not private_transport.CURRENT_ATTEMPT:
+            raise ValueError("Unexpected attempt context binding")
+    if (
+        modules["provider"].PrivateTransportAttempt is not private_transport.PrivateTransportAttempt
+        or modules["provider"].validate_request is not private_transport.validate_request
+        or vars(player)["AirPlayStreamSession"] is not stream_session.AirPlayStreamSession
+        or vars(stream_session)["AirPlayStream"] is not stream.AirPlayStream
+        or vars(stream_session)["FFMpeg"] is not ffmpeg.FFMpeg
+        or vars(modules["provider"])["QueueOption"] is not QueueOption
+    ):
+        raise ValueError("Unexpected transport boundary binding")
+    _check_transport_globals(trees["private_transport"])
+    for name, module, qualname in (
+        ("_handle_play_media", queue_loader, "QueueLoaderMixin._handle_play_media"),
+        ("play_index", queue_controller, "PlayerQueuesController.play_index"),
+    ):
+        _check_queue_wrapper(
+            getattr(PlayerQueuesController, name), codes["queue_helpers"], module, qualname
+        )
+
+
+def _check_transport_globals(tree: ast.Module) -> None:
+    """Reject substituted request validators and the shared ownership context."""
+    if (
+        vars(private_transport)["asyncio"] is not asyncio
+        or vars(private_transport)["re"] is not re
+        or vars(private_transport)["urlsplit"] is not urllib.parse.urlsplit
+        or type(private_transport.CURRENT_ATTEMPT) is not contextvars.ContextVar
+        or private_transport.CURRENT_ATTEMPT.name != "private_transport_attempt"
+        or contextvars.Context().run(private_transport.CURRENT_ATTEMPT.get) is not None
+    ):
+        raise ValueError("Unexpected transport globals")
+    for name in ("_TOKEN", "_PLAYER", "_STIMULUS_PATH"):
+        declaration = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        if not isinstance(declaration.value, ast.Call) or len(declaration.value.args) != 1:
+            raise ValueError("Unexpected transport pattern declaration")
+        pattern = getattr(private_transport, name)
+        if (
+            type(pattern) is not re.Pattern
+            or pattern.pattern != ast.literal_eval(declaration.value.args[0])
+            or pattern.flags != re.UNICODE
+        ):
+            raise ValueError("Unexpected transport pattern")
+
+
+def _check_boundary(
+    compiled: list[CodeType], tree: ast.Module, owner: object, name: str, module: ModuleType
+) -> None:
+    """Verify an undecorated boundary including literal positional/keyword defaults."""
+    value = inspect.getattr_static(owner, name)
+    if type(value) is not FunctionType or hasattr(value, "__wrapped__"):
+        raise ValueError("Unexpected boundary callable")
+    class_name = owner.__name__ if isinstance(owner, type) else None
+    qualname = f"{class_name}.{name}" if class_name else name
+    matches = [item for item in compiled if item.co_qualname == qualname]
+    if len(matches) != 1 or _normalize(value.__code__) != _normalize(matches[0]):
+        raise ValueError("Boundary code mismatch")
+    nodes = tree.body
+    if class_name is not None:
+        nodes = next(
+            node.body
+            for node in nodes
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+    declaration = next(
+        node
+        for node in nodes
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
+    if declaration.decorator_list:
+        raise ValueError("Unexpected boundary decorator")
+    if value.__qualname__ != qualname:
+        raise ValueError("Unexpected boundary qualified name")
+    _check_callable_defaults(value, declaration)
+    _check_globals(value, module)
+    if value.__closure__ is not None:
+        raise ValueError("Unexpected boundary closure")
+
+
+def _check_callable_defaults(
+    value: FunctionType, declaration: ast.FunctionDef | ast.AsyncFunctionDef
+) -> None:
+    """Compare literal source defaults without accepting equal but differently typed values."""
+    defaults = tuple(ast.literal_eval(item) for item in declaration.args.defaults)
+    kwdefaults = {
+        arg.arg: ast.literal_eval(default)
+        for arg, default in zip(
+            declaration.args.kwonlyargs, declaration.args.kw_defaults, strict=True
+        )
+        if default is not None
+    }
+    actual_defaults = value.__defaults__ or ()
+    actual_kwdefaults = value.__kwdefaults__ or {}
+    if (
+        len(actual_defaults) != len(defaults)
+        or any(
+            type(actual) is not type(expected) or actual != expected
+            for actual, expected in zip(actual_defaults, defaults, strict=True)
+        )
+        or set(actual_kwdefaults) != set(kwdefaults)
+        or any(
+            type(actual_kwdefaults[key]) is not type(expected) or actual_kwdefaults[key] != expected
+            for key, expected in kwdefaults.items()
+        )
+    ):
+        raise ValueError("Unexpected boundary defaults")
+
+
+def _check_queue_wrapper(
+    value: object, compiled: list[CodeType], module: ModuleType, qualname: str
+) -> None:
+    """Accept only the actual wraps wrapper with its exact wrapped callable cell."""
+    wrapped = getattr(value, "__wrapped__", None)
+    if type(value) is not FunctionType or type(wrapped) is not FunctionType:
+        raise ValueError("Unexpected queue wrapper")
+    expected = next(
+        code for code in compiled if code.co_qualname == "handle_play_action.<locals>.wrapper"
+    )
+    if (
+        _normalize(value.__code__) != _normalize(expected)
+        or value.__globals__ is not vars(queue_helpers)
+        or value.__defaults__ is not None
+        or value.__kwdefaults__ is not None
+        or value.__code__.co_freevars != ("func",)
+        or value.__closure__ is None
+        or len(value.__closure__) != 1
+        or value.__closure__[0].cell_contents is not wrapped
+    ):
+        raise ValueError("Unexpected queue wrapper binding")
+    if wrapped.__module__ != module.__name__ or wrapped.__qualname__ != qualname:
+        raise ValueError("Unexpected wrapped callable identity")
+    source_path = Path(str(module.__file__)).resolve()
+    if not source_path.exists() or not source_path.is_file():
+        raise ValueError("Missing wrapped callable source")
+    with source_path.open("rb") as source_file:
+        source = source_file.read(_MAX_SOURCE_SIZE + 1)
+    if len(source) > _MAX_SOURCE_SIZE or wrapped.__globals__ is not vars(module):
+        raise ValueError("Unexpected wrapped callable globals")
+    matches = [
+        code
+        for code in _codes(
+            compile(
+                source, str(module.__file__), "exec", dont_inherit=True, optimize=sys.flags.optimize
+            )
+        )
+        if code.co_qualname == qualname
+    ]
+    if len(matches) != 1 or _normalize(wrapped.__code__) != _normalize(matches[0]):
+        raise ValueError("Unexpected wrapped callable code")
+    declarations = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == wrapped.__name__
+    ]
+    if len(declarations) != 1 or wrapped.__closure__ is not None:
+        raise ValueError("Unexpected wrapped callable closure")
+    _check_callable_defaults(wrapped, declarations[0])
 
 
 def _check_globals(function: FunctionType, module: ModuleType) -> None:

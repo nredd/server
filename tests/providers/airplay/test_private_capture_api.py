@@ -126,6 +126,10 @@ async def test_readiness_reports_verified_real_server_code(
         "server_code_evidence",
         "players_controller",
         "sendspin_bridge",
+        "private_transport",
+        "queue_helpers",
+        "stream_session",
+        "stream",
     }
 
 
@@ -139,12 +143,14 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     unregister_admission = MagicMock()
     unregister_flags = MagicMock()
     unregister_mutate = MagicMock()
+    unregister_transport = MagicMock()
     mass.register_api_command.side_effect = (
         unregister_capture,
         unregister_readiness,
         unregister_admission,
         unregister_flags,
         unregister_mutate,
+        unregister_transport,
     )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
@@ -172,6 +178,10 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
         ),
         (
             (_MUTATE_COMMAND, provider.private_trial_admission_mutate),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
+        (
+            ("airplay/private_trial_transport", provider.private_trial_transport),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
     ]
@@ -744,7 +754,7 @@ async def test_every_route_collision_retains_only_the_incumbent(
     assert registry.command_handlers == {collision: incumbent}
 
 
-async def test_unload_releases_all_five_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unload_releases_all_six_routes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unload unregisters the flag route together with the other private routes."""
     provider, mass = _provider()
     registry = MusicAssistant.__new__(MusicAssistant)
@@ -761,6 +771,7 @@ async def test_unload_releases_all_five_routes(monkeypatch: pytest.MonkeyPatch) 
         _ADMISSION_COMMAND,
         _FLAGS_COMMAND,
         _MUTATE_COMMAND,
+        "airplay/private_trial_transport",
     }
     _stub_unload_state(provider)
     await provider.unload()

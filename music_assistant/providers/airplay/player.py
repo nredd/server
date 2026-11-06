@@ -23,6 +23,7 @@ from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.streams.audio import overlay_active
+from music_assistant.helpers.private_transport import CURRENT_ATTEMPT
 from music_assistant.helpers.util import get_primary_ip_address_from_zeroconf, is_valid_mac_address
 from music_assistant.models.player import (
     AnnouncementFeature,
@@ -589,10 +590,17 @@ class AirPlayPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
+        attempt = CURRENT_ATTEMPT.get()
+        if attempt is not None:
+            attempt.check_current()
         # the player is being (re)purposed on purpose: drop any pending
         # automatic re-join left over from an unexpected stream loss
         self.cancel_group_rejoin()
         async with self._lock:
+            if attempt is not None:
+                attempt.check_current()
+                if attempt.player is not self or self.stream is not None:
+                    raise ValueError("Private transport cannot displace a stream")
             if self.synced_to:
                 # this should not happen, but guard anyways
                 raise RuntimeError("Player is synced")
@@ -652,6 +660,8 @@ class AirPlayPlayer(Player):
                     session_pcm_format,
                     media,
                 )
+                if attempt is not None:
+                    attempt.bind_session(stream_session, stream_session.private_release)
                 await stream_session.start(audio_source)
             finally:
                 self._transitioning = False
