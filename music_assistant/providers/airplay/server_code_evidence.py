@@ -382,6 +382,7 @@ def _check_transport_boundaries(
                 "private_release",
                 "_write_cli_command",
                 "_connect_volume_allowed",
+                "_create_private_pipe",
             ),
         ),
     )

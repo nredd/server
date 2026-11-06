@@ -8,6 +8,9 @@ References:
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -75,6 +78,46 @@ async def test_real_publication_boundary_revocation(
         if player.stream_spawn_lock.locked():
             player.stream_spawn_lock.release()
         await attempt.request_stop("fixture-end")
+
+
+async def test_fifo_creation_is_joined_before_private_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cancelled start retains its in-flight FIFO worker until removal."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    player.stream = stream
+    stream.commands_pipe._pipe_path = str(tmp_path / "commands")
+    attempt = PrivateTransportAttempt("a" * 32, player, object(), "unused", lambda: True)
+    stream.private_attempt = attempt
+    attempt.bind_session(stream, stream.private_release)
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    mkfifo = os.mkfifo
+
+    def held_mkfifo(path: str) -> None:
+        """Pause the real FIFO creation in its worker thread."""
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(10)
+        mkfifo(path)
+
+    monkeypatch.setattr("music_assistant.helpers.named_pipe.os.mkfifo", held_mkfifo)
+    monkeypatch.setattr(stream, "_build_cli_args", AsyncMock(return_value=["binary"]))
+    attempt.play(stream.connect)
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        cleanup = attempt.request_stop("test-stop")
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
+        assert not attempt.snapshot()["cleanup_complete"]
+        release.set()
+        await asyncio.wait_for(cleanup, 2)
+        assert not Path(stream.commands_pipe.path).exists()
+        assert attempt.snapshot()["cleanup_complete"]
+    finally:
+        release.set()
+        await attempt.request_stop("fixture-end")
+        await attempt.watchdog
 
 
 async def test_private_teardown_bypasses_ordinary_locks_without_volume(

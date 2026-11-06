@@ -13,10 +13,17 @@ from typing import Any
 
 import pytest
 
+from music_assistant.controllers.player_queues import helpers as queue_helpers
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players.controller import PlayerController
 from music_assistant.helpers import private_transport
-from music_assistant.providers.airplay import provider, server_code_evidence, stream, stream_session
+from music_assistant.providers.airplay import (
+    player,
+    provider,
+    server_code_evidence,
+    stream,
+    stream_session,
+)
 
 BOUNDARIES = [
     (private_transport, "validate_request"),
@@ -61,6 +68,7 @@ BOUNDARIES = [
             "private_release",
             "_write_cli_command",
             "_connect_volume_allowed",
+            "_create_private_pipe",
         )
     ],
 ]
@@ -139,11 +147,25 @@ def test_queue_wrapper_and_runtime_bindings_are_independent_controls(
     assert evidence()["status"] == "unverified"
 
 
-@pytest.mark.parametrize(("owner", "name"), [(provider, "QueueOption"), (stream_session, "FFMpeg")])
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    [
+        (provider, "QueueOption"),
+        (provider, "PrivateTransportAttempt"),
+        (provider, "validate_request"),
+        (player, "AirPlayStreamSession"),
+        (stream_session, "AirPlayStream"),
+        (stream_session, "FFMpeg"),
+        *[
+            (module, "CURRENT_ATTEMPT")
+            for module in (queue_helpers, player, stream_session, stream)
+        ],
+    ],
+)
 def test_transport_dependency_substitution_is_rejected(
     monkeypatch: pytest.MonkeyPatch, owner: ModuleType, name: str
 ) -> None:
-    """Reject substituted queue option and process wrapper bindings independently."""
+    """Reject each transport dependency and shared context binding independently."""
     monkeypatch.setattr(owner, name, object())
     assert evidence()["status"] == "unverified"
 

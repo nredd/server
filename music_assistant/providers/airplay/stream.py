@@ -171,6 +171,7 @@ class AirPlayStream:
         self.prevent_playback: bool = False
         self.private_attempt = CURRENT_ATTEMPT.get()
         self._cli_proc: AsyncProcess | None = None
+        self._private_pipe_create_task: asyncio.Task[None] | None = None
         self.commands_pipe = AsyncNamedPipeWriter(
             f"/tmp/{self.player.protocol.value}-{self.player.player_id}-"  # noqa: S108
             f"{self.active_remote_id}-{self._stream_id}-cmd",
@@ -415,7 +416,7 @@ class AirPlayStream:
         }
         if self.private_attempt is not None:
             self.private_attempt.check_current()
-            await self.commands_pipe.create()
+            await self._create_private_pipe()
             self.private_attempt.check_current()
         if trial_binary.is_trial_target():
             self._cli_proc = await trial_binary.create_private_process(
@@ -538,6 +539,8 @@ class AirPlayStream:
             # EOF alone can park a CLI awaiting another START. Deliver teardown
             # directly, without either ordinary stop/metadata lock, before unlinking.
             await self._write_cli_command("ACTION=STOP")
+        if self._private_pipe_create_task is not None:
+            await asyncio.gather(self._private_pipe_create_task, return_exceptions=True)
         await self.commands_pipe.remove()
         if self.player.stream is self:
             self.player.stream = None
@@ -1129,6 +1132,11 @@ class AirPlayStream:
                 await self._render_and_send_artwork(
                     artwork_url, metadata_generation, artwork_render
                 )
+
+    async def _create_private_pipe(self) -> None:
+        """Retain FIFO creation when the private start is cancelled."""
+        self._private_pipe_create_task = asyncio.create_task(self.commands_pipe.create())
+        await asyncio.shield(self._private_pipe_create_task)
 
     async def _kill_child(self, stdout_reader_task: asyncio.Task[None] | None) -> None:
         """Cancel the stdout reader and kill the child immediately."""
