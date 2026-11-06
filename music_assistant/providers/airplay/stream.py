@@ -26,7 +26,12 @@ from music_assistant_models.media_items import Radio
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.images import _extract_imageproxy_id, get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
-from music_assistant.helpers.private_transport import CURRENT_ATTEMPT
+from music_assistant.helpers.private_transport import (
+    CURRENT_ATTEMPT,
+    PrivateTransportAttempt,
+    ReceiptScanner,
+    resolved_media_route,
+)
 from music_assistant.helpers.private_trial import private_child_env
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import sanitize_http_header_value
@@ -171,6 +176,8 @@ class AirPlayStream:
         self.prevent_playback: bool = False
         self.private_attempt = CURRENT_ATTEMPT.get()
         self._cli_proc: AsyncProcess | None = None
+        self.private_media_route = "unknown"
+        self._private_route_reported = False
         self._private_pipe_create_task: asyncio.Task[None] | None = None
         self.commands_pipe = AsyncNamedPipeWriter(
             f"/tmp/{self.player.protocol.value}-{self.player.player_id}-"  # noqa: S108
@@ -415,7 +422,7 @@ class AirPlayStream:
             ),
         }
         if self.private_attempt is not None:
-            self.private_attempt.check_current()
+            self._check_private_start(capture_eligible)
             await self._create_private_pipe()
             self.private_attempt.check_current()
         if trial_binary.is_trial_target():
@@ -444,13 +451,16 @@ class AirPlayStream:
             if self.private_attempt is None:
                 await self.commands_pipe.create()
             if self.private_attempt is not None:
-                await self.private_attempt.spawn(self._cli_proc)
+                await self.private_attempt.spawn(
+                    self._cli_proc,
+                    self._private_stdout_reader if self._uses_private_receipt() else None,
+                )
             else:
                 await self._cli_proc.start()
             if self.native_volume_capture:
                 self.native_volume_capture.trust(self._cli_proc)
             self._cli_proc.attach_stderr_reader(self.mass.create_task(self._stderr_reader()))
-            self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
+            self._attach_stdout_reader()
         except BaseException:
             if self.private_attempt is not None:
                 self.private_attempt.request_stop("connect-failed")
@@ -526,7 +536,9 @@ class AirPlayStream:
         tasks = [
             task
             for task in (
-                self._stdout_reader_task,
+                None
+                if self.private_attempt and self.private_attempt.version == 2
+                else self._stdout_reader_task,
                 self._cli_proc._stderr_reader_task if self._cli_proc is not None else None,
             )
             if task is not None
@@ -1133,6 +1145,36 @@ class AirPlayStream:
                     artwork_url, metadata_generation, artwork_render
                 )
 
+    def _attach_stdout_reader(self) -> None:
+        """Bind the stdout owner: the attempt's registered one for v2, else a plain reader."""
+        if self._uses_private_receipt() and self.private_attempt is not None and self._cli_proc:
+            self._stdout_reader_task = self.private_attempt.stdout_owners[self._cli_proc]
+        else:
+            self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
+
+    def _check_private_start(self, capture_eligible: bool) -> None:
+        """
+        Reject a stale owner, and a v2 receipt attempt that would own native volume capture.
+
+        `capture_eligible` is computed before connect's awaits. `check_current` re-checks the
+        flags now, so a flag set and cleared again in between passes it while eligibility is
+        still stale; refuse that before any side effect.
+
+        :raises ValueError: If a v2 attempt would enable native volume capture.
+        """
+        attempt = self.private_attempt
+        if attempt is None:
+            return
+        attempt.check_current()
+        if self._uses_private_receipt() and capture_eligible:
+            attempt.request_stop("capture-refused")
+            raise ValueError("Private media receipt refuses native volume capture")
+
+    def _uses_private_receipt(self) -> bool:
+        """Whether this stream is a v2 private attempt owning its stdout through EOF."""
+        attempt = self.private_attempt
+        return attempt is not None and attempt.version == 2
+
     async def _create_private_pipe(self) -> None:
         """Retain FIFO creation when the private start is cancelled."""
         self._private_pipe_create_task = asyncio.create_task(self.commands_pipe.create())
@@ -1357,6 +1399,8 @@ class AirPlayStream:
         ]
         if timing_arg:
             args += ["--timing", timing_arg]
+        if self._uses_private_receipt():
+            args.append("--private-media-receipt")
 
         # The binary owns the playback lead (2000 ms default, clamped to the
         # device-reported window) and there is no user override for it; the
@@ -1542,25 +1586,8 @@ class AirPlayStream:
                     return False
                 raw_line, buffer = buffer.split(b"\n", 1)
                 line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                if backend.handle_stdout(line):
-                    continue
-                if line.startswith("[STATUS] homepod_remote_admission"):
-                    self._parse_homepod_remote_admission_status(line)
-                elif "[STATUS] route" in line:
-                    self._parse_route_status(line)
-                elif "[STATUS] mrp" in line:
-                    self._parse_mrp_status(line)
-                elif "[STATUS] latency" in line:
-                    self._parse_latency_status(line)
-                elif "[STATUS] capabilities" in line:
-                    self._parse_capabilities_status(line)
-                elif line.startswith("[EVENT] remote command="):
-                    self._parse_remote_event(line)
-                self.player.logger.log(
-                    VERBOSE_LOG_LEVEL, "cliairplay for %s: %s", self.player.display_name, line
-                )
+                if line:
+                    self._handle_stdout_line(line, backend)
 
         # Older binaries may not emit capabilities either. EOF is the only
         # ordering-safe fallback; stderr's connected/exit can beat queued stdout.
@@ -1569,6 +1596,98 @@ class AirPlayStream:
         self._report_unreported_homepod_remote_admission()
         await backend.close()
         return True
+
+    def _handle_stdout_line(self, line: str, backend: SessionVolumeBackend) -> None:
+        """Dispatch one ordinary stdout status line."""
+        if backend.handle_stdout(line):
+            return
+        if line.startswith("[STATUS] homepod_remote_admission"):
+            self._parse_homepod_remote_admission_status(line)
+        elif "[STATUS] route" in line:
+            self._parse_route_status(line)
+        elif "[STATUS] mrp" in line:
+            self._parse_mrp_status(line)
+        elif "[STATUS] latency" in line:
+            self._parse_latency_status(line)
+        elif "[STATUS] capabilities" in line:
+            self._parse_capabilities_status(line)
+        elif line.startswith("[EVENT] remote command="):
+            self._parse_remote_event(line)
+        self.player.logger.log(
+            VERBOSE_LOG_LEVEL, "cliairplay for %s: %s", self.player.display_name, line
+        )
+
+    async def _private_stdout_reader(self) -> None:
+        """
+        Own a v2 attempt's stdout from attestation through EOF, receipt included.
+
+        Media bytes go only to the bounded scanner, never to a logger. The final record
+        counts only at EOF with the exact historical child, stream and attempt still bound.
+        """
+        process = self._cli_proc
+        attempt = self.private_attempt
+        backend = self.session_volume
+        if attempt is None or not isinstance(process, trial_binary.TrialAsyncProcess):
+            return
+        scanner = ReceiptScanner()
+        rejected = False
+        try:
+            process.enter_receipt_mode()
+            while True:
+                try:
+                    chunk = await process.read_receipt_chunk(trial_binary.MAX_RECEIPT_CHUNK)
+                except trial_binary.TrialBinaryError:
+                    rejected = True
+                    attempt.fail_media()
+                    if process.receipt_rejected:
+                        continue
+                    # Not a screened rejection: no retry, contain and let the attempt drain.
+                    process.reject_receipt_stream()
+                    break
+                if not chunk:
+                    break
+                if rejected:
+                    continue
+                if not self._private_owner_current(process, attempt, backend):
+                    rejected = True
+                else:
+                    for line in scanner.feed(chunk):
+                        self._handle_stdout_line(line, backend)
+                    rejected = scanner.failed
+                if rejected:
+                    attempt.fail_media()
+                    process.reject_receipt_stream()
+            record = None if rejected else scanner.finish()
+            accepted = (
+                record is not None
+                and self._private_owner_current(process, attempt, backend)
+                and attempt.accept_media(
+                    record, stream=self, resolved_route=self.private_media_route
+                )
+            )
+            if not accepted:
+                attempt.fail_media()
+            self._report_unreported_homepod_remote_admission()
+            await backend.close()
+        except BaseException:
+            # Ownership is lost: contain now; the attempt hands stdout to its discard drainer.
+            attempt.fail_media()
+            process.reject_receipt_stream()
+            raise
+
+    def _private_owner_current(
+        self,
+        process: trial_binary.TrialAsyncProcess,
+        attempt: PrivateTransportAttempt,
+        backend: SessionVolumeBackend,
+    ) -> bool:
+        """Match the exact historical child, captured stream and backend, never live state."""
+        return (
+            self._cli_proc is process
+            and attempt.stream is self
+            and self.session_volume is backend
+            and process.has_historical_receipt()
+        )
 
     def _parse_homepod_remote_admission_status(self, line: str) -> None:
         """Record the CLI's PRE-SETUP policy selection, never native UI readiness."""
@@ -1753,6 +1872,12 @@ class AirPlayStream:
             else "unknown",
             fields["timing"] if valid and fields["timing"] in ("ptp", "ntp") else "unknown",
         )
+        self.private_media_route = (
+            "unknown"
+            if self._private_route_reported or not valid or fields["timing"] not in ("ptp", "ntp")
+            else resolved_media_route(fields)
+        )
+        self._private_route_reported = True
         if protocol == "airplay2":
             flow = fields.get("flow", "")
             timing = fields.get("timing", "")

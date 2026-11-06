@@ -15,7 +15,7 @@ import pytest
 from music_assistant import mass as mass_module
 from music_assistant.controllers import players as players_package
 from music_assistant.controllers.players import controller as players_controller
-from music_assistant.helpers import private_trial
+from music_assistant.helpers import private_transport, private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 from music_assistant.providers.airplay import (
     constants,
@@ -23,6 +23,7 @@ from music_assistant.providers.airplay import (
     player,
     provider,
     sendspin_bridge,
+    stream,
     trial_binary,
 )
 from music_assistant.providers.airplay import (
@@ -650,3 +651,173 @@ def test_live_enum_name_corruption_is_unverified() -> None:
     finally:
         type.__setattr__(cls, "__name__", "PrivateFlagState")
     assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
+
+
+def _other(*_args: object, **_kwargs: object) -> None:
+    """Stand-in with different code, accepted by no sealed boundary."""
+
+
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    [
+        (private_transport, "parse_media_record"),
+        (private_transport, "media_qualifies"),
+        (private_transport, "resolved_media_route"),
+        (private_transport, "_media_int"),
+        (private_transport, "is_canonical_ipv4"),
+        (private_transport.ReceiptScanner, "feed"),
+        (private_transport.ReceiptScanner, "finish"),
+        (private_transport.ReceiptScanner, "_complete_line"),
+        (private_transport.PrivateTransportAttempt, "accept_media"),
+        (private_transport.PrivateTransportAttempt, "media_snapshot"),
+        (private_transport.PrivateTransportAttempt, "_force"),
+        (trial_binary.TrialAsyncProcess, "read_receipt_chunk"),
+        (trial_binary.TrialAsyncProcess, "reject_receipt_stream"),
+        (trial_binary.TrialAsyncProcess, "enter_receipt_mode"),
+        (stream.AirPlayStream, "_handle_stdout_line"),
+        (trial_binary.TrialAsyncProcess, "_screen_receipt_bytes"),
+        (trial_binary.TrialAsyncProcess, "close"),
+        (trial_binary.TrialAsyncProcess, "kill"),
+        (stream.AirPlayStream, "_private_stdout_reader"),
+        (stream.AirPlayStream, "_private_owner_current"),
+        (stream.AirPlayStream, "_attach_stdout_reader"),
+        (stream.AirPlayStream, "_parse_route_status"),
+        (stream.AirPlayStream, "_stdout_reader"),
+        (stream.AirPlayStream, "_stderr_reader"),
+        (stream.AirPlayStream, "_consume_capture_stderr"),
+        (stream.AirPlayStream, "_finish_stderr_actor"),
+        (stream.AirPlayStream, "_kill_child"),
+        (stream.AirPlayStream, "_graceful_close"),
+        (stream.AirPlayStream, "_cleanup_failed_start"),
+        (stream.AirPlayStream, "wait_for_connection"),
+        (stream.AirPlayStream, "write_audio"),
+        (stream.AirPlayStream, "write_audio_eof"),
+        (stream.AirPlayStream, "flush"),
+        (provider.AirPlayProvider, "private_trial_transport_v2"),
+        (provider.AirPlayProvider, "_private_trial_transport"),
+        (provider, "_private_target_address"),
+    ],
+)
+def test_receipt_callables_are_code_sealed(
+    monkeypatch: pytest.MonkeyPatch, owner: object, name: str
+) -> None:
+    """A substituted parser, scanner, wrapper byte API or v2 handler is unverified."""
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
+    monkeypatch.setattr(owner, name, _other)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+def _stream_process_callers() -> list[str]:
+    """Names of every `AirPlayStream` function (not property) that reads the child process."""
+    tree = ast.parse(Path(str(stream.__file__)).read_bytes())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AirPlayStream"
+    )
+    return sorted(
+        node.name
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.decorator_list
+        and any(
+            isinstance(item, ast.Attribute) and item.attr == "_cli_proc" for item in ast.walk(node)
+        )
+        and node.name != "__init__"
+    )
+
+
+@pytest.mark.parametrize("name", _stream_process_callers())
+def test_every_stream_caller_of_the_child_process_is_code_sealed(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """No `AirPlayStream` function touching `_cli_proc` can be replaced and stay verified."""
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
+    monkeypatch.setattr(stream.AirPlayStream, name, _other)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("owner", "name", "value"),
+    [
+        (private_transport, "MAX_MEDIA_RECORD", 1024),
+        (private_transport, "MAX_STATUS_LINE", 8192),
+        (private_transport, "MAX_STDOUT_TOTAL", 1 << 20),
+        (private_transport, "MEDIA_ROUTES", ("raop", "compat", "udp", "buffered")),
+        (private_transport, "MEDIA_PREFIX", b"@MEDIA1"),
+        (private_transport, "_MEDIA_KEYS", frozenset({"v"})),
+        (private_transport, "_ALL_ROUTES", ("raop",)),
+        (private_transport, "_CANONICAL_UINT", re.compile(r"[0-9]+")),
+        (private_transport, "json", SimpleNamespace()),
+        (private_transport, "ipaddress", SimpleNamespace()),
+        (trial_binary, "MAX_RECEIPT_CHUNK", 1 << 20),
+        (trial_binary, "_ATTEST_PREFIX", b"[ATTEST]x"),
+        (stream, "ReceiptScanner", type("ReceiptScanner", (), {})),
+        (stream, "resolved_media_route", _other),
+        (provider, "is_canonical_ipv4", _other),
+    ],
+)
+def test_receipt_constants_and_dependencies_are_sealed(
+    monkeypatch: pytest.MonkeyPatch, owner: object, name: str, value: object
+) -> None:
+    """Receipt limits, patterns and imported dependencies cannot be substituted."""
+    monkeypatch.setattr(owner, name, value)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+def test_receipt_record_and_state_shapes_are_sealed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replaced record dataclass or state enum is unverified."""
+    monkeypatch.setattr(private_transport, "MediaReceipt", type("MediaReceipt", (), {}))
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("module", "old", "new"),
+    [
+        (private_transport, b"len(line) > MAX_MEDIA_RECORD", b"len(line) > 4096"),
+        (private_transport, b"and receipt.port == receipt.setup_port", b"and True"),
+        (private_transport, b"and receipt.addr == target_address", b"and True"),
+        (
+            private_transport,
+            b"and not self.forced\n            and self.loop.time()",
+            b"and self.loop.time()",
+        ),
+        (
+            private_transport,
+            b'("airplay2", "native", "1"): "buffered"',
+            b'("airplay2", "native", "1"): "udp"',
+        ),
+        (trial_binary, b"not 1 <= n <= MAX_RECEIPT_CHUNK", b"not 1 <= n"),
+        (
+            trial_binary,
+            b'raise TrialBinaryError("Trial image acknowledgement was repeated")\n            if _ATTEST',
+            b"pass\n            if _ATTEST",
+        ),
+        (stream, b"and process.has_historical_receipt()\n        )", b"and True\n        )"),
+        (provider, b"or attempt.version != version", b"or False"),
+    ],
+)
+def test_receipt_source_mutation_on_disk_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleType, old: bytes, new: bytes
+) -> None:
+    """Changed receipt or v2 handler source cannot attest the loaded code."""
+    assert module.__file__ is not None
+    source = Path(module.__file__).read_bytes()
+    assert source.count(old) == 1, old
+    path = tmp_path / "changed.py"
+    path.write_bytes(source.replace(old, new, 1))
+    monkeypatch.setattr(module, "__file__", str(path))
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
+def test_v2_handler_decorator_and_defaults_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The v2 handler must remain an undecorated, default-free declaration."""
+    original = provider.AirPlayProvider.private_trial_transport_v2
+
+    def wrapper(self: Any, request: Any) -> Any:
+        """Wrap without code identity."""
+        return original(self, request)
+
+    vars(wrapper)["__wrapped__"] = original
+    monkeypatch.setattr(provider.AirPlayProvider, "private_trial_transport_v2", wrapper)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"

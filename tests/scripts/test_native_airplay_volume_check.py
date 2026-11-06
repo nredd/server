@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -107,27 +109,109 @@ async def test_reader_failure_is_prompt() -> None:
         await check.wait_for_record(asyncio.Event(), reader)
 
 
-async def test_process_timeout_reaps_child_and_removes_fifo(tmp_path: Path) -> None:
-    """An unresponsive local executable cannot strand a child, reader or FIFO."""
-    harness = tmp_path / "idle"
+def _idle_harness(directory: Path) -> Path:
+    """Write an executable that never answers."""
+    harness = directory / "idle"
     harness.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
     harness.chmod(0o700)
+    return harness
+
+
+async def test_process_timeout_reaps_child_and_removes_fifo(tmp_path: Path) -> None:
+    """An unresponsive local executable cannot strand a child, reader or FIFO."""
+    harness = _idle_harness(tmp_path)
     children: list[check.WitnessProcess] = []
-    original = check.WitnessProcess
+    started = asyncio.Event()
 
-    def create(binary: Path, fifo: Path) -> check.WitnessProcess:
-        """Retain ownership evidence without replacing the real process."""
-        child = original(binary, fifo)
-        children.append(child)
-        return child
+    class Observed(check.WitnessProcess):
+        """Real witness process that reports when its spawn has completed."""
 
-    with patch.object(check, "WitnessProcess", side_effect=create), pytest.raises(TimeoutError):
-        async with asyncio.timeout(0.15):
-            await check.exercise(harness, tmp_path)
+        def __init__(self, binary: Path, fifo: Path) -> None:
+            """Retain ownership evidence without replacing the real process."""
+            super().__init__(binary, fifo)
+            children.append(self)
+
+        async def start(self) -> None:
+            """Spawn for real, then release the deadline."""
+            await super().start()
+            started.set()
+
+    exercise: asyncio.Task[check.Report] | None = None
+    try:
+        with patch.object(check, "WitnessProcess", Observed):
+            exercise = asyncio.create_task(check.exercise(harness, tmp_path))
+            # Harness guard only. The 0.15s behavior deadline below starts once the child
+            # exists: a deadline spanning spawn can cancel `create_subprocess_exec` before
+            # `proc` is bound, leaving `returncode` None with nothing for the wrapper to reap.
+            await asyncio.wait_for(started.wait(), 30)
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.15):
+                    await exercise
+    finally:
+        if exercise is not None and not exercise.done():
+            exercise.cancel()
+        if exercise is not None:
+            await asyncio.gather(exercise, return_exceptions=True)
     assert len(children) == 1
     assert children[0].closed
     assert children[0].returncode is not None
     assert not (tmp_path / "commands").exists()
+
+
+async def test_cancel_during_spawn_leaks_no_child_or_fifo(tmp_path: Path) -> None:
+    """A cancel landing after `Popen` but inside `create_subprocess_exec` leaks nothing."""
+    harness = _idle_harness(tmp_path)
+    children: list[check.WitnessProcess] = []
+    spawned: list[subprocess.Popen[bytes]] = []
+    popen_ran = asyncio.Event()
+
+    class RecordingPopen(subprocess.Popen[bytes]):
+        """Record the child the transport actually created."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Fork/exec for real, then report the owned child."""
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+            popen_ran.set()
+
+    class CancelledMidSpawn(check.WitnessProcess):
+        """Real witness process whose spawn is cancelled once the child exists."""
+
+        def __init__(self, binary: Path, fifo: Path) -> None:
+            """Retain ownership evidence."""
+            super().__init__(binary, fifo)
+            children.append(self)
+
+        async def start(self) -> None:
+            """Cancel the real start after `Popen` ran, before the transport returned."""
+            task = asyncio.create_task(super().start())
+            try:
+                await asyncio.wait_for(popen_ran.wait(), 30)
+                task.cancel()
+            finally:
+                # Own the start task on every path, including a guard failure.
+                if not task.done():
+                    task.cancel()
+                outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            raise AssertionError("start completed instead of being cancelled")
+
+    with (
+        patch.object(check, "WitnessProcess", CancelledMidSpawn),
+        patch.object(subprocess, "Popen", RecordingPopen),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await check.exercise(harness, tmp_path)
+    assert len(children) == 1
+    assert len(spawned) == 1
+    # Exactly the state a deadline inside spawn produced: no wrapper-owned process object ...
+    assert children[0].proc is None
+    assert children[0].closed
+    assert not (tmp_path / "commands").exists()
+    # ... yet asyncio itself killed and reaped the exact child it had created.
+    assert spawned[0].returncode is not None
+    assert spawned[0].poll() is not None
 
 
 async def test_early_child_failure_cleans_fifo(tmp_path: Path) -> None:

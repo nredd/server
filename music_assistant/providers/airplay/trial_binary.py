@@ -45,6 +45,8 @@ MAX_CHECK_OUTPUT = 4096
 CHECK_TIMEOUT = 5.0
 ATTEST_TIMEOUT = 5
 MAX_ATTEST_LINE = 1024
+MAX_RECEIPT_CHUNK = 1024
+_ATTEST_PREFIX = b"[ATTEST]"
 PROC_ROOT = Path("/proc")
 _BUILD_LABEL = re.compile(r"(?<![a-zA-Z0-9])v[0-9a-f]{7,40}(?![a-zA-Z0-9])")
 
@@ -89,6 +91,13 @@ class TrialAsyncProcess(AsyncProcess):
         self._stdout_pending = b""
         self._trusted_receipt: _TrustedChildReceipt | None = None
         self._exit_watcher: asyncio.Task[None] | None = None
+        self._receipt_mode = False
+        self._receipt_reading = False
+        self._receipt_rejected = False
+        self._receipt_killed = False
+        self._receipt_eof = False
+        self._receipt_line_start = True
+        self._receipt_head = bytearray()
         super().__init__(
             [
                 descriptor_path(asset_fd),
@@ -124,6 +133,16 @@ class TrialAsyncProcess(AsyncProcess):
         """Match the acknowledged child even after exit, never as live authority."""
         receipt = self._trusted_receipt
         return receipt is not None and receipt.process is self and receipt.proc is self.proc
+
+    @property
+    def receipt_rejected(self) -> bool:
+        """Return whether the receipt stream was rejected and is only being discarded."""
+        return self._receipt_rejected
+
+    @property
+    def receipt_eof(self) -> bool:
+        """Return whether the receipt reader has seen stdout EOF."""
+        return self._receipt_eof
 
     def has_current_receipt(self) -> bool:
         """Return whether this exact owned child has a current acknowledgement receipt."""
@@ -174,12 +193,87 @@ class TrialAsyncProcess(AsyncProcess):
             result += block
         return bytes(result)
 
+    def enter_receipt_mode(self) -> None:
+        """Hand stdout to exactly one bounded byte reader after the unchanged attestation."""
+        if (
+            self._receipt_mode
+            or not self.has_historical_receipt()
+            or self._stdout_pending
+            or self._stdout_lock.locked()
+        ):
+            raise TrialBinaryError("Private stdout cannot enter receipt mode")
+        self._receipt_mode = True
+
+    async def read_receipt_chunk(self, n: int) -> bytes:
+        """
+        Read at most `n` screened bytes; b"" only at EOF.
+
+        :param n: Maximum bytes to return, 1 to `MAX_RECEIPT_CHUNK`.
+        :raises TrialBinaryError: If the mode is not entered, a reader is active, or a repeated
+            acknowledgement was screened (the child is then rejected and later calls discard).
+        """
+        if not self._receipt_mode or not 1 <= n <= MAX_RECEIPT_CHUNK:
+            raise TrialBinaryError("Private receipt read is not permitted")
+        if self._receipt_reading or self.proc is None or self.proc.stdout is None:
+            raise TrialBinaryError("Private receipt reader is unavailable")
+        self._receipt_reading = True
+        try:
+            while True:
+                data = await self._receipt_read(n)
+                if self._receipt_rejected:
+                    while data:
+                        data = await self._receipt_read(n)
+                    self._receipt_eof = True
+                    return b""
+                if not data:
+                    held = bytes(self._receipt_head)
+                    self._receipt_head.clear()
+                    self._receipt_eof = not held
+                    return held
+                try:
+                    if screened := self._screen_receipt_bytes(data):
+                        return screened
+                except TrialBinaryError:
+                    self.reject_receipt_stream()
+                    raise
+        finally:
+            self._receipt_reading = False
+
+    async def discard_receipt_stream(self) -> None:
+        """
+        Discard stdout to EOF as its exclusive reader after the receipt reader was joined.
+
+        :raises TrialBinaryError: If another reader is active or the pipe is unavailable.
+        """
+        if self._receipt_reading or self.proc is None or self.proc.stdout is None:
+            raise TrialBinaryError("Private receipt discard is not permitted")
+        self._receipt_rejected = True
+        self._receipt_reading = True
+        try:
+            while await self._receipt_read(MAX_RECEIPT_CHUNK):
+                pass
+            self._receipt_eof = True
+        finally:
+            self._receipt_reading = False
+
+    def reject_receipt_stream(self) -> None:
+        """Revoke trust and signal the child once; the single reader keeps discarding to EOF."""
+        self._trusted_receipt = None
+        self._receipt_rejected = True
+        proc = self.proc
+        if proc is not None and proc.returncode is None and not self._receipt_killed:
+            self._receipt_killed = True
+            with suppress(ProcessLookupError):
+                proc.kill()
+
     async def communicate(self, *_args: object, **_kwargs: object) -> tuple[bytes, bytes]:
         """Reject raw communication which would bypass the private proof reader/writer."""
         raise TrialBinaryError("Private CLI communication requires verified stream methods")
 
     async def read_stdout(self) -> bytes:
         """Reject any second acknowledgement before either reader API can expose it."""
+        if self._receipt_mode:
+            raise TrialBinaryError("Private stdout is owned by the receipt reader")
         if self._stdout_pending:
             line, self._stdout_pending = self._stdout_pending, b""
             return line
@@ -203,16 +297,59 @@ class TrialAsyncProcess(AsyncProcess):
     async def close(self) -> None:
         """Close the child and its parent-owned executable descriptor."""
         try:
-            await super().close()
+            if self._receipt_mode and not self._receipt_eof:
+                await self._release_receipt_owner()
+            else:
+                await super().close()
         finally:
             self._release_asset_fd()
 
     async def kill(self) -> None:
         """Kill the child and close its parent-owned executable descriptor."""
         try:
-            await super().kill()
+            if self._receipt_mode and not self._receipt_eof:
+                await self._release_receipt_owner()
+            else:
+                await super().kill()
         finally:
             self._release_asset_fd()
+
+    async def _release_receipt_owner(self) -> None:
+        """Contain the child without ever reading stdout from under the receipt reader."""
+        self._close_called = True
+        self._stdout_left_to_reader = True
+        self.reject_receipt_stream()
+        if self.proc is not None:
+            if self.proc.stdin is not None and not self.proc.stdin.is_closing():
+                self.proc.stdin.close()
+            await self.proc.wait()
+
+    async def _receipt_read(self, n: int) -> bytes:
+        """Read one chunk under the wrapper's stdout lock, never via close-state shortcuts."""
+        assert self.proc is not None
+        assert self.proc.stdout is not None
+        async with self._stdout_lock:
+            return await self.proc.stdout.read(n)
+
+    def _screen_receipt_bytes(self, data: bytes) -> bytes:
+        """Withhold any line-start prefix of the attestation marker; reject a full match."""
+        out = bytearray()
+        head = self._receipt_head
+        for byte in data:
+            if not self._receipt_line_start:
+                out.append(byte)
+                self._receipt_line_start = byte == 10
+                continue
+            head.append(byte)
+            if bytes(head) == _ATTEST_PREFIX:
+                head.clear()
+                raise TrialBinaryError("Trial image acknowledgement was repeated")
+            if _ATTEST_PREFIX.startswith(head):
+                continue
+            out += head
+            head.clear()
+            self._receipt_line_start = byte == 10
+        return bytes(out)
 
     async def _verify_acknowledgement(self) -> None:
         """Accept one bounded acknowledgement before any caller can read stdout status."""

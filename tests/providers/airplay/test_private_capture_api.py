@@ -144,6 +144,7 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
     unregister_flags = MagicMock()
     unregister_mutate = MagicMock()
     unregister_transport = MagicMock()
+    unregister_transport_v2 = MagicMock()
     mass.register_api_command.side_effect = (
         unregister_capture,
         unregister_readiness,
@@ -151,6 +152,7 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
         unregister_flags,
         unregister_mutate,
         unregister_transport,
+        unregister_transport_v2,
     )
     monkeypatch.setattr(provider_module, "is_trial_target", lambda: True)
 
@@ -184,7 +186,13 @@ async def test_registers_fixed_scoped_route_only_for_trial_target(
             ("airplay/private_trial_transport", provider.private_trial_transport),
             {"required_scope": Scope.SYSTEM_MANAGE},
         ),
+        (
+            ("airplay/private_trial_transport_v2", provider.private_trial_transport_v2),
+            {"required_scope": Scope.SYSTEM_MANAGE},
+        ),
     ]
+    assert provider._unregister_private_transport_api is unregister_transport
+    assert provider._unregister_private_transport_v2_api is unregister_transport_v2
     assert provider._unregister_private_admission_mutate_api is unregister_mutate
     assert provider._unregister_private_flags_api is unregister_flags
     assert provider._unregister_private_admission_api is unregister_admission
@@ -747,6 +755,8 @@ async def test_every_route_collision_retains_only_the_incumbent(
         "_unregister_private_admission_api",
         "_unregister_private_flags_api",
         "_unregister_private_admission_mutate_api",
+        "_unregister_private_transport_api",
+        "_unregister_private_transport_v2_api",
     ):
         assert getattr(provider, name) is None
     _stub_unload_state(provider)
@@ -754,8 +764,8 @@ async def test_every_route_collision_retains_only_the_incumbent(
     assert registry.command_handlers == {collision: incumbent}
 
 
-async def test_unload_releases_all_six_routes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unload unregisters the flag route together with the other private routes."""
+async def test_unload_releases_all_seven_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unload unregisters the flag route together with the other private routes, v2 included."""
     provider, mass = _provider()
     registry = MusicAssistant.__new__(MusicAssistant)
     registry.command_handlers = {}
@@ -772,6 +782,7 @@ async def test_unload_releases_all_six_routes(monkeypatch: pytest.MonkeyPatch) -
         _FLAGS_COMMAND,
         _MUTATE_COMMAND,
         "airplay/private_trial_transport",
+        "airplay/private_trial_transport_v2",
     }
     _stub_unload_state(provider)
     await provider.unload()

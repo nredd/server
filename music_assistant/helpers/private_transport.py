@@ -8,12 +8,15 @@ References:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, TypedDict
+from typing import Any, Final, Protocol, TypedDict, cast
 from urllib.parse import urlsplit
 
 _TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -22,6 +25,32 @@ _STIMULUS_PATH = re.compile(r"/stimulus\.wav")
 CURRENT_ATTEMPT: ContextVar[PrivateTransportAttempt | None] = ContextVar(
     "private_transport_attempt", default=None
 )
+
+
+MEDIA_PREFIX: Final = b"@MEDIA1 "
+MAX_MEDIA_RECORD: Final = 512
+MAX_STATUS_LINE: Final = 4096
+MAX_STDOUT_TOTAL: Final = 65536
+MEDIA_ROUTES: Final = ("raop", "compat", "udp")
+_MEDIA_KEYS: Final = frozenset(
+    {
+        "v",
+        "terminal",
+        "route",
+        "epoch",
+        "fresh_units",
+        "fresh_bytes",
+        "idle_units",
+        "backlog_units",
+        "fault",
+        "overflow",
+        "addr",
+        "port",
+        "setup_port",
+    }
+)
+_ALL_ROUTES: Final = ("raop", "compat", "udp", "buffered", "unknown")
+_CANONICAL_UINT = re.compile(r"0|[1-9][0-9]{0,9}")
 
 
 class TransportOutcome(StrEnum):
@@ -46,6 +75,66 @@ class TransportSnapshot(TypedDict):
     start_generation: int
     reason: str | None
     cleanup_complete: bool
+
+
+class MediaState(StrEnum):
+    """Closed v2 sender-write evidence states; incomplete is terminal."""
+
+    PENDING = "pending"
+    INCOMPLETE = "incomplete"
+    COMPLETE = "complete"
+
+
+class MediaSnapshot(TypedDict):
+    """Closed v2 media facts, sender-write evidence only."""
+
+    state: MediaState
+    route: str
+    epoch: int | None
+    fresh_units: int | None
+    fresh_bytes: int | None
+
+
+class TransportSnapshotV2(TransportSnapshot):
+    """Exact v1 fields with `version` 2 plus the closed media object."""
+
+    media: MediaSnapshot
+
+
+class MediaReceiptError(ValueError):
+    """Reject a private child media record; never carries raw child data."""
+
+
+@dataclass(frozen=True)
+class MediaReceipt:
+    """One exactly parsed private `@MEDIA1` record."""
+
+    terminal: str
+    route: str
+    epoch: int
+    fresh_units: int
+    fresh_bytes: int
+    idle_units: int
+    backlog_units: int
+    fault: bool
+    overflow: bool
+    addr: str | None
+    port: int
+    setup_port: int
+
+
+class ReceiptProcess(Protocol):
+    """Wrapper whose stdout is owned by a single receipt reader."""
+
+    @property
+    def receipt_eof(self) -> bool:
+        """Whether the reader saw EOF."""
+
+    def reject_receipt_stream(self) -> None:
+        """Revoke trust and signal the child once."""
+
+    async def discard_receipt_stream(self) -> None:
+        """Discard stdout to EOF as its exclusive reader."""
 
 
 class OwnedProcess(Protocol):
@@ -114,6 +203,217 @@ def validate_request(request: Any) -> str:
     return mode
 
 
+def _reject_media_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate members instead of last-value-wins."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MediaReceiptError("Duplicate media member")
+        result[key] = value
+    return result
+
+
+def _media_int(token: str) -> int:
+    """Accept only canonical nonnegative decimal integers within u32."""
+    if _CANONICAL_UINT.fullmatch(token) is None or int(token) > 0xFFFFFFFF:
+        raise MediaReceiptError("Invalid media integer")
+    return int(token)
+
+
+def _media_reject(_token: str) -> object:
+    """Reject floats and non-finite constants."""
+    raise MediaReceiptError("Invalid media number")
+
+
+def _media_uint(value: object, limit: int = 0xFFFFFFFF) -> int:
+    """Return an exact (non-bool) integer within range."""
+    if type(value) is not int or not 0 <= value <= limit:
+        raise MediaReceiptError("Invalid media integer")
+    return value
+
+
+def _media_bool(value: object) -> bool:
+    """Return an exact JSON boolean."""
+    if type(value) is not bool:
+        raise MediaReceiptError("Invalid media boolean")
+    return value
+
+
+def parse_media_record(line: bytes) -> MediaReceipt:
+    """
+    Parse one complete newline-terminated `@MEDIA1` line, exactly or not at all.
+
+    :param line: The complete line including its prefix and trailing newline.
+    :raises MediaReceiptError: If the line is not exactly one closed record.
+    """
+    if (
+        len(line) > MAX_MEDIA_RECORD
+        or not line.startswith(MEDIA_PREFIX)
+        or line.count(b"\n") != 1
+        or not line.endswith(b"\n")
+        or b"\\" in line
+        or b"\r" in line
+    ):
+        raise MediaReceiptError("Malformed media record")
+    try:
+        value = json.loads(
+            line[len(MEDIA_PREFIX) : -1].decode("ascii"),
+            object_pairs_hook=_reject_media_duplicates,
+            parse_int=_media_int,
+            parse_float=_media_reject,
+            parse_constant=_media_reject,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as err:
+        raise MediaReceiptError("Malformed media record") from err
+    if type(value) is not dict or set(value) != _MEDIA_KEYS or value["v"] != 1:
+        raise MediaReceiptError("Unexpected media members")
+    if type(value["v"]) is not int:
+        raise MediaReceiptError("Unexpected media version")
+    addr = value["addr"]
+    if addr is not None and (
+        type(addr) is not str or not addr.isascii() or not is_canonical_ipv4(addr)
+    ):
+        raise MediaReceiptError("Invalid media address")
+    terminal, route = value["terminal"], value["route"]
+    if type(terminal) is not str or terminal not in ("stop", "abnormal"):
+        raise MediaReceiptError("Invalid media terminal")
+    if type(route) is not str or route not in _ALL_ROUTES:
+        raise MediaReceiptError("Invalid media route")
+    receipt = MediaReceipt(
+        terminal=terminal,
+        route=route,
+        epoch=_media_uint(value["epoch"], 1),
+        fresh_units=_media_uint(value["fresh_units"]),
+        fresh_bytes=_media_uint(value["fresh_bytes"]),
+        idle_units=_media_uint(value["idle_units"]),
+        backlog_units=_media_uint(value["backlog_units"]),
+        fault=_media_bool(value["fault"]),
+        overflow=_media_bool(value["overflow"]),
+        addr=addr,
+        port=_media_uint(value["port"], 65535),
+        setup_port=_media_uint(value["setup_port"], 65535),
+    )
+    if (
+        (receipt.fresh_units == 0) != (receipt.fresh_bytes == 0)
+        or (receipt.addr is None) != (receipt.fresh_units == 0)
+        or (receipt.addr is None and receipt.port != 0)
+    ):
+        raise MediaReceiptError("Incompatible media fields")
+    return receipt
+
+
+def is_canonical_ipv4(text: str) -> bool:
+    """Return whether text is canonical dotted-decimal IPv4."""
+    try:
+        return str(ipaddress.IPv4Address(text)) == text
+    except ValueError:
+        return False
+
+
+def media_qualifies(receipt: MediaReceipt, *, target_address: str, resolved_route: str) -> bool:
+    """
+    Apply every necessary receipt condition against independently held facts.
+
+    :param receipt: The parsed record.
+    :param target_address: The canonical IPv4 address held independently of the child.
+    :param resolved_route: The route parsed from the child's `[STATUS] route` line.
+    """
+    return (
+        receipt.terminal == "stop"
+        and receipt.route in MEDIA_ROUTES
+        and receipt.route == resolved_route
+        and receipt.epoch == 1
+        and receipt.fresh_units >= 1
+        and receipt.fresh_bytes >= 1
+        and not receipt.fault
+        and not receipt.overflow
+        and receipt.addr == target_address
+        and 1 <= receipt.port <= 65535
+        and receipt.port == receipt.setup_port
+    )
+
+
+def resolved_media_route(fields: dict[str, str]) -> str:
+    """
+    Map the closed `[STATUS] route` facts to the receipt's route names; else unknown.
+
+    :param fields: The `protocol`, `flow` and `buffered` values of the status line.
+    """
+    key = (fields.get("protocol", ""), fields.get("flow", ""), fields.get("buffered", ""))
+    return {
+        ("raop", "legacy", "0"): "raop",
+        ("airplay2", "raop-compat", "0"): "compat",
+        ("airplay2", "native", "0"): "udp",
+        ("airplay2", "native", "1"): "buffered",
+    }.get(key, "unknown")
+
+
+class ReceiptScanner:
+    """Bounded line splitter for private child stdout; diverts every media line."""
+
+    def __init__(self) -> None:
+        """Start with no line, no record and no failure."""
+        self._line = bytearray()
+        self._total = 0
+        self._done = False
+        self.record: MediaReceipt | None = None
+        self.failed = False
+
+    def feed(self, data: bytes) -> list[str]:
+        """
+        Return complete ordinary lines; media bytes never leave this object.
+
+        :param data: The next screened stdout bytes.
+        """
+        lines: list[str] = []
+        if self.failed:
+            return lines
+        self._total += len(data)
+        pos = 0
+        while pos < len(data) and not self.failed:
+            if self._done or self._total > MAX_STDOUT_TOTAL:
+                self.failed = True
+                break
+            newline = data.find(b"\n", pos)
+            end = len(data) if newline < 0 else newline + 1
+            self._line += data[pos:end]
+            pos = end
+            limit = MAX_MEDIA_RECORD if self._line[:6] == b"@MEDIA" else MAX_STATUS_LINE
+            if len(self._line) > limit:
+                self.failed = True
+            elif newline >= 0:
+                self._complete_line(lines)
+        if self.failed:
+            self._line.clear()
+        return lines
+
+    def finish(self) -> MediaReceipt | None:
+        """At EOF return the single record, or None (failed, missing, or truncated)."""
+        if self._line and (self._line.startswith(b"@MEDIA") or b"@MEDIA".startswith(self._line)):
+            self.failed = True
+        if self.failed or self.record is None:
+            return None
+        return self.record
+
+    def _complete_line(self, lines: list[str]) -> None:
+        """Classify one complete line; any media-looking line other than one record fails."""
+        raw = bytes(self._line)
+        self._line.clear()
+        if b"@MEDIA" in raw:
+            if self.record is not None or not raw.startswith(b"@MEDIA"):
+                self.failed = True
+                return
+            try:
+                self.record = parse_media_record(raw)
+            except MediaReceiptError:
+                self.failed = True
+                return
+            self._done = True
+            return
+        if text := raw.decode("utf-8", errors="replace").strip():
+            lines.append(text)
+
+
 class PrivateTransportAttempt:
     """One irreversible epoch-bound start and its retained resource ownership."""
 
@@ -124,6 +424,8 @@ class PrivateTransportAttempt:
         queue: object,
         media: str,
         current: Callable[[], bool],
+        version: int = 1,
+        target_address: str | None = None,
     ) -> None:
         """Commit fixed server deadlines before any acknowledgement can be returned."""
         self.attempt_id = attempt_id
@@ -136,6 +438,11 @@ class PrivateTransportAttempt:
         self.cancel_at = self.armed_at + 1.75
         self.drain_at = self.armed_at + 4.75
         self.observe_at = self.armed_at + 5.0
+        self.version = version
+        self.target_address = target_address
+        self._media = MediaState.PENDING
+        self._media_receipt: MediaReceipt | None = None
+        self.stdout_owners: dict[OwnedProcess, asyncio.Task[None]] = {}
         self.revoked = False
         self.consumed = False
         self.start_generation = 0
@@ -172,8 +479,17 @@ class PrivateTransportAttempt:
             raise ValueError("Private transport already owns a stream")
         self.stream = stream
 
-    async def spawn(self, process: OwnedProcess) -> None:
-        """Retain the wrapper and shielded spawn even if the caller is cancelled."""
+    async def spawn(
+        self,
+        process: OwnedProcess,
+        stdout_owner: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    ) -> None:
+        """
+        Retain the wrapper and shielded spawn even if the caller is cancelled.
+
+        :param process: The captured wrapper to start.
+        :param stdout_owner: Factory of the sole stdout reader, registered before spawn completes.
+        """
         try:
             self.check_current()
         except asyncio.CancelledError:
@@ -182,10 +498,65 @@ class PrivateTransportAttempt:
             task = asyncio.create_task(process.close())
             self.spawns.append((process, task))
             raise
-        task = asyncio.create_task(process.start())
+        task = asyncio.create_task(self._start(process, stdout_owner))
         self.spawns.append((process, task))
         await asyncio.shield(task)
         self.check_current()
+
+    def fail_media(self) -> None:
+        """Irreversibly mark media incomplete unless it already completed."""
+        if self._media is MediaState.PENDING:
+            self._media = MediaState.INCOMPLETE
+
+    def accept_media(self, receipt: MediaReceipt, *, stream: object, resolved_route: str) -> bool:
+        """
+        Complete media once, only for the captured stream before observation.
+
+        :param receipt: The record accepted at EOF.
+        :param stream: The stream that owned stdout; must be the attempt's captured stream.
+        :param resolved_route: The route parsed from the child's status line.
+        """
+        ok = (
+            self._media is MediaState.PENDING
+            and self.version == 2
+            and stream is self.stream
+            and not self.forced
+            and self.loop.time() <= self.observe_at
+            and self.start_generation == 1
+            and self.target_address is not None
+            and getattr(self.player, "address", None) == self.target_address
+            and media_qualifies(
+                receipt, target_address=self.target_address, resolved_route=resolved_route
+            )
+        )
+        if not ok:
+            self.fail_media()
+            return False
+        self._media = MediaState.COMPLETE
+        self._media_receipt = receipt
+        return True
+
+    def media_snapshot(self) -> MediaSnapshot:
+        """Return the closed media object; pending latches incomplete at observation."""
+        if self._media is MediaState.PENDING and self.loop.time() >= self.observe_at:
+            self._media = MediaState.INCOMPLETE
+        receipt = self._media_receipt
+        if self.forced or self._media is not MediaState.COMPLETE or receipt is None:
+            pending = self._media is MediaState.PENDING and not self.forced
+            return {
+                "state": MediaState.PENDING if pending else MediaState.INCOMPLETE,
+                "route": "unknown",
+                "epoch": None,
+                "fresh_units": None,
+                "fresh_bytes": None,
+            }
+        return {
+            "state": MediaState.COMPLETE,
+            "route": receipt.route,
+            "epoch": receipt.epoch,
+            "fresh_units": receipt.fresh_units,
+            "fresh_bytes": receipt.fresh_bytes,
+        }
 
     def claim_start(self) -> bool:
         """Guard the actual FIFO delivery and consume exactly one START generation."""
@@ -226,9 +597,9 @@ class PrivateTransportAttempt:
             self.cleanup_task = asyncio.create_task(self._cleanup())
         return self.cleanup_task
 
-    def snapshot(self) -> TransportSnapshot:
+    def snapshot(self) -> TransportSnapshot | TransportSnapshotV2:
         """Return software ownership facts, never audio or physical cessation proof."""
-        return {
+        base: TransportSnapshot = {
             "version": 1,
             "attempt_id": self.attempt_id,
             "outcome": self.outcome,
@@ -245,6 +616,17 @@ class PrivateTransportAttempt:
                 for process, task in self.spawns
             ),
         }
+        if self.version != 2:
+            return base
+        return {**base, "version": 2, "media": self.media_snapshot()}
+
+    async def _start(
+        self, process: OwnedProcess, stdout_owner: Callable[[], Coroutine[Any, Any, None]] | None
+    ) -> None:
+        """Start the wrapper and register its sole stdout owner before spawn completes."""
+        await process.start()
+        if stdout_owner is not None:
+            self.stdout_owners[process] = asyncio.create_task(stdout_owner())
 
     async def _play(self, operation: Callable[[], Awaitable[None]]) -> None:
         """Scope ambient ownership only to the real queue call."""
@@ -286,6 +668,9 @@ class PrivateTransportAttempt:
             if isinstance(result, Exception):
                 self.outcome = TransportOutcome.INCOMPLETE
                 raise result
+        self.media_snapshot()
+        if self._media is MediaState.PENDING:
+            self._media = MediaState.INCOMPLETE
         if self.loop.time() > self.observe_at:
             self.outcome = TransportOutcome.INCOMPLETE
         else:
@@ -294,6 +679,21 @@ class PrivateTransportAttempt:
                 if self.forced
                 else TransportOutcome.NATURAL_CLEANUP
             )
+
+    async def _hand_off_stdout(self, process: OwnedProcess, owner: asyncio.Task[None]) -> None:
+        """Join the owner; if it ended before EOF, kill and discard as the exclusive reader."""
+        outcome = (await asyncio.gather(owner, return_exceptions=True))[0]
+        receipt = cast("ReceiptProcess", process)
+        if outcome is None and receipt.receipt_eof:
+            return
+        self.fail_media()
+        receipt.reject_receipt_stream()
+        await receipt.discard_receipt_stream()
+
+    def _force(self) -> None:
+        """Record forced containment; media evidence can never survive it."""
+        self.forced = True
+        self.fail_media()
 
     async def _release(self) -> None:
         """Let captured readers relinquish pipes before raw drainers consume them."""
@@ -317,7 +717,7 @@ class PrivateTransportAttempt:
         """Use one absolute window for EOF, forced containment and final reap."""
         done, _ = await asyncio.wait({spawn}, timeout=max(0, self.drain_at - self.loop.time()))
         if not done:
-            self.forced = True
+            self._force()
             if process.proc is not None and process.proc.returncode is None:
                 with suppress(ProcessLookupError):
                     process.proc.kill()
@@ -330,21 +730,24 @@ class PrivateTransportAttempt:
         reader = process._stderr_reader_task
         if reader is not None:
             reader.cancel()
+        owner = self.stdout_owners.get(process)
         readers = [
             asyncio.create_task(self._read_pipe(pipe, reader if pipe is proc.stderr else None))
             for pipe in (proc.stdout, proc.stderr)
-            if pipe is not None
+            if pipe is not None and not (pipe is proc.stdout and owner is not None)
         ]
+        if owner is not None:
+            readers.append(asyncio.create_task(self._hand_off_stdout(process, owner)))
         waiter = asyncio.create_task(proc.wait())
         reaped, _ = await asyncio.wait({waiter}, timeout=max(0, self.drain_at - self.loop.time()))
         if not reaped and proc.returncode is None:
-            self.forced = True
+            self._force()
             with suppress(ProcessLookupError):
                 proc.kill()
         await waiter
         await asyncio.gather(*readers)
         if proc.returncode is not None and proc.returncode < 0:
-            self.forced = True
+            self._force()
         # The child is already reaped and both pipes reached EOF. This only
         # finalizes wrapper-owned descriptors; it is not the live-child stop bound.
         await process.close()

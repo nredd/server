@@ -41,7 +41,11 @@ from music_assistant.helpers.config_entries import (
 )
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
-from music_assistant.helpers.private_transport import PrivateTransportAttempt, validate_request
+from music_assistant.helpers.private_transport import (
+    PrivateTransportAttempt,
+    is_canonical_ipv4,
+    validate_request,
+)
 from music_assistant.helpers.private_trial import (
     CONF_PRIVATE_TRIAL_TARGET,
     admits_player_id,
@@ -304,6 +308,12 @@ def _private_flag_refusal(
     )
 
 
+def _private_target_address(player: AirPlayPlayer) -> str | None:
+    """Return the admitted player's canonical numeric IPv4 address, else None."""
+    address = getattr(player, "address", None)
+    return address if isinstance(address, str) and is_canonical_ipv4(address) else None
+
+
 def _has_current_private_receipt(child: AsyncProcess) -> bool:
     """Require the exact private child acknowledgement, not a legacy procfs match."""
     return isinstance(child, trial_binary.TrialAsyncProcess) and child.has_current_receipt()
@@ -388,6 +398,7 @@ class AirPlayProvider(PlayerProvider):
     _unregister_private_capture_readiness_api: Callable[[], None] | None = None
     _unregister_private_flags_api: Callable[[], None] | None = None
     _unregister_private_transport_api: Callable[[], None] | None = None
+    _unregister_private_transport_v2_api: Callable[[], None] | None = None
     _private_transport_attempt: PrivateTransportAttempt | None = None
     _private_admission_epoch: int = 0
     _private_transport_epoch: int = -1
@@ -666,6 +677,9 @@ class AirPlayProvider(PlayerProvider):
         if unregister := self._unregister_private_transport_api:
             unregister()
             self._unregister_private_transport_api = None
+        if unregister := self._unregister_private_transport_v2_api:
+            unregister()
+            self._unregister_private_transport_v2_api = None
         if unregister := getattr(self, "_unregister_private_admission_api", None):
             unregister()
             self._unregister_private_admission_api = None
@@ -1022,55 +1036,12 @@ class AirPlayProvider(PlayerProvider):
         }
 
     async def private_trial_transport(self, request: Any) -> dict[str, SerializableType]:
-        """Arm or control exactly one private finite-stimulus transport attempt."""
-        mode = validate_request(request)
-        if not is_trial_target():
-            raise ValueError("Private transport unavailable")
-        attempt = self._private_transport_attempt
-        if mode == "arm":
-            # A tombstone is retained for the entire admission epoch. Even after CLEAR,
-            # unresolved old ownership cannot be displaced by a new attempt.
-            if attempt is not None and (
-                self._private_transport_epoch == self._private_admission_epoch
-                or attempt.snapshot()["cleanup_complete"] is not True
-            ):
-                raise ValueError("Private transport already armed")
-            players = self.get_players()
-            if len(players) != 1 or players[0].player_id != request["player_id"]:
-                raise ValueError("Private transport requires one admitted player")
-            player = players[0]
-            queue = self.mass.player_queues.get(player.player_id)
-            if queue is None or player.stream is not None:
-                raise ValueError("Private transport requires an idle queue")
-            epoch = self._private_admission_epoch
+        """Arm or control exactly one private finite-stimulus transport attempt (v1)."""
+        return await self._private_trial_transport(request, 1)
 
-            def current() -> bool:
-                """Bind the exact admitted objects and epoch without yielding."""
-                return self._private_transport_current(player, queue, epoch)
-
-            if not current():
-                raise ValueError("Private transport prerequisites unavailable")
-            attempt = PrivateTransportAttempt(
-                request["attempt_id"], player, queue, request["media"], current
-            )
-            self._private_transport_attempt = attempt
-            self._private_transport_epoch = epoch
-        elif attempt is None or attempt.attempt_id != request["attempt_id"]:
-            raise ValueError("Unknown private transport attempt")
-        elif mode == "play":
-
-            async def play() -> None:
-                """Forward only the immutable admitted URI and replace option."""
-                await self.mass.player_queues.play_media(
-                    queue_id=cast("AirPlayPlayer", attempt.player).player_id,
-                    media=attempt.media,
-                    option=QueueOption.REPLACE,
-                )
-
-            attempt.play(play)
-        elif mode == "stop":
-            attempt.request_stop("private-stop")
-        return cast("dict[str, SerializableType]", attempt.snapshot())
+    async def private_trial_transport_v2(self, request: Any) -> dict[str, SerializableType]:
+        """Arm or control one private transport attempt (v2, adds the closed media object)."""
+        return await self._private_trial_transport(request, 2)
 
     async def private_airplay_flags(self, request: Any) -> dict[str, SerializableType]:
         """
@@ -1146,6 +1117,72 @@ class AirPlayProvider(PlayerProvider):
             PrivateFlagMemory.APPLIED,
             persistence,
         )
+
+    async def _private_trial_transport(
+        self, request: Any, version: int
+    ) -> dict[str, SerializableType]:
+        """Share one tombstone and admission guard; the version is fixed at ARM."""
+        mode = validate_request(request)
+        if not is_trial_target():
+            raise ValueError("Private transport unavailable")
+        attempt = self._private_transport_attempt
+        if mode == "arm":
+            # A tombstone is retained for the entire admission epoch. Even after CLEAR,
+            # unresolved old ownership cannot be displaced by a new attempt.
+            if attempt is not None and (
+                self._private_transport_epoch == self._private_admission_epoch
+                or attempt.snapshot()["cleanup_complete"] is not True
+            ):
+                raise ValueError("Private transport already armed")
+            players = self.get_players()
+            if len(players) != 1 or players[0].player_id != request["player_id"]:
+                raise ValueError("Private transport requires one admitted player")
+            player = players[0]
+            queue = self.mass.player_queues.get(player.player_id)
+            if queue is None or player.stream is not None:
+                raise ValueError("Private transport requires an idle queue")
+            epoch = self._private_admission_epoch
+
+            def current() -> bool:
+                """Bind the exact admitted objects and epoch without yielding."""
+                return self._private_transport_current(player, queue, epoch)
+
+            if not current():
+                raise ValueError("Private transport prerequisites unavailable")
+            target_address = _private_target_address(player) if version == 2 else None
+            if version == 2 and target_address is None:
+                raise ValueError("Private transport requires a numeric IPv4 target")
+            attempt = PrivateTransportAttempt(
+                request["attempt_id"],
+                player,
+                queue,
+                request["media"],
+                current,
+                version,
+                target_address,
+            )
+            self._private_transport_attempt = attempt
+            self._private_transport_epoch = epoch
+        elif (
+            attempt is None
+            or attempt.attempt_id != request["attempt_id"]
+            or attempt.version != version
+        ):
+            raise ValueError("Unknown private transport attempt")
+        elif mode == "play":
+
+            async def play() -> None:
+                """Forward only the immutable admitted URI and replace option."""
+                await self.mass.player_queues.play_media(
+                    queue_id=cast("AirPlayPlayer", attempt.player).player_id,
+                    media=attempt.media,
+                    option=QueueOption.REPLACE,
+                )
+
+            attempt.play(play)
+        elif mode == "stop":
+            attempt.request_stop("private-stop")
+        return cast("dict[str, SerializableType]", attempt.snapshot())
 
     def _private_transport_current(self, player: AirPlayPlayer, queue: object, epoch: int) -> bool:
         """Reject changed admission, grouping, redirect, bridge or strict readiness."""
@@ -1247,6 +1284,7 @@ class AirPlayProvider(PlayerProvider):
             ("airplay/private_flags", self.private_airplay_flags),
             ("airplay/private_trial_admission/mutate", self.private_trial_admission_mutate),
             ("airplay/private_trial_transport", self.private_trial_transport),
+            ("airplay/private_trial_transport_v2", self.private_trial_transport_v2),
         )
         claimed: list[Callable[[], None]] = []
         try:
@@ -1268,6 +1306,7 @@ class AirPlayProvider(PlayerProvider):
             self._unregister_private_flags_api,
             self._unregister_private_admission_mutate_api,
             self._unregister_private_transport_api,
+            self._unregister_private_transport_v2_api,
         ) = claimed
 
     def _private_target_unset(self) -> bool:

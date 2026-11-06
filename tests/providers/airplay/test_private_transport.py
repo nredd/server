@@ -338,6 +338,7 @@ async def test_captured_stream_release_preserves_foreign_publication() -> None:
         _teardown_started=asyncio.Event(),
         _stdout_reader_task=None,
         _cli_proc=None,
+        private_attempt=None,
         _private_pipe_create_task=None,
         commands_pipe=SimpleNamespace(remove=asyncio.sleep),
         player=SimpleNamespace(stream=foreign),
