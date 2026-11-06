@@ -682,6 +682,17 @@ def _other(*_args: object, **_kwargs: object) -> None:
         (stream.AirPlayStream, "_private_owner_current"),
         (stream.AirPlayStream, "_attach_stdout_reader"),
         (stream.AirPlayStream, "_parse_route_status"),
+        (stream.AirPlayStream, "_stdout_reader"),
+        (stream.AirPlayStream, "_stderr_reader"),
+        (stream.AirPlayStream, "_consume_capture_stderr"),
+        (stream.AirPlayStream, "_finish_stderr_actor"),
+        (stream.AirPlayStream, "_kill_child"),
+        (stream.AirPlayStream, "_graceful_close"),
+        (stream.AirPlayStream, "_cleanup_failed_start"),
+        (stream.AirPlayStream, "wait_for_connection"),
+        (stream.AirPlayStream, "write_audio"),
+        (stream.AirPlayStream, "write_audio_eof"),
+        (stream.AirPlayStream, "flush"),
         (provider.AirPlayProvider, "private_trial_transport_v2"),
         (provider.AirPlayProvider, "_private_trial_transport"),
         (provider, "_private_target_address"),
@@ -696,6 +707,36 @@ def test_receipt_callables_are_code_sealed(
     assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
 
 
+def _stream_process_callers() -> list[str]:
+    """Names of every `AirPlayStream` function (not property) that reads the child process."""
+    tree = ast.parse(Path(str(stream.__file__)).read_bytes())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AirPlayStream"
+    )
+    return sorted(
+        node.name
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.decorator_list
+        and any(
+            isinstance(item, ast.Attribute) and item.attr == "_cli_proc" for item in ast.walk(node)
+        )
+        and node.name != "__init__"
+    )
+
+
+@pytest.mark.parametrize("name", _stream_process_callers())
+def test_every_stream_caller_of_the_child_process_is_code_sealed(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """No `AirPlayStream` function touching `_cli_proc` can be replaced and stay verified."""
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "verified"
+    monkeypatch.setattr(stream.AirPlayStream, name, _other)
+    assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"
+
+
 @pytest.mark.parametrize(
     ("owner", "name", "value"),
     [
@@ -706,9 +747,9 @@ def test_receipt_callables_are_code_sealed(
         (private_transport, "MEDIA_PREFIX", b"@MEDIA1"),
         (private_transport, "_MEDIA_KEYS", frozenset({"v"})),
         (private_transport, "_ALL_ROUTES", ("raop",)),
-        (private_transport, "_CANONICAL_UINT", __import__("re").compile(r"[0-9]+")),
-        (private_transport, "json", __import__("types").SimpleNamespace()),
-        (private_transport, "ipaddress", __import__("types").SimpleNamespace()),
+        (private_transport, "_CANONICAL_UINT", re.compile(r"[0-9]+")),
+        (private_transport, "json", SimpleNamespace()),
+        (private_transport, "ipaddress", SimpleNamespace()),
         (trial_binary, "MAX_RECEIPT_CHUNK", 1 << 20),
         (trial_binary, "_ATTEST_PREFIX", b"[ATTEST]x"),
         (stream, "ReceiptScanner", type("ReceiptScanner", (), {})),

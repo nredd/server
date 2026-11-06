@@ -55,6 +55,8 @@ from . import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from music_assistant.helpers.json import SerializableType
 
 _MAX_SOURCE_SIZE = 1024 * 1024
@@ -470,6 +472,17 @@ def _check_transport_boundaries(
                 "_read_stdout",
                 "_handle_stdout_line",
                 "_private_stdout_reader",
+                "_stdout_reader",
+                "_stderr_reader",
+                "_consume_capture_stderr",
+                "_finish_stderr_actor",
+                "_kill_child",
+                "_graceful_close",
+                "_cleanup_failed_start",
+                "wait_for_connection",
+                "write_audio",
+                "write_audio_eof",
+                "flush",
                 "_private_owner_current",
                 "_attach_stdout_reader",
                 "_uses_private_receipt",
@@ -724,9 +737,23 @@ ASYNC_PROCESS_METHODS: Final = frozenset(
         "_drain_under_lock",
         "_cancel_and_await",
         "_is_expected_task_error",
+        "__aenter__",
+        "__aexit__",
+        "iter_chunked",
+        "iter_any",
+        "readexactly",
+        "stdin_quiesced",
+        "write_eof",
+        "read_stderr",
+        "iter_stderr",
+        "iter_stdout",
+        "attach_stderr_reader",
+        "_iter_lines",
+        "_drain_stdin_locked",
     }
 )
-ASYNC_PROCESS_PROPERTIES: Final = frozenset({"closed", "returncode"})
+ASYNC_PROCESS_CONTEXT_MANAGERS: Final = frozenset({"stdin_quiesced"})
+ASYNC_PROCESS_PROPERTIES: Final = frozenset({"closed", "returncode", "stdin_closed"})
 ASYNC_PROCESS_CLASS_ATTRS: Final = frozenset({"_stdin_feeder_task", "_stderr_reader_task"})
 ASYNC_PROCESS_GLOBALS: Final = frozenset(
     {
@@ -917,13 +944,26 @@ def _check_async_process(compiled: list[CodeType], tree: ast.Module) -> None:
     }
     if set(vars(base)) - _CLASS_DUNDERS != declared:
         raise ValueError("Unexpected process class members")
+    if declared - {"__annotations__"} != (
+        ASYNC_PROCESS_METHODS | ASYNC_PROCESS_PROPERTIES | ASYNC_PROCESS_CLASS_ATTRS
+    ):
+        raise ValueError("Unsealed process class members")
     for name in sorted(ASYNC_PROCESS_METHODS):
-        _check_boundary(compiled, tree, base, name, process_module)
+        _check_boundary(
+            compiled,
+            tree,
+            base,
+            name,
+            process_module,
+            context_manager=name in ASYNC_PROCESS_CONTEXT_MANAGERS,
+        )
     for name in sorted(ASYNC_PROCESS_PROPERTIES):
         _check_function(compiled, tree, base, name, prop=True)
     if any(vars(base)[name] is not None for name in ASYNC_PROCESS_CLASS_ATTRS):
         raise ValueError("Unexpected process class attribute")
-    _check_literal_globals(tree, process_module, ("PIPE_DRAIN_TIMEOUT", "STREAM_RELEASE_TIMEOUT"))
+    _check_literal_globals(
+        tree, process_module, ("DEFAULT_CHUNKSIZE", "PIPE_DRAIN_TIMEOUT", "STREAM_RELEASE_TIMEOUT")
+    )
     live = vars(process_module)
     logger = live["LOGGER"]
     if (
@@ -934,6 +974,7 @@ def _check_async_process(compiled: list[CodeType], tree: ast.Module) -> None:
         or live["logging"] is not logging
         or live["Path"] is not Path
         or live["suppress"] is not contextlib.suppress
+        or live["asynccontextmanager"] is not contextlib.asynccontextmanager
     ):
         raise ValueError("Unexpected process module bindings")
 
@@ -1007,12 +1048,47 @@ def _check_literal_globals(tree: ast.Module, module: ModuleType, names: tuple[st
             raise ValueError("Unexpected receipt constant")
 
 
+async def _context_manager_probe() -> AsyncGenerator[None]:
+    """Provide the reference body the stdlib `asynccontextmanager` wrapper is derived from."""
+    yield
+
+
+def _unwrap_context_manager(value: object) -> object:
+    """Return the function wrapped by a genuine `contextlib.asynccontextmanager` helper."""
+    reference = contextlib.asynccontextmanager(_context_manager_probe)
+    wrapped = getattr(value, "__wrapped__", None)
+    if (
+        type(value) is not FunctionType
+        or type(wrapped) is not FunctionType
+        or value.__code__ != reference.__code__
+        or value.__closure__ is None
+        or len(value.__closure__) != 1
+        or value.__closure__[0].cell_contents is not wrapped
+    ):
+        raise ValueError("Unexpected context manager wrapper")
+    return wrapped
+
+
 def _check_boundary(
-    compiled: list[CodeType], tree: ast.Module, owner: object, name: str, module: ModuleType
+    compiled: list[CodeType],
+    tree: ast.Module,
+    owner: object,
+    name: str,
+    module: ModuleType,
+    *,
+    context_manager: bool = False,
 ) -> None:
-    """Verify an undecorated boundary including literal positional/keyword defaults."""
+    """
+    Verify an undecorated boundary including literal positional/keyword defaults.
+
+    :param context_manager: Accept exactly one `asynccontextmanager` decorator.
+    """
     value = inspect.getattr_static(owner, name)
-    if type(value) is not FunctionType or hasattr(value, "__wrapped__"):
+    if context_manager:
+        value = _unwrap_context_manager(value)
+    elif hasattr(value, "__wrapped__"):
+        raise ValueError("Unexpected boundary callable")
+    if type(value) is not FunctionType:
         raise ValueError("Unexpected boundary callable")
     class_name = owner.__name__ if isinstance(owner, type) else None
     qualname = f"{class_name}.{name}" if class_name else name
@@ -1031,11 +1107,12 @@ def _check_boundary(
         for node in nodes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
     )
-    if declaration.decorator_list:
+    expected_decorators = ["asynccontextmanager"] if context_manager else []
+    if [ast.unparse(item) for item in declaration.decorator_list] != expected_decorators:
         raise ValueError("Unexpected boundary decorator")
     if value.__qualname__ != qualname:
         raise ValueError("Unexpected boundary qualified name")
-    _check_callable_defaults(value, declaration)
+    _check_callable_defaults(value, declaration, _literal_constants(tree))
     _check_globals(value, module)
     if value.__closure__ is not None and not (
         class_name is not None
@@ -1046,13 +1123,36 @@ def _check_boundary(
         raise ValueError("Unexpected boundary closure")
 
 
+def _literal_constants(tree: ast.Module) -> dict[str, object]:
+    """Collect module-level `NAME = <literal>` declarations usable as callable defaults."""
+    constants: dict[str, object] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+        ):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _default_value(node: ast.expr, constants: dict[str, object]) -> object:
+    """Evaluate a literal default, or a name bound to a module-level literal constant."""
+    if isinstance(node, ast.Name):
+        return constants[node.id]
+    return ast.literal_eval(node)
+
+
 def _check_callable_defaults(
-    value: FunctionType, declaration: ast.FunctionDef | ast.AsyncFunctionDef
+    value: FunctionType,
+    declaration: ast.FunctionDef | ast.AsyncFunctionDef,
+    constants: dict[str, object],
 ) -> None:
     """Compare literal source defaults without accepting equal but differently typed values."""
-    defaults = tuple(ast.literal_eval(item) for item in declaration.args.defaults)
+    defaults = tuple(_default_value(item, constants) for item in declaration.args.defaults)
     kwdefaults = {
-        arg.arg: ast.literal_eval(default)
+        arg.arg: _default_value(default, constants)
         for arg, default in zip(
             declaration.args.kwonlyargs, declaration.args.kw_defaults, strict=True
         )
@@ -1124,7 +1224,7 @@ def _check_queue_wrapper(
     ]
     if len(declarations) != 1 or wrapped.__closure__ is not None:
         raise ValueError("Unexpected wrapped callable closure")
-    _check_callable_defaults(wrapped, declarations[0])
+    _check_callable_defaults(wrapped, declarations[0], {})
 
 
 _MODULE_DUNDERS: Final = frozenset(
