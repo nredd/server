@@ -7,8 +7,10 @@ References:
 
 from __future__ import annotations
 
+import ast
 import builtins
 import dis
+import functools
 import re
 import sys
 from pathlib import Path
@@ -476,3 +478,239 @@ def test_qualification_closure_reads_only_declared_globals() -> None:
     # Helpers reached by name must themselves be inventoried.
     assert {"descriptor_path", "get_subprocess_env", "open_in_thread"} <= reached
     assert "encode_public_digest" in reached
+
+
+SHADOWED_BUILTINS = ("bytes", "len", "isinstance", "bytearray", "type")
+SHADOW_MODULES = {
+    "trial_binary": trial_binary,
+    "private_transport": private_transport,
+    "private_trial": private_trial,
+    "process_module": process_module,
+    "stream": stream,
+    "stream_session": stream_session,
+    "provider": provider,
+    "server_code_evidence": server_code_evidence,
+}
+
+
+class _Shadow:
+    """A class standing in for a builtin."""
+
+    def method(self, *_args: object) -> int:
+        """Bound-method shadow target."""
+        return 0
+
+
+def _shadow(kind: str, name: str) -> object:
+    builtin = getattr(builtins, name)
+    if kind == "partial":
+        return functools.partial(builtin)
+    if kind == "class":
+        return _Shadow
+    if kind == "bound_method":
+        return _Shadow().method
+    if kind == "function":
+        return lambda *_a, **_k: builtin(*_a, **_k)
+    return object()
+
+
+@pytest.mark.parametrize("kind", ["partial", "class", "bound_method", "function", "object"])
+@pytest.mark.parametrize("name", SHADOWED_BUILTINS)
+@pytest.mark.parametrize("module_name", sorted(SHADOW_MODULES))
+def test_undeclared_builtin_shadow_in_sealed_module_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, name: str, kind: str
+) -> None:
+    """A module attribute of ANY type shadows a builtin read by sealed code; reject it."""
+    monkeypatch.setattr(SHADOW_MODULES[module_name], name, _shadow(kind, name), raising=False)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("module_name", sorted(SHADOW_MODULES))
+def test_undeclared_nonbuiltin_global_in_sealed_module_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, module_name: str
+) -> None:
+    """The inventory is closed against the module's own source, not only builtin names."""
+    monkeypatch.setattr(SHADOW_MODULES[module_name], "_forged_global", 1, raising=False)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("module_name", sorted(SHADOW_MODULES))
+def test_interpreter_warnings_registry_dict_is_accepted_other_types_rejected(
+    monkeypatch: pytest.MonkeyPatch, module_name: str
+) -> None:
+    """The interpreter adds a dict `__warningregistry__` once a module emits a warning."""
+    module = SHADOW_MODULES[module_name]
+    monkeypatch.setattr(module, "__warningregistry__", {}, raising=False)
+    assert evidence()["status"] == "verified"
+    monkeypatch.setattr(module, "__warningregistry__", print, raising=False)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("module_name", sorted(SHADOW_MODULES))
+def test_swapped_module_builtins_mapping_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, module_name: str
+) -> None:
+    """A per-module `__builtins__` mapping is a builtin shadow too."""
+    module = SHADOW_MODULES[module_name]
+    monkeypatch.setattr(
+        module, "__builtins__", {**vars(builtins), "bytes": functools.partial(bytes)}
+    )
+    assert evidence()["status"] == "unverified"
+
+
+def test_declared_module_globals_are_the_live_inventory() -> None:
+    """Control: the real namespaces are closed and fully verified (no false positives)."""
+    for module in SHADOW_MODULES.values():
+        assert not (
+            set(vars(module))
+            - server_code_evidence._declared_names(
+                ast.parse(Path(str(module.__file__)).read_bytes())
+            )
+            - server_code_evidence._MODULE_DUNDERS
+        )
+    assert evidence()["status"] == "verified"
+
+
+ASYNC_METHODS = sorted(server_code_evidence.ASYNC_PROCESS_METHODS)
+ASYNC_PROPERTIES = sorted(server_code_evidence.ASYNC_PROCESS_PROPERTIES)
+
+
+@pytest.mark.parametrize("name", ASYNC_METHODS)
+def test_inherited_async_process_method_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The exec/close path runs inherited `AsyncProcess` code; it is sealed to its source."""
+    monkeypatch.setattr(process_module.AsyncProcess, name, lambda *_a, **_k: None)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", ASYNC_METHODS)
+def test_inherited_async_process_foreign_globals_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """A same-code clone bound to another globals dictionary is refused."""
+    function = vars(process_module.AsyncProcess)[name]
+    clone = FunctionType(
+        function.__code__,
+        dict(function.__globals__),
+        name=function.__name__,
+        argdefs=function.__defaults__,
+        closure=function.__closure__,
+    )
+    clone.__kwdefaults__ = function.__kwdefaults__
+    monkeypatch.setattr(process_module.AsyncProcess, name, clone)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", ASYNC_PROPERTIES)
+def test_inherited_async_process_property_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """`closed` and `returncode` feed the receipt and attestation checks."""
+    monkeypatch.setattr(process_module.AsyncProcess, name, property(lambda _self: None))
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", ["_forged", "__getattr__", "__getattribute__"])
+def test_extra_async_process_member_is_rejected(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """The class dictionary is closed against its source body."""
+    monkeypatch.setattr(process_module.AsyncProcess, name, lambda *_a: None, raising=False)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", ["_stdin_feeder_task", "_stderr_reader_task"])
+def test_async_process_class_attribute_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Inherited class-level defaults the wrapper reads stay `None`."""
+    monkeypatch.setattr(process_module.AsyncProcess, name, object())
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("PIPE_DRAIN_TIMEOUT", 10_000),
+        ("STREAM_RELEASE_TIMEOUT", 10_000),
+        ("SIGINT", 0),
+        ("VERBOSE_LOG_LEVEL", 99),
+        ("LOGGER", object()),
+        ("logging", object()),
+        ("Path", object()),
+        ("suppress", object()),
+    ],
+)
+def test_async_process_module_binding_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: object
+) -> None:
+    """Constants and bindings the inherited code reads are sealed."""
+    monkeypatch.setattr(process_module, name, value)
+    assert evidence()["status"] == "unverified"
+
+
+def test_async_process_mro_is_closed() -> None:
+    """A mixin spliced into the hierarchy is refused."""
+
+    class Mixin:
+        """Foreign base."""
+
+    child = trial_binary.TrialAsyncProcess
+    original = child.__bases__
+    child.__bases__ = (Mixin, process_module.AsyncProcess)
+    try:
+        assert evidence()["status"] == "unverified"
+    finally:
+        child.__bases__ = original
+    assert child.__bases__ == original
+    assert evidence()["status"] == "verified"
+
+
+def test_async_process_inventory_covers_every_inherited_dependency() -> None:
+    """Audit: every AsyncProcess member reachable from the wrapper (self./super()) is sealed."""
+    base = vars(process_module.AsyncProcess)
+
+    def function(value: object) -> FunctionType | None:
+        target = value.fget if isinstance(value, property) else value
+        return target if isinstance(target, FunctionType) else None
+
+    def attributes(target: FunctionType) -> tuple[set[str], set[str]]:
+        names: set[str] = set()
+        read: set[str] = set()
+        stack = [target.__code__]
+        while stack:
+            code = stack.pop()
+            stack.extend(item for item in code.co_consts if hasattr(item, "co_code"))
+            for ins in dis.get_instructions(code):
+                if ins.opname in {"LOAD_ATTR", "LOAD_SUPER_ATTR", "STORE_ATTR"}:
+                    names.add(str(ins.argval))
+                if ins.opname == "LOAD_GLOBAL":
+                    read.add(str(ins.argval))
+        return names, read
+
+    pending = [
+        name
+        for value in vars(trial_binary.TrialAsyncProcess).values()
+        if (target := function(value)) is not None
+        for name in attributes(target)[0]
+        if name in base
+    ]
+    reached: set[str] = set()
+    global_reads: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        if (target := function(base[name])) is not None:
+            names, read = attributes(target)
+            global_reads |= read
+            pending.extend(item for item in names if item in base)
+    sealed = (
+        server_code_evidence.ASYNC_PROCESS_METHODS
+        | server_code_evidence.ASYNC_PROCESS_PROPERTIES
+        | server_code_evidence.ASYNC_PROCESS_CLASS_ATTRS
+    )
+    assert reached <= sealed
+    assert {name for name in global_reads if name not in vars(builtins)} <= (
+        server_code_evidence.ASYNC_PROCESS_GLOBALS
+    )

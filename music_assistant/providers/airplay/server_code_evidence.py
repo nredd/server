@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import contextlib
 import contextvars
 import dataclasses
@@ -13,9 +14,11 @@ import hashlib
 import inspect
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
+import signal
 import stat
 import sys
 import typing
@@ -122,6 +125,7 @@ def server_code_evidence(
                 compile(data, str(path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
             )
             trees[key] = ast.parse(data)
+            _check_module_namespace(module, trees[key])
         for name in (
             "private_trial_transport",
             "private_trial_transport_v2",
@@ -697,6 +701,63 @@ PROCESS_HELPER_GLOBALS: Final = {
     "open_in_thread": frozenset({"_close_late_descriptor", "asyncio"}),
     "_close_late_descriptor": frozenset({"os"}),
 }
+# Inherited `AsyncProcess` members `TrialAsyncProcess` reaches (self./super() attributes,
+# transitively), the exec path included. Enforced complete by a bytecode-audit test.
+ASYNC_PROCESS_METHODS: Final = frozenset(
+    {
+        "__init__",
+        "start",
+        "read",
+        "write",
+        "read_stdout",
+        "communicate",
+        "close",
+        "kill",
+        "wait",
+        "wait_with_timeout",
+        "_prepare_stderr_close",
+        "_reclaim_finished_stderr_reader",
+        "_wait_for_stderr_reader",
+        "_readline",
+        "_acquire_stream_lock",
+        "_drain_pipe",
+        "_drain_under_lock",
+        "_cancel_and_await",
+        "_is_expected_task_error",
+    }
+)
+ASYNC_PROCESS_PROPERTIES: Final = frozenset({"closed", "returncode"})
+ASYNC_PROCESS_CLASS_ATTRS: Final = frozenset({"_stdin_feeder_task", "_stderr_reader_task"})
+ASYNC_PROCESS_GLOBALS: Final = frozenset(
+    {
+        "LOGGER",
+        "PIPE_DRAIN_TIMEOUT",
+        "Path",
+        "SIGINT",
+        "STREAM_RELEASE_TIMEOUT",
+        "VERBOSE_LOG_LEVEL",
+        "asyncio",
+        "get_subprocess_env",
+        "logging",
+        "os",
+        "suppress",
+    }
+)
+_CLASS_DUNDERS: Final = frozenset(
+    {
+        "__module__",
+        "__doc__",
+        "__dict__",
+        "__weakref__",
+        "__firstlineno__",
+        "__static_attributes__",
+        "__qualname__",
+        "__annotations__",
+        "__annotate_func__",
+        "__annotations_cache__",
+        "__classdictcell__",
+    }
+)
 PRIVATE_TRIAL_HELPER_GLOBALS: Final = {
     "encode_public_digest": frozenset({"_SHA", "_SHA256"}),
 }
@@ -822,14 +883,59 @@ def _check_process_helpers(codes: dict[str, list[CodeType]], trees: dict[str, as
         compile(data, str(path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
     )
     tree = ast.parse(data)
+    _check_module_namespace(process_module, tree)
     for name in PROCESS_HELPER_GLOBALS:
         _check_boundary(compiled, tree, process_module, name, process_module)
+    _check_async_process(compiled, tree)
     if (
         vars(process_module)["os"] is not os
         or vars(process_module)["sys"] is not sys
         or vars(process_module)["asyncio"] is not asyncio
     ):
         raise ValueError("Unexpected process helper bindings")
+
+
+def _check_async_process(compiled: list[CodeType], tree: ast.Module) -> None:
+    """Seal the inherited `AsyncProcess` code the wrapper's exec and close path runs."""
+    base = process_module.AsyncProcess
+    child = trial_binary.TrialAsyncProcess
+    if child.__mro__ != (child, base, object) or base.__bases__ != (object,):
+        raise ValueError("Unexpected process class hierarchy")
+    if type(base) is not type or type(child) is not type:
+        raise ValueError("Unexpected process metaclass")
+    declaration = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == base.__name__
+    )
+    declared = {
+        node.name
+        for node in declaration.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } | {
+        node.target.id
+        for node in declaration.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    if set(vars(base)) - _CLASS_DUNDERS != declared:
+        raise ValueError("Unexpected process class members")
+    for name in sorted(ASYNC_PROCESS_METHODS):
+        _check_boundary(compiled, tree, base, name, process_module)
+    for name in sorted(ASYNC_PROCESS_PROPERTIES):
+        _check_function(compiled, tree, base, name, prop=True)
+    if any(vars(base)[name] is not None for name in ASYNC_PROCESS_CLASS_ATTRS):
+        raise ValueError("Unexpected process class attribute")
+    _check_literal_globals(tree, process_module, ("PIPE_DRAIN_TIMEOUT", "STREAM_RELEASE_TIMEOUT"))
+    live = vars(process_module)
+    logger = live["LOGGER"]
+    if (
+        type(logger) is not logging.Logger
+        or logger.name != f"{core_constants.MASS_LOGGER_NAME}.helpers.process"
+        or live["SIGINT"] is not signal.SIGINT
+        or live["VERBOSE_LOG_LEVEL"] != core_constants.VERBOSE_LOG_LEVEL
+        or live["logging"] is not logging
+        or live["Path"] is not Path
+        or live["suppress"] is not contextlib.suppress
+    ):
+        raise ValueError("Unexpected process module bindings")
 
 
 def _check_receipt_shapes() -> None:
@@ -1019,6 +1125,73 @@ def _check_queue_wrapper(
     if len(declarations) != 1 or wrapped.__closure__ is not None:
         raise ValueError("Unexpected wrapped callable closure")
     _check_callable_defaults(wrapped, declarations[0])
+
+
+_MODULE_DUNDERS: Final = frozenset(
+    {
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__file__",
+        "__cached__",
+        "__builtins__",
+        "__annotations__",
+        "__conditional_annotations__",
+        "__warningregistry__",
+    }
+)
+
+
+def _bound_names(target: ast.AST) -> set[str]:
+    """Return every plain name bound by an assignment-style target."""
+    return {node.id for node in ast.walk(target) if isinstance(node, ast.Name)}
+
+
+def _declared_names(tree: ast.Module) -> set[str]:
+    """Return every module global the source binds (top-level flow, `global` and walrus)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.Global):
+            names.update(node.names)
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names |= _bound_names(target)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.NamedExpr)):
+            names |= _bound_names(node.target)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            names |= _bound_names(node.optional_vars)
+    return names
+
+
+def _check_module_namespace(module: ModuleType, tree: ast.Module) -> None:
+    """
+    Reject any module global the source does not declare, and a swapped builtins mapping.
+
+    Sealed code resolves builtins (`len`, `bytes`, `isinstance`, ...) through the module's own
+    globals first, so an undeclared attribute of ANY type (function, class, `partial`, bound
+    method, object) would silently shadow one. The inventory is closed against the module's
+    own source rather than the code being compared.
+
+    :param module: The live sealed module.
+    :param tree: The module's parsed source.
+    :raises ValueError: If the live namespace holds an undeclared name or foreign builtins.
+    """
+    live = vars(module)
+    builtins_ref = live.get("__builtins__")
+    builtins_dict = builtins_ref if isinstance(builtins_ref, dict) else vars(builtins_ref)
+    if builtins_dict is not vars(builtins):
+        raise ValueError("Unexpected module builtins")
+    if set(live) - _declared_names(tree) - _MODULE_DUNDERS:
+        raise ValueError("Undeclared module global")
+    if "__warningregistry__" in live and type(live["__warningregistry__"]) is not dict:
+        raise ValueError("Unexpected warnings registry")
 
 
 def _check_globals(function: FunctionType, module: ModuleType) -> None:
