@@ -241,6 +241,9 @@ class Chain:
         self.provider.private_trial_transport = MethodType(
             AirPlayProvider.private_trial_transport, self.provider
         )
+        self.provider._private_trial_transport = MethodType(
+            AirPlayProvider._private_trial_transport, self.provider
+        )
         self.mass.command_handlers = {
             name: APICommandHandler.parse(name, method)
             for name, method in (

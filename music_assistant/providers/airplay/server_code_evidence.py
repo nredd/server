@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import contextvars
+import dataclasses
 import enum
 import hashlib
 import inspect
+import ipaddress
+import json
 import re
 import sys
 import typing
@@ -115,6 +119,8 @@ def server_code_evidence(
             trees[key] = ast.parse(data)
         for name in (
             "private_trial_transport",
+            "private_trial_transport_v2",
+            "_private_trial_transport",
             "_private_transport_current",
             "get_private_trial_admission_preflight",
             "_private_admission_snapshot",
@@ -145,6 +151,7 @@ def server_code_evidence(
         _check_transport_boundaries(modules, codes, trees)
         for name in (
             "_has_current_private_receipt",
+            "_private_target_address",
             "_private_flag_states",
             "_private_flag_map",
             "_private_flag_request",
@@ -332,7 +339,45 @@ def _check_transport_boundaries(
 ) -> None:
     """Check actual ownership boundaries, defaults and module-global bindings."""
     owners = (
-        ("private_transport", private_transport, ("validate_request",)),
+        (
+            "private_transport",
+            private_transport,
+            (
+                "validate_request",
+                "parse_media_record",
+                "media_qualifies",
+                "resolved_media_route",
+                "_reject_media_duplicates",
+                "_media_int",
+                "_media_reject",
+                "_media_uint",
+                "_media_bool",
+                "_is_canonical_ipv4",
+            ),
+        ),
+        (
+            "private_transport",
+            private_transport.ReceiptScanner,
+            ("__init__", "feed", "finish", "_complete_line"),
+        ),
+        (
+            "trial_binary",
+            trial_binary.TrialAsyncProcess,
+            (
+                "__init__",
+                "enter_receipt_mode",
+                "read_receipt_chunk",
+                "reject_receipt_stream",
+                "read_stdout",
+                "close",
+                "kill",
+                "has_historical_receipt",
+                "has_current_receipt",
+                "_release_receipt_owner",
+                "_receipt_read",
+                "_screen_receipt_bytes",
+            ),
+        ),
         (
             "private_transport",
             private_transport.PrivateTransportAttempt,
@@ -348,6 +393,11 @@ def _check_transport_boundaries(
                 "invalidate",
                 "request_stop",
                 "snapshot",
+                "fail_media",
+                "accept_media",
+                "media_snapshot",
+                "_start",
+                "_force",
                 "_play",
                 "_watchdog",
                 "_cleanup",
@@ -383,6 +433,14 @@ def _check_transport_boundaries(
                 "_write_cli_command",
                 "_connect_volume_allowed",
                 "_create_private_pipe",
+                "_build_cli_args",
+                "_read_stdout",
+                "_handle_stdout_line",
+                "_private_stdout_reader",
+                "_private_owner_current",
+                "_attach_stdout_reader",
+                "_uses_private_receipt",
+                "_parse_route_status",
             ),
         ),
     )
@@ -402,6 +460,7 @@ def _check_transport_boundaries(
     ):
         raise ValueError("Unexpected transport boundary binding")
     _check_transport_globals(trees["private_transport"])
+    _check_receipt_bindings(modules, trees)
     for name, module, qualname in (
         ("_handle_play_media", queue_loader, "QueueLoaderMixin._handle_play_media"),
         ("play_index", queue_controller, "PlayerQueuesController.play_index"),
@@ -442,6 +501,105 @@ def _check_transport_globals(tree: ast.Module) -> None:
             raise ValueError("Unexpected transport pattern")
 
 
+def _check_receipt_bindings(modules: dict[str, ModuleType], trees: dict[str, ast.Module]) -> None:
+    """Seal the receipt parser's constants, shapes and imported dependencies."""
+    _check_literal_globals(
+        trees["private_transport"],
+        private_transport,
+        (
+            "MEDIA_PREFIX",
+            "MAX_MEDIA_RECORD",
+            "MAX_STATUS_LINE",
+            "MAX_STDOUT_TOTAL",
+            "MEDIA_ROUTES",
+            "_MEDIA_KEYS",
+            "_ALL_ROUTES",
+            "_CANONICAL_UINT",
+        ),
+    )
+    _check_literal_globals(
+        trees["trial_binary"], trial_binary, ("MAX_RECEIPT_CHUNK", "_ATTEST_PREFIX")
+    )
+    stream_globals, provider_globals = vars(stream), vars(modules["provider"])
+    if (
+        vars(private_transport)["json"] is not json
+        or vars(private_transport)["ipaddress"] is not ipaddress
+        or vars(private_transport)["dataclass"] is not dataclasses.dataclass
+        or vars(private_transport)["MediaReceiptError"] is not private_transport.MediaReceiptError
+        or vars(trial_binary)["suppress"] is not contextlib.suppress
+        or stream_globals["ReceiptScanner"] is not private_transport.ReceiptScanner
+        or stream_globals["resolved_media_route"] is not private_transport.resolved_media_route
+        or stream_globals["PrivateTransportAttempt"]
+        is not private_transport.PrivateTransportAttempt
+        or provider_globals["ipaddress"] is not ipaddress
+        or stream_globals["trial_binary"] is not trial_binary
+        or tuple(private_transport.MediaState)
+        != tuple(private_transport.MediaState.__members__.values())
+        or [item.value for item in private_transport.MediaState]
+        != ["pending", "incomplete", "complete"]
+        or [item.name for item in dataclasses.fields(private_transport.MediaReceipt)]
+        != [
+            "terminal",
+            "route",
+            "epoch",
+            "fresh_units",
+            "fresh_bytes",
+            "idle_units",
+            "backlog_units",
+            "fault",
+            "overflow",
+            "addr",
+            "port",
+            "setup_port",
+        ]
+        or not dataclasses.is_dataclass(private_transport.MediaReceipt)
+        or vars(private_transport.MediaReceipt)["__dataclass_params__"].frozen is not True
+    ):
+        raise ValueError("Unexpected receipt bindings")
+
+
+def _check_literal_globals(tree: ast.Module, module: ModuleType, names: tuple[str, ...]) -> None:
+    """Compare selected live constants and patterns with their source declarations."""
+    for name in names:
+        declarations = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == name
+            )
+            or (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name
+            )
+        ]
+        if len(declarations) != 1 or declarations[0].value is None:
+            raise ValueError("Unexpected receipt constant declaration")
+        value, live = declarations[0].value, vars(module)[name]
+        if isinstance(value, ast.Call):
+            func = ast.unparse(value.func)
+            argument = ast.literal_eval(value.args[0])
+            if func == "re.compile":
+                if (
+                    type(live) is not re.Pattern
+                    or live.pattern != argument
+                    or live.flags != re.UNICODE
+                ):
+                    raise ValueError("Unexpected receipt pattern")
+            elif func == "frozenset":
+                if type(live) is not frozenset or live != frozenset(argument):
+                    raise ValueError("Unexpected receipt constant")
+            else:
+                raise ValueError("Unexpected receipt constant call")
+            continue
+        expected = ast.literal_eval(value)
+        if type(live) is not type(expected) or live != expected:
+            raise ValueError("Unexpected receipt constant")
+
+
 def _check_boundary(
     compiled: list[CodeType], tree: ast.Module, owner: object, name: str, module: ModuleType
 ) -> None:
@@ -472,7 +630,12 @@ def _check_boundary(
         raise ValueError("Unexpected boundary qualified name")
     _check_callable_defaults(value, declaration)
     _check_globals(value, module)
-    if value.__closure__ is not None:
+    if value.__closure__ is not None and not (
+        class_name is not None
+        and value.__code__.co_freevars == ("__class__",)
+        and len(value.__closure__) == 1
+        and value.__closure__[0].cell_contents is owner
+    ):
         raise ValueError("Unexpected boundary closure")
 
 
