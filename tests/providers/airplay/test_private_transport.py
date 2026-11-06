@@ -14,8 +14,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from music_assistant_models.enums import ContentType
+from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.helpers import process as process_module
+from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.helpers.private_transport import PrivateTransportAttempt, validate_request
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.providers.airplay.stream import AirPlayStream
@@ -152,6 +155,7 @@ class Child:
         self.code = code
         self.release = release
         self.proc: asyncio.subprocess.Process | None = None
+        self._stderr_reader_task: asyncio.Task[None] | None = None
 
     async def close(self) -> None:
         """Verify the private primitive reaped before wrapper finalization."""
@@ -213,6 +217,76 @@ async def test_actual_process_wrapper_eof_and_descriptor_finalization(
     assert process.returncode == 0
     assert attempt.outcome == "natural-cleanup"
     assert attempt.snapshot()["cleanup_complete"] is True
+
+
+def make_ffmpeg_child(monkeypatch: pytest.MonkeyPatch, forced: bool) -> FFMpeg:
+    """Keep the actual wrapper/readers but use a fixed receiver-free Python child."""
+    monkeypatch.setattr(process_module, "get_subprocess_env", lambda _env: {})
+    pcm = AudioFormat(
+        content_type=ContentType.PCM_S16LE, sample_rate=44100, bit_depth=16, channels=2
+    )
+    process = FFMpeg(audio_input="-", input_format=pcm, output_format=pcm)
+    code = (
+        "import sys,time; sys.stderr.write('ready\\n'); sys.stderr.flush(); sys.stdin.buffer.read()"
+    )
+    if forced:
+        code += "; time.sleep(30)"
+    monkeypatch.setattr(process, "_args", [sys.executable, "-I", "-c", code])
+    return process
+
+
+@pytest.mark.parametrize("forced", [False, True])
+async def test_actual_ffmpeg_wrapper_relinquishes_stderr_before_raw_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    forced: bool,
+) -> None:
+    """Use real FFMpeg.start/readers over a receiver-free diagnostic Python child."""
+    process = make_ffmpeg_child(monkeypatch, forced)
+    attempt = make_attempt()
+    await attempt.spawn(process)
+    reader = process._stderr_reader_task
+    assert reader is not None
+    assert not reader.done()
+    await attempt.request_stop("stop")
+    await attempt.watchdog
+    assert reader.done()
+    assert process.closed
+    assert process.returncode is not None
+    assert process._close_called
+    assert attempt.snapshot()["cleanup_complete"] is True
+    assert attempt.outcome == ("forced-containment" if forced else "natural-cleanup")
+
+
+async def test_late_actual_ffmpeg_start_reader_remains_owned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reader created after revocation must also relinquish its pipe before drain."""
+    process = make_ffmpeg_child(monkeypatch, False)
+    release = asyncio.Event()
+    original_start = process.start
+
+    async def delayed_start() -> None:
+        """Delay creation only; run the actual wrapper start and reader setup afterward."""
+        await release.wait()
+        await original_start()
+
+    monkeypatch.setattr(process, "start", delayed_start)
+    attempt = make_attempt()
+    caller = asyncio.create_task(attempt.spawn(process))
+    await asyncio.sleep(0)
+    caller.cancel()
+    await asyncio.gather(caller, return_exceptions=True)
+    cleanup = attempt.request_stop("stop")
+    await attempt.watchdog
+    assert attempt.outcome == "incomplete"
+    assert not cleanup.done()
+    release.set()
+    await asyncio.wait_for(cleanup, 2)
+    assert process._stderr_reader_task is not None
+    assert process._stderr_reader_task.done()
+    assert process._close_called
+    assert process.returncode is not None
+    assert attempt.outcome == "incomplete"
 
 
 async def test_late_spawn_retains_owner_and_cannot_pass_observation() -> None:

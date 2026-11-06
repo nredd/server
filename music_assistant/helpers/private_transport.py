@@ -27,6 +27,7 @@ class OwnedProcess(Protocol):
     """Minimal process wrapper captured before its spawn task starts."""
 
     proc: asyncio.subprocess.Process | None
+    _stderr_reader_task: asyncio.Task[None] | None
 
     async def start(self) -> None:
         """Start the captured wrapper."""
@@ -272,9 +273,13 @@ class PrivateTransportAttempt:
         finally:
             self.readers_released.set()
 
-    async def _read_pipe(self, pipe: asyncio.StreamReader) -> None:
-        """Drain a pipe only after the captured stream readers have stopped."""
+    async def _read_pipe(
+        self, pipe: asyncio.StreamReader, reader: asyncio.Task[None] | None
+    ) -> None:
+        """Drain only after both captured stream and process-owned readers stop."""
         await self.readers_released.wait()
+        if reader is not None:
+            await asyncio.gather(reader, return_exceptions=True)
         while await pipe.read(65536):
             pass
 
@@ -292,8 +297,11 @@ class PrivateTransportAttempt:
             return
         if proc.stdin is not None:
             proc.stdin.close()
+        reader = process._stderr_reader_task
+        if reader is not None:
+            reader.cancel()
         readers = [
-            asyncio.create_task(self._read_pipe(pipe))
+            asyncio.create_task(self._read_pipe(pipe, reader if pipe is proc.stderr else None))
             for pipe in (proc.stdout, proc.stderr)
             if pipe is not None
         ]
