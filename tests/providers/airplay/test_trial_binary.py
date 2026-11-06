@@ -27,12 +27,18 @@ from tests.providers.airplay.test_provider import _make_provider
 from tests.providers.airplay.test_stream import _make_player
 
 
+def test_strict_peer_artifact_pin() -> None:
+    """Pin the measured strict-peer asset independently of synthetic ELF fixtures."""
+    assert trial.EXPECTED_SHA == "e7cc51d557c31a9ea05e26f6a284d938a5a1cdad37e04078b87dd29004d8ce67"
+    assert trial.EXPECTED_BUILD == "v7e9f175"
+
+
 def test_private_manifest_matches_source_pin() -> None:
     """Keep the private source overlay and launch record on the same accepted artifact."""
     manifest = json.loads(
         (Path(__file__).resolve().parents[3] / "private-native-airplay-trial-pin.json").read_text()
     )
-    assert manifest["cli_source_sha"] == "429c5670fb6cdf1ddbf28ca5cfab0e5db7d2aea4"
+    assert manifest["cli_source_sha"] == "7e9f1756ad7f10cdebc89fee71a8c0a1bf7dda48"
     assert manifest["cli_sha256"] == trial.EXPECTED_SHA
     assert manifest["cli_build_label"] == trial.EXPECTED_BUILD
     assert manifest["cli_path"] == str(trial.TRIAL_ROOT / trial.EXPECTED_SHA / trial.ASSET_NAME)
@@ -177,7 +183,8 @@ async def test_replacement_during_check_rejected(asset: Path) -> None:
 @pytest.mark.parametrize(
     ("script", "error"),
     [
-        (f"print('cliairplay check {trial.EXPECTED_BUILD}')", None),
+        (f"print('cliairplay {trial.EXPECTED_BUILD} check')", None),
+        ("print('cliairplay vcd7d36b check')", "failed"),
         (f"print('cliairplay check {trial.EXPECTED_BUILD}'); raise SystemExit(1)", "failed"),
         ("print('cliairplay check v5b3dcc4')", "failed"),
         ("print('cliairplay check v0000000')", "failed"),
