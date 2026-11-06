@@ -1070,7 +1070,7 @@ class AirPlayProvider(PlayerProvider):
             attempt.play(play)
         elif mode == "stop":
             attempt.request_stop("private-stop")
-        return dict(attempt.snapshot())
+        return cast("dict[str, SerializableType]", attempt.snapshot())
 
     async def private_airplay_flags(self, request: Any) -> dict[str, SerializableType]:
         """

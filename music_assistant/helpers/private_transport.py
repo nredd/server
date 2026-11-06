@@ -12,7 +12,8 @@ import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar
-from typing import Any, Protocol
+from enum import StrEnum
+from typing import Any, Protocol, TypedDict
 from urllib.parse import urlsplit
 
 _TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -21,6 +22,30 @@ _STIMULUS_PATH = re.compile(r"/stimulus\.wav")
 CURRENT_ATTEMPT: ContextVar[PrivateTransportAttempt | None] = ContextVar(
     "private_transport_attempt", default=None
 )
+
+
+class TransportOutcome(StrEnum):
+    """Closed set of software ownership outcomes."""
+
+    ARMED = "armed"
+    STARTING = "starting"
+    ACTIVE = "active"
+    INCOMPLETE = "incomplete"
+    FORCED_CONTAINMENT = "forced-containment"
+    NATURAL_CLEANUP = "natural-cleanup"
+
+
+class TransportSnapshot(TypedDict):
+    """Software ownership facts for one attempt."""
+
+    version: int
+    attempt_id: str
+    outcome: TransportOutcome
+    revoked: bool
+    consumed: bool
+    start_generation: int
+    reason: str | None
+    cleanup_complete: bool
 
 
 class OwnedProcess(Protocol):
@@ -114,7 +139,7 @@ class PrivateTransportAttempt:
         self.consumed = False
         self.start_generation = 0
         self.reason: str | None = None
-        self.outcome = "armed"
+        self.outcome = TransportOutcome.ARMED
         self.start_task: asyncio.Task[None] | None = None
         self.cleanup_task: asyncio.Task[None] | None = None
         self.session: object | None = None
@@ -182,7 +207,7 @@ class PrivateTransportAttempt:
         if self.consumed:
             raise ValueError("Private PLAY already consumed")
         self.consumed = True
-        self.outcome = "starting"
+        self.outcome = TransportOutcome.STARTING
         self.start_task = asyncio.create_task(self._play(operation))
 
     def invalidate(self, reason: str) -> None:
@@ -200,7 +225,7 @@ class PrivateTransportAttempt:
             self.cleanup_task = asyncio.create_task(self._cleanup())
         return self.cleanup_task
 
-    def snapshot(self) -> dict[str, str | int | bool | None]:
+    def snapshot(self) -> TransportSnapshot:
         """Return software ownership facts, never audio or physical cessation proof."""
         return {
             "version": 1,
@@ -230,7 +255,7 @@ class PrivateTransportAttempt:
             if self.stream is not None and getattr(self.player, "stream", None) is not self.stream:
                 self.request_stop("publication-changed")
                 return
-            self.outcome = "active"
+            self.outcome = TransportOutcome.ACTIVE
         except asyncio.CancelledError:
             self.request_stop("start-cancelled")
             raise
@@ -245,7 +270,7 @@ class PrivateTransportAttempt:
         cleanup = self.request_stop("expired")
         done, _ = await asyncio.wait({cleanup}, timeout=max(0, self.observe_at - self.loop.time()))
         if not done or cleanup.cancelled() or cleanup.exception() is not None:
-            self.outcome = "incomplete"
+            self.outcome = TransportOutcome.INCOMPLETE
 
     async def _cleanup(self) -> None:
         """Retain late spawns/reaps after the observation window without reporting success."""
@@ -258,12 +283,16 @@ class PrivateTransportAttempt:
         results = await asyncio.gather(*operations, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
-                self.outcome = "incomplete"
+                self.outcome = TransportOutcome.INCOMPLETE
                 raise result
         if self.loop.time() > self.observe_at:
-            self.outcome = "incomplete"
+            self.outcome = TransportOutcome.INCOMPLETE
         else:
-            self.outcome = "forced-containment" if self.forced else "natural-cleanup"
+            self.outcome = (
+                TransportOutcome.FORCED_CONTAINMENT
+                if self.forced
+                else TransportOutcome.NATURAL_CLEANUP
+            )
 
     async def _release(self) -> None:
         """Let captured readers relinquish pipes before raw drainers consume them."""
