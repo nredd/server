@@ -185,9 +185,17 @@ async def test_cancel_during_spawn_leaks_no_child_or_fifo(tmp_path: Path) -> Non
         async def start(self) -> None:
             """Cancel the real start after `Popen` ran, before the transport returned."""
             task = asyncio.create_task(super().start())
-            await asyncio.wait_for(popen_ran.wait(), 30)
-            task.cancel()
-            await task
+            try:
+                await asyncio.wait_for(popen_ran.wait(), 30)
+                task.cancel()
+            finally:
+                # Own the start task on every path, including a guard failure.
+                if not task.done():
+                    task.cancel()
+                outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            raise AssertionError("start completed instead of being cancelled")
 
     with (
         patch.object(check, "WitnessProcess", CancelledMidSpawn),
