@@ -38,10 +38,10 @@ from music_assistant.providers.airplay.provider import AirPlayProvider
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
 
+LOGGER = logging.getLogger(__name__)
 PLAYER = "ap021122334455"
 URL = "http://192.0.2.1:18080/stimulus.wav"
 TOKEN = "a" * 32
-LOGGER = logging.getLogger(__name__)
 
 
 def completes_without_suspending(coro: Coroutine[Any, Any, Any]) -> Any:
