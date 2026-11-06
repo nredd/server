@@ -8,11 +8,15 @@ import contextlib
 import contextvars
 import dataclasses
 import enum
+import errno
 import hashlib
 import inspect
 import ipaddress
 import json
+import os
 import re
+import secrets
+import stat
 import sys
 import typing
 import urllib.parse
@@ -487,6 +491,7 @@ def _check_transport_boundaries(
         raise ValueError("Unexpected transport boundary binding")
     _check_transport_globals(trees["private_transport"])
     _check_receipt_bindings(modules, codes, trees)
+    _check_trial_qualification(modules, codes, trees)
     for name, module, qualname in (
         ("_handle_play_media", queue_loader, "QueueLoaderMixin._handle_play_media"),
         ("play_index", queue_controller, "PlayerQueuesController.play_index"),
@@ -622,6 +627,209 @@ _TRIAL_PROCESS_NAMES: Final = frozenset(
         "_current_receipt",
     }
 )
+
+# Trusted boundary for the qualification closure. Project code below is sealed by source
+# comparison; only these are trusted as the Python runtime itself: builtins and the stdlib
+# modules `asyncio errno hashlib json os re secrets stat sys platform` (identity-bound, but
+# their attributes are not compared), `pathlib.Path`, `contextlib.suppress`,
+# `dataclasses.dataclass` and `typing.cast`.
+TRIAL_GLOBALS: Final = frozenset(
+    {
+        "ASSET_NAME",
+        "ATTEST_TIMEOUT",
+        "AsyncProcess",
+        "CHECK_TIMEOUT",
+        "ChildAttestationChangedError",
+        "EXPECTED_BUILD",
+        "EXPECTED_SHA",
+        "MAX_ATTEST_LINE",
+        "MAX_BINARY_SIZE",
+        "MAX_CHECK_OUTPUT",
+        "MAX_RECEIPT_CHUNK",
+        "PROC_ROOT",
+        "Path",
+        "TRIAL_ROOT",
+        "TrialAsyncProcess",
+        "TrialBinaryError",
+        "_ATTEST_PREFIX",
+        "_BUILD_LABEL",
+        "_TrustedChildReceipt",
+        "_is_trial_target",
+        "asyncio",
+        "dataclass",
+        "descriptor_path",
+        "encode_public_digest",
+        "errno",
+        "get_subprocess_env",
+        "hashlib",
+        "json",
+        "open_in_thread",
+        "os",
+        "re",
+        "secrets",
+        "stat",
+        "suppress",
+    }
+    | {
+        "_attestation_os_error",
+        "_check_binary",
+        "_check_open_descriptor",
+        "_digest_fd",
+        "_open_private_asset_fd",
+        "_open_validated_asset",
+        "_parse_attestation_line",
+        "_read_child_digest",
+        "_reject_duplicate_json_keys",
+        "_validate_asset",
+        "_validate_elf_and_digest",
+        "_validate_open_asset",
+        "attest_owned_child",
+        "create_private_process",
+        "is_trial_target",
+        "preflight_current_image",
+        "validate_trial_binary",
+    }
+)
+# Project helpers the closure leaves trial_binary for, with the globals each may read.
+PROCESS_HELPER_GLOBALS: Final = {
+    "get_subprocess_env": frozenset({"os"}),
+    "descriptor_path": frozenset({"sys"}),
+    "open_in_thread": frozenset({"_close_late_descriptor", "asyncio"}),
+    "_close_late_descriptor": frozenset({"os"}),
+}
+PRIVATE_TRIAL_HELPER_GLOBALS: Final = {
+    "encode_public_digest": frozenset({"_SHA", "_SHA256"}),
+}
+
+
+def _trial_constant(node: ast.expr) -> object:
+    """Evaluate the closed set of constant shapes `trial_binary` declares."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        left, right = _trial_constant(node.left), _trial_constant(node.right)
+        if type(left) is int and type(right) is int:
+            return left * right
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        argument = _trial_constant(node.args[0])
+        if ast.unparse(node.func) == "Path" and type(argument) is str:
+            return Path(argument)
+        if ast.unparse(node.func) == "re.compile" and type(argument) is str:
+            return re.compile(argument)
+    raise ValueError("Unexpected qualification constant shape")
+
+
+def _check_trial_constants(tree: ast.Module) -> None:
+    """Compare every top-level qualification constant with its source declaration."""
+    for node in tree.body:
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        name = node.targets[0].id
+        expected, live = _trial_constant(node.value), vars(trial_binary)[name]
+        if isinstance(expected, re.Pattern):
+            if (
+                type(live) is not re.Pattern
+                or live.pattern != expected.pattern
+                or live.flags != expected.flags
+            ):
+                raise ValueError("Unexpected qualification pattern")
+        elif type(live) is not type(expected) or live != expected:
+            raise ValueError("Unexpected qualification constant")
+
+
+def _check_trial_qualification(
+    modules: dict[str, ModuleType], codes: dict[str, list[CodeType]], trees: dict[str, ast.Module]
+) -> None:
+    """Seal factory -> asset validation -> exec path -> attestation -> historical trust."""
+    tree, module = trees["trial_binary"], trial_binary
+    _check_trial_constants(tree)
+    declared = {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    imported = {
+        "dataclass",
+        "descriptor_path",
+        "get_subprocess_env",
+        "open_in_thread",
+        "encode_public_digest",
+    }
+    live_functions = {
+        name
+        for name, value in vars(module).items()
+        if isinstance(value, FunctionType) and name not in imported | {"_is_trial_target"}
+    }
+    if declared != live_functions:
+        raise ValueError("Unexpected qualification functions")
+    for name in sorted(declared):
+        _check_boundary(codes["trial_binary"], tree, module, name, modules["trial_binary"])
+    bindings = {
+        "asyncio": asyncio,
+        "errno": errno,
+        "hashlib": hashlib,
+        "json": json,
+        "os": os,
+        "re": re,
+        "secrets": secrets,
+        "stat": stat,
+        "suppress": contextlib.suppress,
+        "dataclass": dataclasses.dataclass,
+        "Path": Path,
+        "AsyncProcess": process_module.AsyncProcess,
+        "descriptor_path": process_module.descriptor_path,
+        "get_subprocess_env": process_module.get_subprocess_env,
+        "open_in_thread": process_module.open_in_thread,
+        "encode_public_digest": private_trial.encode_public_digest,
+        "_is_trial_target": private_trial.is_trial_target,
+    }
+    live = vars(module)
+    if any(live[name] is not value for name, value in bindings.items()):
+        raise ValueError("Unexpected qualification bindings")
+    errors = (
+        (module.TrialBinaryError, RuntimeError),
+        (module.ChildAttestationChangedError, ValueError),
+    )
+    for error, base in errors:
+        if error.__bases__ != (base,) or type(error) is not type:
+            raise ValueError("Unexpected qualification error class")
+    receipt = module._TrustedChildReceipt
+    params = getattr(receipt, "__dataclass_params__", None)
+    if (
+        receipt.__bases__ != (object,)
+        or params is None
+        or params.frozen is not True
+        or tuple(getattr(receipt, "__dataclass_fields__", ())) != ("process", "proc", "digest")
+    ):
+        raise ValueError("Unexpected trusted receipt class")
+    _check_process_helpers(codes, trees)
+
+
+def _check_process_helpers(codes: dict[str, list[CodeType]], trees: dict[str, ast.Module]) -> None:
+    """Seal the helper implementations the closure delegates to, against fresh compiles."""
+    for name, deps in PRIVATE_TRIAL_HELPER_GLOBALS.items():
+        _check_function(codes["private_trial"], trees["private_trial"], private_trial, name)
+        _check_globals(getattr(private_trial, name), private_trial)
+        _check_literal_globals(trees["private_trial"], private_trial, tuple(sorted(deps)))
+    path = Path(str(process_module.__file__))
+    with path.open("rb") as source:
+        data = source.read(_MAX_SOURCE_SIZE + 1)
+    if len(data) > _MAX_SOURCE_SIZE:
+        raise ValueError("Oversized process helper source")
+    compiled = _codes(
+        compile(data, str(path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
+    )
+    tree = ast.parse(data)
+    for name in PROCESS_HELPER_GLOBALS:
+        _check_boundary(compiled, tree, process_module, name, process_module)
+    if (
+        vars(process_module)["os"] is not os
+        or vars(process_module)["sys"] is not sys
+        or vars(process_module)["asyncio"] is not asyncio
+    ):
+        raise ValueError("Unexpected process helper bindings")
 
 
 def _check_receipt_shapes() -> None:

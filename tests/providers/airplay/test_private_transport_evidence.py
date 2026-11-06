@@ -7,7 +7,11 @@ References:
 
 from __future__ import annotations
 
+import builtins
+import dis
+import re
 import sys
+from pathlib import Path
 from types import FunctionType, ModuleType
 from typing import Any
 
@@ -16,7 +20,8 @@ import pytest
 from music_assistant.controllers.player_queues import helpers as queue_helpers
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players.controller import PlayerController
-from music_assistant.helpers import private_transport
+from music_assistant.helpers import private_transport, private_trial
+from music_assistant.helpers import process as process_module
 from music_assistant.providers.airplay import (
     player,
     provider,
@@ -310,3 +315,164 @@ def test_owner_handoff_dependencies_are_bound(monkeypatch: pytest.MonkeyPatch, n
     """A substituted `cast`/`suppress` could forge the discard decision; both are sealed."""
     monkeypatch.setattr(private_transport, name, lambda *_a, **_k: None)
     assert evidence()["status"] == "unverified"
+
+
+TRIAL_CONSTANTS: dict[str, Any] = {
+    "EXPECTED_SHA": "0" * 64,
+    "EXPECTED_BUILD": "v0000000",
+    "TRIAL_ROOT": Path("/forged-root"),
+    "ASSET_NAME": "forged-asset",
+    "MAX_BINARY_SIZE": 1,
+    "MAX_CHECK_OUTPUT": 1,
+    "CHECK_TIMEOUT": 99.0,
+    "ATTEST_TIMEOUT": 99,
+    "MAX_ATTEST_LINE": 1,
+    "MAX_RECEIPT_CHUNK": 1,
+    "_ATTEST_PREFIX": b"[FORGED]",
+    "PROC_ROOT": Path("/forged-proc"),
+    "_BUILD_LABEL": re.compile("forged"),
+}
+TRIAL_BINDINGS = (
+    "asyncio",
+    "errno",
+    "hashlib",
+    "json",
+    "os",
+    "re",
+    "secrets",
+    "stat",
+    "suppress",
+    "dataclass",
+    "Path",
+    "AsyncProcess",
+    "descriptor_path",
+    "get_subprocess_env",
+    "open_in_thread",
+    "encode_public_digest",
+    "_is_trial_target",
+    "TrialBinaryError",
+    "ChildAttestationChangedError",
+    "_TrustedChildReceipt",
+)
+TRIAL_FUNCTIONS = sorted(
+    name
+    for name, value in vars(trial_binary).items()
+    if isinstance(value, FunctionType) and value.__module__ == trial_binary.__name__
+)
+PROCESS_HELPERS = (
+    "get_subprocess_env",
+    "descriptor_path",
+    "open_in_thread",
+    "_close_late_descriptor",
+)
+
+
+@pytest.mark.parametrize("name", sorted(TRIAL_CONSTANTS))
+def test_trial_qualification_constant_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Every pin, root, limit and pattern the qualification reads is sealed to its source."""
+    monkeypatch.setattr(trial_binary, name, TRIAL_CONSTANTS[name])
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", TRIAL_BINDINGS)
+def test_trial_qualification_binding_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Every imported alias and local class the qualification reads is the canonical object."""
+    monkeypatch.setattr(trial_binary, name, object())
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", TRIAL_FUNCTIONS)
+def test_every_trial_binary_function_rejects_foreign_globals(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The whole qualification closure is sealed, not just the receipt entry points."""
+    function = getattr(trial_binary, name)
+    clone = FunctionType(
+        function.__code__,
+        dict(function.__globals__),
+        name=function.__name__,
+        argdefs=function.__defaults__,
+        closure=function.__closure__,
+    )
+    clone.__kwdefaults__ = function.__kwdefaults__
+    monkeypatch.setattr(trial_binary, name, clone)
+    assert evidence()["status"] == "unverified"
+
+
+@pytest.mark.parametrize("name", PROCESS_HELPERS)
+def test_process_helper_closure_is_sealed(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """The helpers the qualification delegates to match a fresh compile of their source."""
+    function = getattr(process_module, name)
+    clone = FunctionType(
+        function.__code__,
+        dict(function.__globals__),
+        name=function.__name__,
+        argdefs=function.__defaults__,
+        closure=function.__closure__,
+    )
+    clone.__kwdefaults__ = function.__kwdefaults__
+    monkeypatch.setattr(process_module, name, clone)
+    assert evidence()["status"] == "unverified"
+    monkeypatch.undo()
+    monkeypatch.setattr(process_module, name, lambda *_a, **_k: None)
+    assert evidence()["status"] == "unverified"
+
+
+def test_pinned_fixture_style_patch_cannot_keep_evidence_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact bypass: a forged pin plus a substituted descriptor path or asset opener."""
+    monkeypatch.setattr(trial_binary, "EXPECTED_SHA", "0" * 64)
+    monkeypatch.setattr(trial_binary, "descriptor_path", lambda _fd: "/bin/sh")
+    assert evidence()["status"] == "unverified"
+    monkeypatch.undo()
+    monkeypatch.setattr(trial_binary, "_open_validated_asset", lambda: (0, "0" * 64))
+    assert evidence()["status"] == "unverified"
+
+
+def test_injected_trial_binary_function_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A function added to the module is outside its source closure."""
+    monkeypatch.setattr(trial_binary, "_forged", lambda: None, raising=False)
+    assert evidence()["status"] == "unverified"
+
+
+def _global_names(function: FunctionType) -> set[str]:
+    """Return every non-builtin global a function and its nested code reads."""
+    names: set[str] = set()
+    stack = [function.__code__]
+    while stack:
+        code = stack.pop()
+        stack.extend(item for item in code.co_consts if hasattr(item, "co_code"))
+        names |= {ins.argval for ins in dis.get_instructions(code) if ins.opname == "LOAD_GLOBAL"}
+    return {name for name in names if name not in vars(builtins)}
+
+
+def test_qualification_closure_reads_only_declared_globals() -> None:
+    """Audit: nothing reachable from the factory/attestation path reads an unsealed global."""
+    entries: list[FunctionType] = [
+        value
+        for value in vars(trial_binary).values()
+        if isinstance(value, FunctionType) and value.__module__ == trial_binary.__name__
+    ]
+    for cls in (trial_binary.TrialAsyncProcess, trial_binary._TrustedChildReceipt):
+        for value in vars(cls).values():
+            function = value.fget if isinstance(value, property) else value
+            # Skip dataclass-generated methods (compiled from "<string>").
+            if (
+                isinstance(function, FunctionType)
+                and function.__code__.co_filename == trial_binary.__file__
+            ):
+                entries.append(function)
+    reached = set().union(*(_global_names(function) for function in entries))
+    assert reached <= server_code_evidence.TRIAL_GLOBALS
+    for name, allowed in server_code_evidence.PROCESS_HELPER_GLOBALS.items():
+        assert _global_names(getattr(process_module, name)) == allowed
+    for name, allowed in server_code_evidence.PRIVATE_TRIAL_HELPER_GLOBALS.items():
+        assert _global_names(getattr(private_trial, name)) == allowed
+    # Helpers reached by name must themselves be inventoried.
+    assert {"descriptor_path", "get_subprocess_env", "open_in_thread"} <= reached
+    assert "encode_public_digest" in reached
