@@ -25,14 +25,17 @@ from aiohttp.test_utils import make_mocked_request
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 from music_assistant_models.enums import ConfigEntryType
+from music_assistant_models.player_queue import PlayerQueue
 
 from music_assistant.controllers.config import ConfigController
 from music_assistant.controllers.discovery import controller as discovery_module
+from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.webserver import controller as webserver_module
 from music_assistant.controllers.webserver.controller import WebserverController
 from music_assistant.helpers.api import APICommandHandler, parse_arguments
 from music_assistant.helpers.json import json_dumps
+from music_assistant.helpers.private_transport import PrivateTransportAttempt
 from music_assistant.helpers.private_trial import CONF_PRIVATE_TRIAL_TARGET
 from music_assistant.mass import MusicAssistant
 from music_assistant.providers.airplay import provider as provider_module
@@ -854,3 +857,149 @@ async def test_cancel_before_entry_does_not_mutate(admission: AirPlayProvider) -
     with pytest.raises(asyncio.CancelledError):
         await task
     assert admission.mass.config._data == before
+
+
+async def test_matching_clear_revokes_before_suspended_persistence(
+    admission: AirPlayProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validated CLEAR cancels ownership before changing the leaf or awaiting flush."""
+    await admission.private_trial_admission_mutate(request())
+    attempt = PrivateTransportAttempt("a" * 32, object(), object(), "unused", lambda: True)
+    admission._private_transport_attempt = attempt
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def save() -> None:
+        """Hold persistence after the synchronous admission boundary."""
+        assert attempt.revoked
+        entered.set()
+        await release.wait()
+        raise OSError("synthetic persistence uncertainty")
+
+    monkeypatch.setattr(admission.mass.config, "async_save", save)
+    clear = asyncio.create_task(admission.private_trial_admission_mutate(request("clear")))
+    try:
+        await entered.wait()
+        assert attempt.revoked
+        assert admission.mass.discovery.config.values[CONF_PRIVATE_TRIAL_TARGET].value == ""
+    finally:
+        release.set()
+    assert (await clear)["persistence"] == "unproven"
+    await attempt.request_stop("fixture-end")
+    await attempt.watchdog
+
+
+async def test_refused_clear_does_not_revoke_owner(admission: AirPlayProvider) -> None:
+    """An expected-target mismatch must not cancel another admission owner."""
+    await admission.private_trial_admission_mutate(request())
+    attempt = PrivateTransportAttempt("a" * 32, object(), object(), "unused", lambda: True)
+    admission._private_transport_attempt = attempt
+    result = await admission.private_trial_admission_mutate(
+        request("clear") | {"target": "0123456789ab@Other TV"}
+    )
+    assert result["status"] == "refused"
+    assert not attempt.revoked
+    await attempt.request_stop("fixture-end")
+    await attempt.watchdog
+
+
+async def _ready_transport(
+    admission: AirPlayProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """Build actual admitted TV/player/queue objects with a synthetic PTP receipt."""
+    await admission.private_trial_admission_mutate(request())
+    player = _make_control_player()
+    player._player_id = PLAYER
+    player._provider = admission
+    player.mass = admission.mass
+    player._attr_available = True
+    player.__dict__["enabled"] = True
+    admission.__dict__["get_players"].return_value = [player]
+    admission.mass.players = PlayerController.__new__(PlayerController)
+    admission.mass.players._players = {PLAYER: player}
+    admission.mass.player_queues = PlayerQueuesController.__new__(PlayerQueuesController)
+    queue = PlayerQueue(PLAYER, True, "synthetic TV", True, 0)
+    monkeypatch.setattr(admission.mass.player_queues, "get", lambda _id: queue)
+    admission._bridge_manager = MagicMock(_bridges={})
+    admission._ptp_daemon = MagicMock()
+    admission._ptp_daemon_ready = asyncio.Event()
+    admission._ptp_daemon_ready.set()
+    monkeypatch.setattr(provider_module, "_has_current_private_receipt", lambda _child: True)
+    monkeypatch.setattr(trial_binary, "is_trial_target", lambda: True)
+    return player
+
+
+async def test_actual_arm_checks_exact_admission_and_objects(
+    admission: AirPlayProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real registered TV and current admission can arm without a transport write."""
+    player = await _ready_transport(admission, monkeypatch)
+    result = await admission.private_trial_transport(
+        {
+            "mode": "arm",
+            "attempt_id": "a" * 32,
+            "player_id": PLAYER,
+            "media": "http://192.0.2.1:18080/stimulus.wav",
+        }
+    )
+    assert result["outcome"] == "armed"
+    attempt = admission._private_transport_attempt
+    assert attempt is not None
+    assert attempt.player is player
+    assert attempt.queue is admission.mass.player_queues.get(PLAYER)
+    await attempt.request_stop("fixture-end")
+    await attempt.watchdog
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "target",
+        "player",
+        "queue",
+        "group",
+        "redirect",
+        "bridge",
+        "stream",
+        "ptp",
+        "flags",
+    ],
+)
+async def test_actual_arm_refuses_changed_scope_without_creating_owner(
+    admission: AirPlayProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Changed identity, readiness or foreign output state cannot arm transport."""
+    player = await _ready_transport(admission, monkeypatch)
+    if change == "target":
+        await admission.private_trial_admission_mutate(request("clear"))
+    elif change == "player":
+        admission.mass.players._players[PLAYER] = MagicMock()
+    elif change == "queue":
+        monkeypatch.setattr(admission.mass.player_queues, "get", lambda _id: object())
+    elif change == "group":
+        player._attr_group_members = ["foreign"]
+    elif change == "redirect":
+        monkeypatch.setattr(player, "_Player__attr_protocol_parent_id", "foreign")
+    elif change == "bridge":
+        admission._bridge_manager._bridges[PLAYER] = MagicMock()
+    elif change == "stream":
+        player.stream = MagicMock()
+    elif change == "ptp":
+        assert admission._ptp_daemon_ready is not None
+        admission._ptp_daemon_ready.clear()
+    else:
+        monkeypatch.setattr(admission.config, "get_value", lambda _key: True)
+    with pytest.raises(ValueError, match="Private transport"):
+        await admission.private_trial_transport(
+            {
+                "mode": "arm",
+                "attempt_id": "a" * 32,
+                "player_id": PLAYER,
+                "media": "http://192.0.2.1:18080/stimulus.wav",
+            }
+        )
+    assert admission._private_transport_attempt is None
