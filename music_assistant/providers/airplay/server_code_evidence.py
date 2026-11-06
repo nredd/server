@@ -352,7 +352,7 @@ def _check_transport_boundaries(
                 "_media_reject",
                 "_media_uint",
                 "_media_bool",
-                "_is_canonical_ipv4",
+                "is_canonical_ipv4",
             ),
         ),
         (
@@ -531,13 +531,20 @@ def _check_receipt_bindings(modules: dict[str, ModuleType], trees: dict[str, ast
         or stream_globals["resolved_media_route"] is not private_transport.resolved_media_route
         or stream_globals["PrivateTransportAttempt"]
         is not private_transport.PrivateTransportAttempt
-        or provider_globals["ipaddress"] is not ipaddress
         or stream_globals["trial_binary"] is not trial_binary
-        or tuple(private_transport.MediaState)
-        != tuple(private_transport.MediaState.__members__.values())
-        or [item.value for item in private_transport.MediaState]
+        or provider_globals["is_canonical_ipv4"] is not private_transport.is_canonical_ipv4
+    ):
+        raise ValueError("Unexpected receipt dependency bindings")
+    _check_receipt_shapes()
+
+
+def _check_receipt_shapes() -> None:
+    """Seal the closed receipt state enum and record dataclass."""
+    record = private_transport.MediaReceipt
+    if (
+        [item.value for item in private_transport.MediaState]
         != ["pending", "incomplete", "complete"]
-        or [item.name for item in dataclasses.fields(private_transport.MediaReceipt)]
+        or [item.name for item in dataclasses.fields(record)]
         != [
             "terminal",
             "route",
@@ -552,10 +559,10 @@ def _check_receipt_bindings(modules: dict[str, ModuleType], trees: dict[str, ast
             "port",
             "setup_port",
         ]
-        or not dataclasses.is_dataclass(private_transport.MediaReceipt)
-        or vars(private_transport.MediaReceipt)["__dataclass_params__"].frozen is not True
+        or not dataclasses.is_dataclass(record)
+        or vars(record)["__dataclass_params__"].frozen is not True
     ):
-        raise ValueError("Unexpected receipt bindings")
+        raise ValueError("Unexpected receipt record shape")
 
 
 def _check_literal_globals(tree: ast.Module, module: ModuleType, names: tuple[str, ...]) -> None:

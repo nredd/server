@@ -142,9 +142,9 @@ async def start(
     """Spawn the child under a v2 attempt exactly like `AirPlayStream.connect`."""
     player = _make_player()
     player.address = TARGET
-    stream = AirPlayStream(player)
-    stream._write_cli_command = AsyncMock(return_value=True)  # type: ignore[method-assign]
-    stream.commands_pipe.remove = AsyncMock()  # type: ignore[method-assign]
+    stream: Any = AirPlayStream(player)
+    stream._write_cli_command = AsyncMock(return_value=True)
+    stream.commands_pipe.remove = AsyncMock()
     attempt = PrivateTransportAttempt("a" * 32, player, object(), "x", lambda: True, 2, TARGET)
     if deadlines is not None:
         now = attempt.loop.time()
@@ -321,7 +321,8 @@ async def test_duplicate_attest_after_final_before_eof_rejects(pinned: Path) -> 
         kills += 1
         original()
 
-    run.proc.proc.kill = counted  # type: ignore[method-assign]
+    child: Any = run.proc.proc
+    child.kill = counted
     result = await run.finish()
     assert run.media["state"] == "incomplete"
     assert kills == 1
@@ -367,7 +368,8 @@ async def test_replaced_owner_cannot_satisfy_attempt(pinned: Path, replace: str)
     elif replace == "stream":
         run.attempt.stream = object()
     else:
-        run.stream.session_volume = object()  # type: ignore[assignment]
+        holder: Any = run.stream
+        holder.session_volume = object()
     await run.go()
     result = await run.finish()
     assert run.media["state"] == "incomplete"
@@ -581,7 +583,8 @@ async def test_wrapper_mode_guards(pinned: Path) -> None:
     with pytest.raises(trial.TrialBinaryError):
         await proc.read_receipt_chunk(8)
     assert proc.proc is not None
-    proc.proc.stdin.write(b"go\n")  # type: ignore[union-attr]
+    assert proc.proc.stdin is not None
+    proc.proc.stdin.write(b"go\n")
     assert await asyncio.wait_for(first, 5) == b""
     await proc.close()
 
@@ -622,3 +625,25 @@ async def test_v1_attempt_keeps_the_original_reader_and_raw_drain(pinned: Path) 
     await asyncio.wait_for(attempt.request_stop("done"), 8)
     attempt.watchdog.cancel()
     await asyncio.gather(attempt.watchdog, return_exceptions=True)
+
+
+async def test_unscreened_reader_error_terminates_without_spinning(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-rejection read error ends the owner and is incomplete; it is never retried."""
+    calls = 0
+
+    async def broken(_self: trial.TrialAsyncProcess, _n: int) -> bytes:
+        """Fail immediately like an unavailable reader."""
+        nonlocal calls
+        calls += 1
+        raise trial.TrialBinaryError("Private receipt reader is unavailable")
+
+    monkeypatch.setattr(trial.TrialAsyncProcess, "read_receipt_chunk", broken)
+    run = await start(pinned, route_and("raop", rec()))
+    owner = run.attempt.stdout_owners[run.proc]
+    await asyncio.wait_for(asyncio.gather(owner, return_exceptions=True), 3)
+    assert calls == 1
+    await run.go()
+    await run.finish()
+    assert run.media["state"] == "incomplete"

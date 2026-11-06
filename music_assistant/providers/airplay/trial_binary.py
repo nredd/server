@@ -134,6 +134,11 @@ class TrialAsyncProcess(AsyncProcess):
         receipt = self._trusted_receipt
         return receipt is not None and receipt.process is self and receipt.proc is self.proc
 
+    @property
+    def receipt_rejected(self) -> bool:
+        """Return whether the receipt stream was rejected and is only being discarded."""
+        return self._receipt_rejected
+
     def has_current_receipt(self) -> bool:
         """Return whether this exact owned child has a current acknowledgement receipt."""
         return self._current_receipt() is not None
@@ -198,8 +203,9 @@ class TrialAsyncProcess(AsyncProcess):
         """
         Read at most `n` screened bytes; b"" only at EOF.
 
-        A line starting with the attestation marker is never exposed: partial prefixes are
-        held across chunks. After a rejection later calls discard to EOF in place.
+        :param n: Maximum bytes to return, 1 to `MAX_RECEIPT_CHUNK`.
+        :raises TrialBinaryError: If the mode is not entered, a reader is active, or a repeated
+            acknowledgement was screened (the child is then rejected and later calls discard).
         """
         if not self._receipt_mode or not 1 <= n <= MAX_RECEIPT_CHUNK:
             raise TrialBinaryError("Private receipt read is not permitted")

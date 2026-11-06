@@ -226,7 +226,12 @@ def _media_bool(value: object) -> bool:
 
 
 def parse_media_record(line: bytes) -> MediaReceipt:
-    """Parse one complete newline-terminated `@MEDIA1` line, exactly or not at all."""
+    """
+    Parse one complete newline-terminated `@MEDIA1` line, exactly or not at all.
+
+    :param line: The complete line including its prefix and trailing newline.
+    :raises MediaReceiptError: If the line is not exactly one closed record.
+    """
     if (
         len(line) > MAX_MEDIA_RECORD
         or not line.startswith(MEDIA_PREFIX)
@@ -252,7 +257,7 @@ def parse_media_record(line: bytes) -> MediaReceipt:
         raise MediaReceiptError("Unexpected media version")
     addr = value["addr"]
     if addr is not None and (
-        type(addr) is not str or not addr.isascii() or not _is_canonical_ipv4(addr)
+        type(addr) is not str or not addr.isascii() or not is_canonical_ipv4(addr)
     ):
         raise MediaReceiptError("Invalid media address")
     terminal, route = value["terminal"], value["route"]
@@ -283,7 +288,7 @@ def parse_media_record(line: bytes) -> MediaReceipt:
     return receipt
 
 
-def _is_canonical_ipv4(text: str) -> bool:
+def is_canonical_ipv4(text: str) -> bool:
     """Return whether text is canonical dotted-decimal IPv4."""
     try:
         return str(ipaddress.IPv4Address(text)) == text
@@ -292,7 +297,13 @@ def _is_canonical_ipv4(text: str) -> bool:
 
 
 def media_qualifies(receipt: MediaReceipt, *, target_address: str, resolved_route: str) -> bool:
-    """Apply every necessary receipt condition against independently held facts."""
+    """
+    Apply every necessary receipt condition against independently held facts.
+
+    :param receipt: The parsed record.
+    :param target_address: The canonical IPv4 address held independently of the child.
+    :param resolved_route: The route parsed from the child's `[STATUS] route` line.
+    """
     return (
         receipt.terminal == "stop"
         and receipt.route in MEDIA_ROUTES
@@ -309,7 +320,11 @@ def media_qualifies(receipt: MediaReceipt, *, target_address: str, resolved_rout
 
 
 def resolved_media_route(fields: dict[str, str]) -> str:
-    """Map the closed `[STATUS] route` facts to the receipt's route names; else unknown."""
+    """
+    Map the closed `[STATUS] route` facts to the receipt's route names; else unknown.
+
+    :param fields: The `protocol`, `flow` and `buffered` values of the status line.
+    """
     key = (fields.get("protocol", ""), fields.get("flow", ""), fields.get("buffered", ""))
     return {
         ("raop", "legacy", "0"): "raop",
@@ -331,7 +346,11 @@ class ReceiptScanner:
         self.failed = False
 
     def feed(self, data: bytes) -> list[str]:
-        """Return complete ordinary lines; media bytes never leave this object."""
+        """
+        Return complete ordinary lines; media bytes never leave this object.
+
+        :param data: The next screened stdout bytes.
+        """
         lines: list[str] = []
         if self.failed:
             return lines
@@ -451,7 +470,12 @@ class PrivateTransportAttempt:
         process: OwnedProcess,
         stdout_owner: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
-        """Retain the wrapper and shielded spawn even if the caller is cancelled."""
+        """
+        Retain the wrapper and shielded spawn even if the caller is cancelled.
+
+        :param process: The captured wrapper to start.
+        :param stdout_owner: Factory of the sole stdout reader, registered before spawn completes.
+        """
         try:
             self.check_current()
         except asyncio.CancelledError:
@@ -471,7 +495,13 @@ class PrivateTransportAttempt:
             self._media = MediaState.INCOMPLETE
 
     def accept_media(self, receipt: MediaReceipt, *, stream: object, resolved_route: str) -> bool:
-        """Complete media once, only for the captured stream before observation."""
+        """
+        Complete media once, only for the captured stream before observation.
+
+        :param receipt: The record accepted at EOF.
+        :param stream: The stream that owned stdout; must be the attempt's captured stream.
+        :param resolved_route: The route parsed from the child's status line.
+        """
         ok = (
             self._media is MediaState.PENDING
             and self.version == 2

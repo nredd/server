@@ -664,7 +664,7 @@ def _other(*_args: object, **_kwargs: object) -> None:
         (private_transport, "media_qualifies"),
         (private_transport, "resolved_media_route"),
         (private_transport, "_media_int"),
-        (private_transport, "_is_canonical_ipv4"),
+        (private_transport, "is_canonical_ipv4"),
         (private_transport.ReceiptScanner, "feed"),
         (private_transport.ReceiptScanner, "finish"),
         (private_transport.ReceiptScanner, "_complete_line"),
@@ -674,6 +674,7 @@ def _other(*_args: object, **_kwargs: object) -> None:
         (trial_binary.TrialAsyncProcess, "read_receipt_chunk"),
         (trial_binary.TrialAsyncProcess, "reject_receipt_stream"),
         (trial_binary.TrialAsyncProcess, "enter_receipt_mode"),
+        (stream.AirPlayStream, "_handle_stdout_line"),
         (trial_binary.TrialAsyncProcess, "_screen_receipt_bytes"),
         (trial_binary.TrialAsyncProcess, "close"),
         (trial_binary.TrialAsyncProcess, "kill"),
@@ -712,7 +713,7 @@ def test_receipt_callables_are_code_sealed(
         (trial_binary, "_ATTEST_PREFIX", b"[ATTEST]x"),
         (stream, "ReceiptScanner", type("ReceiptScanner", (), {})),
         (stream, "resolved_media_route", _other),
-        (provider, "ipaddress", __import__("types").SimpleNamespace()),
+        (provider, "is_canonical_ipv4", _other),
     ],
 )
 def test_receipt_constants_and_dependencies_are_sealed(
@@ -772,10 +773,10 @@ def test_v2_handler_decorator_and_defaults_are_rejected(monkeypatch: pytest.Monk
     """The v2 handler must remain an undecorated, default-free declaration."""
     original = provider.AirPlayProvider.private_trial_transport_v2
 
-    def wrapper(self: object, request: object) -> object:
+    def wrapper(self: Any, request: Any) -> Any:
         """Wrap without code identity."""
-        return original(self, request)  # type: ignore[arg-type]
+        return original(self, request)
 
-    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    vars(wrapper)["__wrapped__"] = original
     monkeypatch.setattr(provider.AirPlayProvider, "private_trial_transport_v2", wrapper)
     assert evidence.server_code_evidence(provider, _controller())["status"] == "unverified"

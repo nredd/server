@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ipaddress
 import json
 import logging
 import os
@@ -42,7 +41,11 @@ from music_assistant.helpers.config_entries import (
 )
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
-from music_assistant.helpers.private_transport import PrivateTransportAttempt, validate_request
+from music_assistant.helpers.private_transport import (
+    PrivateTransportAttempt,
+    is_canonical_ipv4,
+    validate_request,
+)
 from music_assistant.helpers.private_trial import (
     CONF_PRIVATE_TRIAL_TARGET,
     admits_player_id,
@@ -308,11 +311,7 @@ def _private_flag_refusal(
 def _private_target_address(player: AirPlayPlayer) -> str | None:
     """Return the admitted player's canonical numeric IPv4 address, else None."""
     address = getattr(player, "address", None)
-    try:
-        parsed = ipaddress.IPv4Address(str(address))
-    except ValueError:
-        return None
-    return str(parsed) if str(parsed) == address else None
+    return address if isinstance(address, str) and is_canonical_ipv4(address) else None
 
 
 def _has_current_private_receipt(child: AsyncProcess) -> bool:

@@ -1621,7 +1621,11 @@ class AirPlayStream:
                 except trial_binary.TrialBinaryError:
                     rejected = True
                     attempt.fail_media()
-                    continue
+                    if process.receipt_rejected:
+                        continue
+                    # Not a screened rejection: no retry, contain and let the attempt drain.
+                    process.reject_receipt_stream()
+                    break
                 if not chunk:
                     break
                 if rejected:
