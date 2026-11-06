@@ -139,6 +139,15 @@ def test_queue_wrapper_and_runtime_bindings_are_independent_controls(
     assert evidence()["status"] == "unverified"
 
 
+@pytest.mark.parametrize(("owner", "name"), [(provider, "QueueOption"), (stream_session, "FFMpeg")])
+def test_transport_dependency_substitution_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, owner: ModuleType, name: str
+) -> None:
+    """Reject substituted queue option and process wrapper bindings independently."""
+    monkeypatch.setattr(owner, name, object())
+    assert evidence()["status"] == "unverified"
+
+
 def test_wrapped_callable_cannot_select_its_own_trust_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

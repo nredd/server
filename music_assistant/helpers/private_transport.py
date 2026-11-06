@@ -90,7 +90,8 @@ def validate_request(request: Any) -> str:
             uri = urlsplit(media)
             port = uri.port
         except ValueError as err:
-            raise ValueError("Invalid private stimulus URI") from err
+            diagnostic = "invalid port" if str(err).startswith("Port ") else "invalid authority"
+            raise ValueError(f"Invalid private stimulus URI: {diagnostic}") from err
         # Numeric IPv4 only, no DNS, userinfo, redirects/options or arbitrary paths.
         host = uri.hostname or ""
         parts = host.split(".")

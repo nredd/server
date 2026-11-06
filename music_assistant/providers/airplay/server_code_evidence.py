@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.enums import QueueOption
 
 from music_assistant import constants as core_constants
 from music_assistant import mass as mass_module
@@ -27,7 +28,7 @@ from music_assistant.controllers.player_queues import helpers as queue_helpers
 from music_assistant.controllers.player_queues import queue_loader
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players import controller as players_controller
-from music_assistant.helpers import private_transport, private_trial
+from music_assistant.helpers import ffmpeg, private_transport, private_trial
 from music_assistant.helpers.private_trial import encode_public_digest
 
 from . import (
@@ -395,6 +396,8 @@ def _check_transport_boundaries(
         or modules["provider"].validate_request is not private_transport.validate_request
         or vars(player)["AirPlayStreamSession"] is not stream_session.AirPlayStreamSession
         or vars(stream_session)["AirPlayStream"] is not stream.AirPlayStream
+        or vars(stream_session)["FFMpeg"] is not ffmpeg.FFMpeg
+        or vars(modules["provider"])["QueueOption"] is not QueueOption
     ):
         raise ValueError("Unexpected transport boundary binding")
     _check_transport_globals(trees["private_transport"])
@@ -524,7 +527,10 @@ def _check_queue_wrapper(
         raise ValueError("Unexpected queue wrapper binding")
     if wrapped.__module__ != module.__name__ or wrapped.__qualname__ != qualname:
         raise ValueError("Unexpected wrapped callable identity")
-    with Path(str(module.__file__)).open("rb") as source_file:
+    source_path = Path(str(module.__file__)).resolve()
+    if not source_path.exists() or not source_path.is_file():
+        raise ValueError("Missing wrapped callable source")
+    with source_path.open("rb") as source_file:
         source = source_file.read(_MAX_SOURCE_SIZE + 1)
     if len(source) > _MAX_SOURCE_SIZE or wrapped.__globals__ is not vars(module):
         raise ValueError("Unexpected wrapped callable globals")
